@@ -20,24 +20,25 @@ echo "=== zzz-restore-router 开始 $(date) ===" >>$LOG
 
 # 升级后 root 密码(全清刷后 root 无密码, 必须设置, 否则:
 #   a) 内网任何设备可空密码 LAN SSH 进 root; b) 非交互脚本 ssh 连不上无法终验)
-# root 密码与 WiFi key 不再硬编码: 升级前由 Mac 侧 upgrade_router.sh 从活路由器
-# 抓取 /etc/shadow 的 root 行 + /etc/config/wireless 的 key, 写入 kit 的 etc/router-secrets
-# (权限 600, 不进 Git)。首启动自举从此文件恢复, 保证与升级前完全一致, 且无明文泄露。
+# root 密码 / WiFi key / 三频 SSID / LAN IP 均不再硬编码: 升级前由 Mac 侧 upgrade_router.sh
+# 从活路由器抓取 /etc/shadow 的 root 行 + wireless 的 key/ssid + network.lan.ipaddr, 写入 kit 的
+# etc/router-secrets (权限 600, 不进 Git)。首启动自举从此文件恢复, 保证与升级前完全一致, 且无明文泄露。
 # 本脚本自身已不含任何明文密码, 可直接提交到任意 Git 仓库; 敏感数据只存在于
 # 运行期动态注入的 etc/router-secrets (由 kit 携带, kit 不入库)。
 SECRETS=/etc/router-secrets
 ROOT_SHADOW=""; WIFI_KEY=""
-SSID0=""; SSID1=""; SSID2=""
+SSID0=""; SSID1=""; SSID2=""; LAN_IP=""
 if [ -f "$SECRETS" ]; then
   ROOT_SHADOW=$(grep '^ROOT_SHADOW=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
   WIFI_KEY=$(grep '^WIFI_KEY='    "$SECRETS" 2>/dev/null | cut -d= -f2-)
   SSID0=$(grep '^SSID0=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
   SSID1=$(grep '^SSID1=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
   SSID2=$(grep '^SSID2=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
+  LAN_IP=$(grep '^LAN_IP=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
 fi
 
 # ---------- 1. network: 还原 LAN IP / 桥接 / WAN ----------
-cat > /etc/config/network <<'NETEOF'
+cat > /etc/config/network <<NETEOF
 config interface 'loopback'
 	option device 'lo'
 	option proto 'static'
@@ -56,7 +57,7 @@ config device
 config interface 'lan'
 	option device 'br-lan'
 	option proto 'static'
-	option ipaddr '192.168.88.1/24'
+	option ipaddr '${LAN_IP:-192.168.1.1/24}'
 	option ip6assign '0'
 	option ip6ifaceid 'eui64'
 

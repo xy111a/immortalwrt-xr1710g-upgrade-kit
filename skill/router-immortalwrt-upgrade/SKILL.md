@@ -23,7 +23,7 @@ agent_created: true
 
 ## 四层安全保障（fail-safe，非 fail-proof）
 - **T0 预防**：全清刷 + restore-kit 打成 `uci-defaults` 脚本随 `sysupgrade -f kit.tar.gz` 在首启动自举 → 路由自配自己，无需在刷机窗口在线值守。
-- **T1 检测**：Mac 侧轮询重连（192.168.88.1 / 192.168.1.1 / 192.168.50.1，每 5s 最多 40 次）+ 终验。
+- **T1 检测**：Mac 侧轮询重连（路由器地址 / 常见出厂 IP 如 192.168.1.1，每 5s 最多 40 次）+ 终验。
 - **T2 恢复（命门）**：U-Boot 常住兜底 `bootcmd=run boot_ubi || http_recovery` + `recovery_mtd=fit`（在 UBI 卷 ubootenv/ubootenv2，**不受 sysupgrade 影响**）。刷坏自动进 HTTP Recovery，免拆机。
 - **T3 回退**：`upgrade_router.sh` 在刷前预飞阶段**自动解析当前路由器运行版本的 commit hash，并在本地 `*.itb` 中匹配同名 itb 作为回退镜像**（见 `resolve_rollback`）。即"当前版本"会被自动选为回退点——**前提是旧 itb 文件别删掉**。无匹配时回退到手动指定的 `FALLBACK_ITB`。回退操作：`sysupgrade -F <回退 itb>`。
 
@@ -37,7 +37,7 @@ agent_created: true
 1. **设 root 密码用 `passwd root`，绝不用 `chpasswd`**。`echo "root:$PW" | chpasswd` 会静默失败（ImmortalWrt **无 chpasswd 二进制**）→ root 无密码、内网空密码可进 root。正确：`printf '%s\n%s\n' "$PW" "$PW" | passwd root`（root 不强制长度，too short 警告可忽略）。
 2. **sysupgrade -f 还原的 tar 会保留源机 uid** → `/etc/dropbear` 属主变成原机的 uid（如 503）→ dropbear 报 `must be owned by user or root` 并**直接禁用公钥认证** → SSH key 登录全挂（密码仍能进）。自举脚本必须 `chown root:root /etc/dropbear /etc/dropbear/authorized_keys`（原只 chmod 漏 chown，这是根因）。
 3. **authorized_keys 每行必须换行结尾**。缺尾 `\n` 时 `cat >>` 追加会拼成非法长行，两把 key 全被拒。
-4. **SSH host key 变更陷阱**：干净刷后路由器生成**全新 host key**，`StrictHostKeyChecking=accept-new` 语义是"接受新 key、拒绝密钥变更" → 对 clean flush **直接拒连**（脚本误报"重连失败"，实际路由器早起了）。轮询/终验前先 `ssh-keygen -R 192.168.88.1` 清旧 key；或验证用 `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`。
+4. **SSH host key 变更陷阱**：干净刷后路由器生成**全新 host key**，`StrictHostKeyChecking=accept-new` 语义是"接受新 key、拒绝密钥变更" → 对 clean flush **直接拒连**（脚本误报"重连失败"，实际路由器早起了）。轮询/终验前先 `ssh-keygen -R <路由器地址或别名>` 清旧 key；或验证用 `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`。
 5. **U-Boot env 校验陷阱**：`fw_printenv` 默认 `fw_env.config` 把 **mtd0 "vendor" 陈旧出厂副本列首位**，读它报 `Incompatible flash types!` 即中止，读不到真正活跃 env → **会误判兜底消失**。活跃 env 在 **UBI 卷 ubi0_1/ubi0_2**，正确校验：`cat /dev/ubi0_2 | strings | grep -E '^bootcmd='`。根治：升级脚本终验段直接读 UBI 卷，不依赖 fw_env.config。
 
 ## 其他要点
@@ -48,7 +48,17 @@ agent_created: true
 - **进程名**：判代理活死用端口 `7874` 监听或 `ps w | grep [c]lash`（进程名是 `clash` 非 `clash_meta`，`grep clash_meta` 必误报 0）。
 
 ## 收尾
-- 升级后改默认密码：`ssh <router> 'passwd root'`。
+- 升级后改默认密码：`ssh <路由器地址> 'passwd root'`。
+
+## ⚠️ 路由器地址如何配置（不写死、不外泄）
+脚本**不含任何个人 SSH 别名或局域网 IP**。运行时按以下优先级确定路由器 SSH 目标：
+1. 环境变量 `ROUTER`（如 `export ROUTER=root@192.168.1.1`）
+2. 命令行 `--router root@192.168.1.1`
+3. 仓库本地文件 `router-target.conf`（已被 `.gitignore` 忽略，**不会进 Git**；首次成功连接后自动写入）
+4. 自动探测 `~/.ssh/config` 中主机名含 `openwrt`/`immortalwrt`/`router` 的条目
+5. 以上都没有时，**交互询问**你输入，并持久化到 `router-target.conf` 供下次免问
+
+因此克隆本仓库的人无需改任何源码即可适配自己的网络；你的 `router-target.conf` 只存在于你自己机器上。
 - 回退镜像已自动化：`upgrade_router.sh` 刷前会自动把"当前运行版本"的本地 itb 选为回退点（见 `resolve_rollback`）。**只需保证 `*.itb` 里别删掉旧版本文件**。另注：脚本 `EXPECT_SHA` 默认硬编码为某版本 sha256，升新版本前需改成新 itb 的实际 sha256（安全锁，防刷错）；`--force` 可跳过此校验（紧急恢复用）。
 
 ## 🤖 自动化无人值守（router_watch.sh）
