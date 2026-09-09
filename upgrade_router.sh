@@ -19,7 +19,7 @@
 #   - 恢复/诊断时若路由在出厂态, 你的路由器地址/别名连不上, 改用出厂默认: ssh root@192.168.1.1
 #   - Mac 的 SSH 公钥已内置在 kit.tar.gz 的 etc/dropbear/authorized_keys (全清刷后仍可 key 登录)
 #   - 升级后 root 密码由升级前从活路由器抓取的 shadow hash 自动恢复, 与升级前一致; 如需改密: ssh <路由器地址> 'passwd root'
-#   - 在 ~/.ssh/config 配置你的路由器 SSH 地址 (如 Host router -> 192.168.x.1); 刷机后 host key 会变, 终验用 accept-new
+#   - 在 ~/.ssh/config 配置你的路由器 SSH 地址 (如 Host <router> -> 192.168.x.1); 刷机后 host key 会变, 终验用 accept-new
 
 set -u
 # ---------- 参数解析 ----------
@@ -178,7 +178,7 @@ echo "=== 预检 ==="
 echo "ITB : $(basename "$ITB")"
 echo "KIT : $(basename "$KIT")"
 ssh -o ConnectTimeout=8 "$ROUTER" 'echo "路由器可达: $(grep DISTRIB_REVISION /etc/openwrt_release)"' \
-  || die "无法 SSH 到路由器 (确认本机已连路由器: WiFi 或有线均可, 且 Host router 别名有效)"
+  || die "无法 SSH 到路由器 (确认本机已连路由器: WiFi 或有线均可, 且 SSH 地址解析有效; 可用 --router 显式指定或配置 router-target.conf)"
 
 # 解析回退镜像(当前运行版本对应的本地 itb = 自动备份点)
 ROLLBACK=$(resolve_rollback 2>/dev/null)
