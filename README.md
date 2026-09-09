@@ -40,7 +40,7 @@
 ## 前置条件
 
 - macOS（脚本用到 `osascript` 桌面通知、`sed -i ''`、BSD `date`）
-- 已 `ssh` 到路由：`~/.ssh/config` 中 `Host router` → `192.168.88.1`，且 Mac 公钥已能 key 登录
+- 已 `ssh` 到路由：`~/.ssh/config` 中 `Host <router>` → 路由器 LAN 地址（如 `192.168.x.1`），且 Mac 公钥已能 key 登录。脚本也会自动探测该配置或交互询问，无需写死地址。
 - `gh` CLI 已登录（watch 查 release / 自动刷新 `EXPECT_SHA` 需要）
 - `curl`（独立 sha256 校验需要）
 
@@ -82,7 +82,7 @@
 
 ## 四层安全模型
 
-1. **T0 预防**：首启动 `uci-defaults` 自举恢复 LAN 192.168.88.1 + 原 SSID，刷机窗口内 Mac 无需人工接手（WiFi 主路径，有线兜底）。
+1. **T0 预防**：首启动 `uci-defaults` 自举恢复 LAN IP（默认 `192.168.1.1/24`，升级前从活路由器抓取注入）+ 原 SSID，刷机窗口内 Mac 无需人工接手（WiFi 主路径，有线兜底）。
 2. **T1 检测**：脚本轮询重连 + 终验（版本 / flow offload / 三频 / OpenClash / DNS / U-Boot）。
 3. **T2 恢复**：U-Boot 常住兜底 `bootcmd=run boot_ubi || http_recovery`（实测在位）——刷坏自动进 HTTP Recovery，免拆机。
 4. **T3 回退**：刷前自动解析"当前运行版本"对应的本地 itb 作回退镜像；强终验失败自动 `sysupgrade -F` 回退**并连带还原升级前配置快照**（`backups/`）。
