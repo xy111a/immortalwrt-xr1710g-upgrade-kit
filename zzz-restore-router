@@ -1,0 +1,226 @@
+#!/bin/sh
+# /etc/uci-defaults/zzz-restore-router
+# 首启动自举: 在 9/8 干净刷后, 把路由器恢复到与升级前一致的连网状态。
+#
+# 执行时机: 本脚本由 /etc/init.d/boot (S10boot) 在系统启动极早期调用,
+#           此时网络(LAN/WAN)尚未就绪 —— 因此本脚本只做"写盘/设密码"等
+#           不需要联网的操作; 任何需要联网的步骤(apk add / OpenClash 启动)
+#           都必须延后到网络起来之后, 见本脚本第 7 段注入的 /etc/rc.local。
+#
+# 设计原则:
+#  - network/wireless/dhcp 用确定性 heredoc / uci 直接写(已知良好配置, 非旧不兼容配置)
+#  - OpenClash 敏感配置(/etc/config/openclash)与数据(/etc/openclash/*)由 sysupgrade -f 备份原样还原, 本脚本不读取其内容
+#  - 仅重装 luci-app-openclash 包(配置文件不随包走)并启动服务, 但这一步放在 rc.local(网络就绪后)
+#  - 任何单步失败都不阻断启动(用 || true), 失败信息写入 /tmp/zzz-*.log 供事后排查
+set -x
+
+LOG=/tmp/zzz-restore.log
+exec 2>>$LOG
+echo "=== zzz-restore-router 开始 $(date) ===" >>$LOG
+
+# 升级后 root 密码(全清刷后 root 无密码, 必须设置, 否则:
+#   a) 内网任何设备可空密码 LAN SSH 进 root; b) 非交互脚本 ssh 连不上无法终验)
+# root 密码与 WiFi key 不再硬编码: 升级前由 Mac 侧 upgrade_router.sh 从活路由器
+# 抓取 /etc/shadow 的 root 行 + /etc/config/wireless 的 key, 写入 kit 的 etc/router-secrets
+# (权限 600, 不进 Git)。首启动自举从此文件恢复, 保证与升级前完全一致, 且无明文泄露。
+# 本脚本自身已不含任何明文密码, 可直接提交到任意 Git 仓库; 敏感数据只存在于
+# 运行期动态注入的 etc/router-secrets (由 kit 携带, kit 不入库)。
+SECRETS=/etc/router-secrets
+ROOT_SHADOW=""; WIFI_KEY=""
+SSID0=""; SSID1=""; SSID2=""
+if [ -f "$SECRETS" ]; then
+  ROOT_SHADOW=$(grep '^ROOT_SHADOW=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
+  WIFI_KEY=$(grep '^WIFI_KEY='    "$SECRETS" 2>/dev/null | cut -d= -f2-)
+  SSID0=$(grep '^SSID0=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
+  SSID1=$(grep '^SSID1=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
+  SSID2=$(grep '^SSID2=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
+fi
+
+# ---------- 1. network: 还原 LAN IP / 桥接 / WAN ----------
+cat > /etc/config/network <<'NETEOF'
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	list ipaddr '127.0.0.1/8'
+
+config globals 'globals'
+	option dhcp_default_duid '00044ad7b92ad0ae513ab6b6053c60cd4658'
+
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'lan2'
+	list ports 'lan3'
+	list ports 'lan4'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.88.1/24'
+	option ip6assign '0'
+	option ip6ifaceid 'eui64'
+
+config interface 'wan'
+	option device 'wan'
+	option proto 'dhcp'
+	option sendclientid 'hardware'
+
+config interface 'wan6'
+	option device 'wan'
+	option proto 'dhcpv6'
+NETEOF
+
+# ---------- 2. wireless: 还原三频(6G 按当前决策保持 disabled) ----------
+cat > /etc/config/wireless <<WIFIEOF
+config wifi-device 'radio0'
+	option type 'mac80211'
+	option path 'soc/1fc00000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0'
+	option radio '0'
+	option band '2g'
+	option channel '1'
+	option htmode 'EHT20'
+	option country 'US'
+	option txpower '20'
+	option disabled '0'
+	option he_mu_beamformer '0'
+	option he_su_beamformer '1'
+
+config wifi-iface 'default_radio0'
+	option device 'radio0'
+	option network 'lan'
+	option mode 'ap'
+	option ssid '${SSID0:-Router}'
+	option encryption 'sae-mixed'
+	option key '$WIFI_KEY'
+	option disabled '0'
+	option ieee80211k '1'
+	option ieee80211v '1'
+	option ieee80211r '1'
+	option ft_over_ds '1'
+	option ft_psk_generate_local '1'
+
+config wifi-device 'radio1'
+	option type 'mac80211'
+	option path 'soc/1fc00000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0'
+	option radio '1'
+	option band '5g'
+	option channel '36'
+	option htmode 'EHT160'
+	option country 'US'
+	option txpower '28'
+	option disabled '0'
+	option he_su_beamformer '1'
+	option he_mu_beamformer '1'
+	option eht_su_beamformer '1'
+	option eht_mu_beamformer '1'
+	option he_bss_color '2'
+	option radar_background '1'
+
+config wifi-iface 'default_radio1'
+	option device 'radio1'
+	option network 'lan'
+	option mode 'ap'
+	option ssid '${SSID1:-Router-5G}'
+	option encryption 'sae-mixed'
+	option key '$WIFI_KEY'
+	option disabled '0'
+	option ieee80211k '1'
+	option ieee80211v '1'
+	option ieee80211r '1'
+	option ft_over_ds '1'
+	option ft_psk_generate_local '1'
+
+config wifi-device 'radio2'
+	option type 'mac80211'
+	option path 'soc/1fc00000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0'
+	option radio '2'
+	option band '6g'
+	option channel '37'
+	option htmode 'EHT320'
+	option country 'US'
+	option txpower '28'
+	option disabled '1'
+	option eht_su_beamformer '1'
+	option eht_mu_beamformer '1'
+	option he_su_beamformer '1'
+	option he_mu_beamformer '1'
+	option he_bss_color '1'
+	option he_twt_responder '1'
+
+config wifi-iface 'default_radio2'
+	option device 'radio2'
+	option network 'lan'
+	option mode 'ap'
+	option ssid '${SSID2:-Router-6G}'
+	option encryption 'sae-mixed'
+	option key '$WIFI_KEY'
+	option disabled '0'
+WIFIEOF
+
+# ---------- 3. firewall: 确保 flow offload + fullcone 开启 ----------
+uci set firewall.@defaults[0].flow_offloading='1' 2>/dev/null || true
+uci set firewall.@defaults[0].flow_offloading_hw='1' 2>/dev/null || true
+uci set firewall.@defaults[0].fullcone='1' 2>/dev/null || true
+uci commit firewall 2>/dev/null || true
+
+# ---------- 4. root 密码(从升级前抓取的 shadow hash 恢复, 无明文) ----------
+# 不再用 passwd 从明文设密码, 而是把活路由器 /etc/shadow 的 root 行原样写回,
+# 保证升级前后 root 密码完全一致, 且脚本/仓库内无任何明文。
+if [ -n "$ROOT_SHADOW" ]; then
+  if awk -v line="$ROOT_SHADOW" 'BEGIN{FS=":";OFS=":"} $1=="root"{print line; next}{print}' /etc/shadow >/etc/shadow.tmp 2>/dev/null \
+     && mv /etc/shadow.tmp /etc/shadow 2>/dev/null \
+     && chmod 600 /etc/shadow 2>/dev/null; then
+    echo "root 密码已从升级前备份恢复 (shadow hash, 无明文)" >>$LOG
+  else
+    echo "root 密码恢复失败(降级: 仅依赖 authorized_keys key 登录)" >>$LOG
+  fi
+else
+  echo "⚠️ 未找到 shadow 备份, root 将无密码(仅 key 登录)" >>$LOG
+fi
+
+# ---------- 5. dropbear 权限/属主(已由 sysupgrade -f 还原 Mac 公钥) ----------
+# 关键: sysupgrade -f 还原的 tar 会保留 Mac 端 uid(非 root), 导致 dropbear 报
+#   "/etc/dropbear must be owned by user or root" 并直接禁用公钥认证 → ssh 只能密码/全失败。
+# 必须显式 chown 回 root, 否则升级后 key 登录全部失效。
+chown root:root /etc/dropbear /etc/dropbear/authorized_keys 2>/dev/null
+chmod 700 /etc/dropbear 2>/dev/null
+chmod 600 /etc/dropbear/authorized_keys 2>/dev/null
+
+# ---------- 6. 应用网络与无线(写盘即可, 系统正常启动流程会采纳) ----------
+/etc/init.d/network restart >>$LOG 2>&1 || true
+wifi reload >>$LOG 2>&1 || true
+sleep 2
+
+# ---------- 7. 延后到网络就绪后再装 OpenClash(uci-defaults 阶段网络未起, apk 必失败) ----------
+#     注入到 /etc/rc.local(S95done 之后执行, 此时 WAN 已拨号/有路由), 用 sentinel 防重复执行
+if [ ! -f /etc/zzz-postinstall-done ]; then
+cat > /etc/rc.local <<'RCEOF'
+#!/bin/sh
+# zzz-restore-router 注入: 首启动后网络就绪再装 OpenClash 并启动
+# 仅执行一次(sentinel: /etc/zzz-postinstall-done)
+if [ ! -f /etc/zzz-postinstall-done ]; then
+  for i in 1 2 3 4 5 6; do
+    if apk update >>/tmp/zzz-postinstall.log 2>&1 && apk add luci-app-openclash >>/tmp/zzz-postinstall.log 2>&1; then
+      echo "apk add luci-app-openclash 成功 (尝试 $i)" >>/tmp/zzz-postinstall.log
+      break
+    fi
+    echo "apk 重试 $i ..." >>/tmp/zzz-postinstall.log
+    sleep 10
+  done
+  chmod 755 /etc/openclash 2>/dev/null
+  chmod +x /etc/openclash/core/clash_meta 2>/dev/null
+  /etc/init.d/openclash enable >>/tmp/zzz-postinstall.log 2>&1
+  /etc/init.d/openclash restart >>/tmp/zzz-postinstall.log 2>&1
+  touch /etc/zzz-postinstall-done
+fi
+exit 0
+RCEOF
+  chmod +x /etc/rc.local 2>/dev/null
+  echo "rc.local postinstall 已注入" >>$LOG
+fi
+
+echo "=== zzz-restore-router 结束 $(date) ===" >>$LOG
+# 清理: 升级前注入的敏感文件用后删除, 减少明文 hash 在运行系统驻留
+rm -f "$SECRETS" 2>/dev/null
+touch /etc/zzz-restore-done
+exit 0
