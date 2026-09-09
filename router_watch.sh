@@ -20,19 +20,39 @@ REPO="naoki66/ImmortalWrt-for-Gemtek-XR1710G"
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$PREP_DIR/watch.log"
 ENABLE_FILE="$HOME/.router_autoupgrade_enabled"
-FORCE=0; CHECK_ONLY=0; NOW=0
-for a in "$@"; do
-  case "$a" in
+FORCE=0; CHECK_ONLY=0; NOW=0; ROUTER_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --force) FORCE=1;;
     --check) CHECK_ONLY=1;;
     --now)   NOW=1;;
+    --router) ROUTER_OVERRIDE="${2:-}"; shift;;
+    --router=*) ROUTER_OVERRIDE="${1#*=}";;
+    *) ;;
   esac
+  shift
 done
 
 log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 
+# 解析路由器 SSH 目标 (不写死个人别名/IP):
+#   环境变量 ROUTER > --router 参数 > 本地 router-target.conf(git 忽略) > 自动探测 ~/.ssh/config > 交互询问(持久化)
+ROUTER="${ROUTER_OVERRIDE:-}"
+if [ -z "$ROUTER" ] && [ -f "$PREP_DIR/router-target.conf" ]; then
+  ROUTER="$(cat "$PREP_DIR/router-target.conf" 2>/dev/null)"
+fi
+if [ -z "$ROUTER" ] && [ -f "$HOME/.ssh/config" ] && command -v awk >/dev/null 2>&1; then
+  ROUTER=$(awk '/^[Hh]ost /{h=$2} {l=tolower($0)} (l ~ /openwrt/||l ~ /immortalwrt/||l ~ /router/) && h{print h; exit}' "$HOME/.ssh/config" 2>/dev/null)
+fi
+if [ -z "$ROUTER" ]; then
+  printf '请输入路由器的 SSH 地址 (如 root@192.168.1.1, 或 ssh config 中的主机别名): ' >&2
+  read -r ROUTER </dev/tty 2>/dev/null
+  [ -n "$ROUTER" ] && printf '%s\n' "$ROUTER" > "$PREP_DIR/router-target.conf" 2>/dev/null
+fi
+[ -n "$ROUTER" ] || { log "❌ 未配置路由器 SSH 地址 (用 --router 或 ROUTER 环境变量指定)"; exit 1; }
+
 # ---------- 1. 路由器当前版本 commit ----------
-cur_rev=$(ssh -o ConnectTimeout=8 router 'grep DISTRIB_REVISION /etc/openwrt_release' 2>/dev/null)
+cur_rev=$(ssh -o ConnectTimeout=8 "$ROUTER" 'grep DISTRIB_REVISION /etc/openwrt_release' 2>/dev/null)
 cur_hash=$(printf '%s' "$cur_rev" | grep -oE '[0-9a-f]{7,40}' | tail -1)
 [ -n "$cur_hash" ] || { log "❌ 无法读取路由器当前版本 (SSH 不可达?)"; exit 1; }
 log "当前固件 commit: $cur_hash"
@@ -112,5 +132,5 @@ fi
 
 # ---------- 8. 触发升级 (--auto: 强终验失败自动回退) ----------
 log "🚀 触发升级 (--auto)"
-"$PREP_DIR/upgrade_router.sh" --auto
+"$PREP_DIR/upgrade_router.sh" --auto --router "$ROUTER"
 log "=== watch 流程结束 ==="
