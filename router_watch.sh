@@ -75,7 +75,9 @@ log "🔔 发现新版本: $rel_tag (当前 $cur_hash)"
 
 # ---------- 4. 安全闸: 发布满 72h ----------
 if [ "$FORCE" = "0" ]; then
-  pub_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$pub" +%s 2>/dev/null)
+  # macOS BSD date 不认 ISO "Z" 后缀为 UTC, 会当成本地时间导致闸值虚高 8h; 转成 +0000 用 %z 解析
+  pub_utc="${pub/Z/+0000}"
+  pub_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$pub_utc" +%s 2>/dev/null)
   now_epoch=$(date +%s)
   if [ -n "$pub_epoch" ]; then
     age=$(( (now_epoch - pub_epoch) / 3600 ))
