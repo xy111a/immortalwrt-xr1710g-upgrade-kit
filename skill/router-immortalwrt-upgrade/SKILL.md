@@ -12,8 +12,8 @@ agent_created: true
 用户要升级路由器固件（ImmortalWrt，第三方构建 naoki66，Airoha AN7581 平台）。
 **关键前提**：固件来自第三方 GitHub `naoki66/ImmortalWrt-for-Gemtek-XR1710G`（非官方，官方 airoha/an7581 目录空）。升前**必看该仓库 release note** 是否写"不建议保留配置升级"——若写，则**必须全清刷**（keep-settings OFF），不可走"保留 network/wireless"捷径（子系统重构会导致首启动网络异常）。
 
-## 资产位置（从本仓库获取）
-克隆本仓库后，脚本位于仓库根目录：
+## 资产位置（本 skill 自带）
+脚本随 skill 一同安装，位于 skill 根目录（与 SKILL.md 同级）：
 - `upgrade_router.sh` — Mac 侧编排器（上传 itb+kit → `sysupgrade -n -f` → 轮询重连 → 终验；支持 `--dry-run` / `--auto` / `--force`）。
 - `zzz-restore-router` — uci-defaults 首启动自举脚本（设 LAN、三频 SSID、开 flow offload、注入 rc.local 装 OpenClash）。
 - `build_kit.sh` — 本地从源码组装 `kit.tar.gz`（**不入库**；含你的 SSH 公钥与可选 OpenClash 配置）。
