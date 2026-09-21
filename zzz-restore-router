@@ -20,11 +20,12 @@ echo "=== zzz-restore-router 开始 $(date) ===" >>$LOG
 
 # 升级后 root 密码(全清刷后 root 无密码, 必须设置, 否则:
 #   a) 内网任何设备可空密码 LAN SSH 进 root; b) 非交互脚本 ssh 连不上无法终验)
-# root 密码 / WiFi key / 三频 SSID / LAN IP 均不再硬编码: 升级前由 Mac 侧 upgrade_router.sh
-# 从活路由器抓取 /etc/shadow 的 root 行 + wireless 的 key/ssid + network.lan.ipaddr, 写入 kit 的
-# etc/router-secrets (权限 600, 不进 Git)。首启动自举从此文件恢复, 保证与升级前完全一致, 且无明文泄露。
-# 本脚本自身已不含任何明文密码, 可直接提交到任意 Git 仓库; 敏感数据只存在于
-# 运行期动态注入的 etc/router-secrets (由 kit 携带, kit 不入库)。
+# root 密码 / WiFi key / 三频 SSID / LAN IP / DHCP 静态租约 均不再硬编码: 升级前由 Mac 侧
+# upgrade_router.sh 从活路由器抓取 /etc/shadow 的 root 行 + wireless 的 key/ssid + network.lan.ipaddr
+# + DHCP host 段, 写入 kit 的 etc/router-secrets (权限 600) 与 etc/dhcp-hosts.uci (不进 Git)。
+# 首启动自举从这两个文件恢复, 保证与升级前完全一致, 且无明文泄露。
+# 本脚本自身已不含任何明文密码 / MAC, 可直接提交到任意 Git 仓库; 敏感数据只存在于
+# 运行期动态注入的 etc/router-secrets / etc/dhcp-hosts.uci (由 kit 携带, kit 不入库)。
 SECRETS=/etc/router-secrets
 ROOT_SHADOW=""; WIFI_KEY=""
 SSID0=""; SSID1=""; SSID2=""; LAN_IP=""
@@ -164,6 +165,32 @@ uci set firewall.@defaults[0].flow_offloading_hw='1' 2>/dev/null || true
 uci set firewall.@defaults[0].fullcone='1' 2>/dev/null || true
 uci commit firewall 2>/dev/null || true
 
+# ---------- 3.5 dhcp: 恢复静态租约(全清刷 -n 会抹掉 /etc/config/dhcp) ----------
+# 不写死 MAC: 升级前由 Mac 侧 upgrade_router.sh 从活路由器抓取当前 DHCP 静态租约,
+# 写入 kit 的 etc/dhcp-hosts.uci (每行: host <name> <mac> <ip> <leasetime>),
+# 本脚本按文件重建具名段(幂等, 重复运行不追加重复)。文件中无明文密码, 可随 kit 携带。
+DHCP_HOSTS=/etc/dhcp-hosts.uci
+# 先清空可能残留的匿名 host 段, 再用具名段确定性重建(幂等)
+for h in $(uci show dhcp 2>/dev/null | grep -oE 'dhcp\.@host\[[0-9]+\]' | sort -u); do
+  uci -q delete "$h" 2>/dev/null || true
+done
+uci commit dhcp 2>/dev/null || true
+if [ -f "$DHCP_HOSTS" ]; then
+  while read -r _name _mac _ip _lease; do
+    [ -z "$_name" ] && continue
+    _sid=$(printf '%s' "$_name" | tr -c 'A-Za-z0-9' '_')   # uci section 名仅允许 [A-Za-z0-9_]
+    uci set "dhcp.$_sid=host"
+    uci set "dhcp.$_sid.name=$_name"
+    uci set "dhcp.$_sid.mac=$_mac"
+    uci set "dhcp.$_sid.ip=$_ip"
+    uci set "dhcp.$_sid.leasetime=${_lease:-infinite}"
+  done < "$DHCP_HOSTS"
+  uci commit dhcp 2>/dev/null || true
+  echo "已恢复 DHCP 静态租约 ($(wc -l < "$DHCP_HOSTS" 2>/dev/null || echo 0) 条, 抓取自活路由)" >>$LOG
+else
+  echo "ℹ️ 未找到 DHCP 静态租约抓取文件, 跳过(升级前未配置静态租约)" >>$LOG
+fi
+
 # ---------- 4. root 密码(从升级前抓取的 shadow hash 恢复, 无明文) ----------
 # 不再用 passwd 从明文设密码, 而是把活路由器 /etc/shadow 的 root 行原样写回,
 # 保证升级前后 root 密码完全一致, 且脚本/仓库内无任何明文。
@@ -222,6 +249,6 @@ fi
 
 echo "=== zzz-restore-router 结束 $(date) ===" >>$LOG
 # 清理: 升级前注入的敏感文件用后删除, 减少明文 hash 在运行系统驻留
-rm -f "$SECRETS" 2>/dev/null
+rm -f "$SECRETS" /etc/dhcp-hosts.uci 2>/dev/null
 touch /etc/zzz-restore-done
 exit 0

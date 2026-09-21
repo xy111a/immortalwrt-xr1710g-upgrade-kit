@@ -183,6 +183,17 @@ collect_runtime(){
   else
     echo "⚠️ OpenClash 配置抓取失败, 沿用 kit 内烘焙版本"
   fi
+  # 抓取活路由当前 DHCP 静态租约(host 段) -> 写入 kit 的 etc/dhcp-hosts.uci
+  # 格式: 每行 "host <name> <mac> <ip> <leasetime>"; 首启动自举据此重建, 不写死 MAC
+  if ssh -o ConnectTimeout=8 "$ROUTER" 'for sec in $(uci show dhcp 2>/dev/null | grep -oE "dhcp.@host\[[0-9]+\]" | sort -u); do n=$(uci -q get "${sec}.name"); m=$(uci -q get "${sec}.mac"); ip=$(uci -q get "${sec}.ip"); lt=$(uci -q get "${sec}.leasetime"); [ -n "$m" ] && [ -n "$ip" ] && echo "host ${n:-unknown} $m $ip ${lt:-infinite}"; done' 2>/dev/null > "$build/etc/dhcp-hosts.uci"; then
+    if [ -s "$build/etc/dhcp-hosts.uci" ]; then
+      echo "✅ 已抓取活路由 DHCP 静态租约 ($(wc -l < "$build/etc/dhcp-hosts.uci") 条) 注入 kit"
+    else
+      echo "ℹ️ 活路由无 DHCP 静态租约, 跳过"
+    fi
+  else
+    echo "⚠️ DHCP 静态租约抓取失败(不影响升级, 升级后无静态租约)"
+  fi
   mkdir -p "$build/etc"
   {
     [ -n "$s" ]  && echo "ROOT_SHADOW=$s"
@@ -222,7 +233,7 @@ fi
 if [ "$DRY" = "1" ]; then
   echo "=== DRY-RUN: 不执行升级 ==="
   echo "将执行的步骤:"
-  echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 并从活路由抓取 root/WiFi key/三频 SSID/OpenClash 注入 kit"
+  echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 并从活路由抓取 root/WiFi key/三频 SSID/OpenClash/DHCP 静态租约 注入 kit"
   echo "  1. scp $(basename "$ITB") $(basename "$KIT") -> $ROUTER:/tmp/"
   echo "  1b. 路由器侧复核 itb sha256 (防止 WiFi 上传损坏)"
   echo "  2. ssh $ROUTER 'sysupgrade -n -f /tmp/kit.tar.gz /tmp/$(basename "$ITB")' (n=不保留当前配置, 严格全清)"
