@@ -213,6 +213,8 @@ resolve_router || die "未配置路由器 SSH 地址 — 请用 --router root@19
 echo "=== 预检 ==="
 echo "ITB : $(basename "$ITB")"
 echo "KIT : $(basename "$KIT")"
+TARGET_COMMIT=$(basename "$ITB" | grep -oE '[0-9]{6,8}-[0-9a-f]{7,40}' | head -1 | cut -d- -f2)
+[ -n "$TARGET_COMMIT" ] && echo "目标版本 commit : $TARGET_COMMIT"
 ssh -o ConnectTimeout=8 "$ROUTER" 'echo "路由器可达: $(grep DISTRIB_REVISION /etc/openwrt_release)"' \
   || die "无法 SSH 到路由器 (确认本机已连路由器: WiFi 或有线均可, 且 SSH 地址解析有效; 可用 --router 显式指定或配置 router-target.conf)"
 
@@ -235,7 +237,7 @@ if [ "$DRY" = "1" ]; then
   echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 并从活路由抓取 root/WiFi key/三频 SSID/OpenClash/DHCP 静态租约 注入 kit"
   echo "  1. scp $(basename "$ITB") $(basename "$KIT") -> $ROUTER:/tmp/"
   echo "  1b. 路由器侧复核 itb sha256 (防止 WiFi 上传损坏)"
-  echo "  2. ssh $ROUTER 'sysupgrade -n -f /tmp/kit.tar.gz /tmp/$(basename "$ITB")' (n=不保留当前配置, 严格全清)"
+  echo "  2. ssh $ROUTER 'sysupgrade -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (n=不保留当前配置, 严格全清)"
   echo "     (nohup 后台执行, 路由器重启, SSH 断开, 本脚本随后轮询重连)"
   echo "  3. 轮询重连 (每 5s, 最多 40 次) 于路由器地址 / 常见出厂 IP (192.168.1.1 等)"
   echo "  4. 终验: 版本 / flow offload / 三频 / OpenClash / DNS / U-Boot (accept-new 接受新 host key)"
@@ -276,10 +278,19 @@ fi
 echo "=== 触发干净刷 (严格全清 -n + uci-defaults 自举) ==="
 echo "⚠️ 路由器即将重启, SSH 会断开, 本脚本自动轮询重连, 无需人工介入"
 # nohup + & 让 sysupgrade 在路由后台跑, ssh 立即返回, 避免连接在 reboot 时被重置误判
-ssh "$ROUTER" "nohup sysupgrade -n -f /tmp/kit.tar.gz /tmp/$(basename "$ITB") >/tmp/upg.log 2>&1 &" || true
+ssh "$ROUTER" "nohup sysupgrade -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB") >/tmp/upg.log 2>&1 &" || true
 
 # 干净刷后路由器生成全新 SSH host key; 先清掉本地旧 key, 否则 accept-new 会把"密钥变更"误判为拒绝 → 误报重连失败
 ssh-keygen -R "$R_HOST" 2>/dev/null; ssh-keygen -R "$ROUTER" 2>/dev/null
+echo "=== 等待路由器重启(先确认断开, 再等重连, 避免刷写 race 误判) ==="
+DOWN=0
+for i in $(seq 1 12); do
+  if ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then
+    echo "✅ 第 $i 次探测: 路由器已断开(正在重启)"; DOWN=1; break
+  fi
+  sleep 5
+done
+[ "$DOWN" = "1" ] || echo "⚠️ 12 次探测内未检测到断开 — 可能 sysupgrade 未触发重启, 继续尝试重连并终验"
 echo "=== 轮询重连 (每 5s, 最多 40 次 = 200s) ==="
 OK=0
 for i in $(seq 1 40); do
@@ -287,7 +298,7 @@ for i in $(seq 1 40); do
   tried="$ROUTER"
   for ip in 192.168.1.1 192.168.0.1 10.0.0.1; do tried="$tried root@$ip"; done
   for target in $tried; do
-    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new "$target" 'true' 2>/dev/null; then
+    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$target" 'true' 2>/dev/null; then
       echo "✅ 第 $i 轮经 $target 重连成功"; ROUTER="$target"; OK=1; break 2
     fi
   done
@@ -296,9 +307,9 @@ done
 [ "$OK" = "1" ] || die "重连失败 — 可能进入 Recovery 或需手动介入 (U-Boot 兜底已就位, 可访问 HTTP Recovery 重刷)"
 
 echo "=== 终验 (在路由器上, accept-new 接受全清后的新 host key) ==="
-ssh -o StrictHostKeyChecking=accept-new "$ROUTER" '
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
 set -x
-echo "--- 版本 ---"; grep DISTRIB_REVISION /etc/openwrt_release
+echo "--- 版本(期望 '"$TARGET_COMMIT"') ---"; rev=$(grep DISTRIB_REVISION /etc/openwrt_release); echo "$rev"; echo "$rev" | grep -q "'"$TARGET_COMMIT"'" && echo "✅ 版本已更新为新固件" || echo "❌ 版本未变(仍运行旧固件!)"
 echo "--- flow offload 计数 ---"; nft list counters 2>/dev/null | grep -iE "OFFLOAD|HW_OFFLOAD" | head
 echo "--- 三频 disabled 状态 ---"; uci show wireless | grep -E "radio[0-9]\.disabled"
 echo "--- OpenClash 进程 ---"; pgrep -f clash >/dev/null && echo "clash 运行中" || echo "clash 未运行"
@@ -316,7 +327,9 @@ echo "升级后请改 root 密码: ssh \"$ROUTER\" 'passwd root'"
 # ---------- 强终验 (仅 --auto 模式: 判定成败并触发回退) ----------
 # 判定: 外网通 + 代理DNS通(clash@7874) + radio0/1 启用 + clash 进程在 → 成功
 verify_router(){
-  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$ROUTER" '
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
+    rev=$(grep DISTRIB_REVISION /etc/openwrt_release 2>/dev/null | grep -oE "[0-9a-f]{7,40}$")
+    [ "$rev" = "'"$TARGET_COMMIT"'" ] || { echo "FAIL: 固件版本未变更 (期望 '"$TARGET_COMMIT"', 实得 $rev)"; exit 1; }
     curl -fsS --max-time 6 https://www.google.com >/dev/null 2>&1 || ping -c2 -W3 8.8.8.8 >/dev/null 2>&1 || { echo "FAIL: 外网不通"; exit 1; }
     nslookup github.com 127.0.0.1 >/dev/null 2>&1 || { echo "FAIL: 代理DNS不通"; exit 1; }
     for r in radio0 radio1; do
@@ -342,10 +355,10 @@ auto_rollback(){
     rbcmd="sysupgrade -F -f /tmp/rb-config.tar.gz /tmp/rb.itb"
     echo "   同时还原升级前配置快照(配置级回退): $(basename "$PREUPG_BACKUP")"
   fi
-  ssh -o StrictHostKeyChecking=accept-new "$ROUTER" "nohup $rbcmd >/tmp/rb.log 2>&1 &" || true
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" "nohup $rbcmd >/tmp/rb.log 2>&1 &" || true
   ssh-keygen -R "$R_HOST" 2>/dev/null; ssh-keygen -R "$ROUTER" 2>/dev/null
   for i in $(seq 1 40); do
-    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new "$ROUTER" 'true' 2>/dev/null; then break; fi
+    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then break; fi
     sleep 5
   done
   if verify_router; then
