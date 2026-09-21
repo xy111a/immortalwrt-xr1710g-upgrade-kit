@@ -59,11 +59,12 @@ agent_created: true
 5. 以上都没有时，**交互询问**你输入，并持久化到 `router-target.conf` 供下次免问
 
 因此克隆本仓库的人无需改任何源码即可适配自己的网络；你的 `router-target.conf` 只存在于你自己机器上。
-- 回退镜像已自动化：`upgrade_router.sh` 刷前会自动把"当前运行版本"的本地 itb 选为回退点（见 `resolve_rollback`）。**只需保证 `*.itb` 里别删掉旧版本文件**。另注：脚本 `EXPECT_SHA` 默认硬编码为某版本 sha256，升新版本前需改成新 itb 的实际 sha256（安全锁，防刷错）；`--force` 可跳过此校验（紧急恢复用）。
+- 回退镜像已自动化：`upgrade_router.sh` 刷前会自动把"当前运行版本"的本地 itb 选为回退点（见 `resolve_rollback`）。**只需保证 `*.itb` 里别删掉旧版本文件**。待刷 itb 的选择与校验均已自动化：`ITB` 按"官方最新 release 的 itb 资源名"精确匹配本地文件（`--itb` 可显式指定，避免回退镜像因 mtime 更新被误选）；`EXPECT_SHA` 运行时从官方 `sha256sums` 派生（不再硬编码旧版本 sha，杜绝"误刷回退镜像假通过"）；离线或刷旧 itb 时用 `--expect-sha` 显式给定，或 `--force` 跳过校验（紧急恢复用）。
 
 ## 🤖 自动化无人值守（router_watch.sh）
 - **何时加这层**：用户要"平时零介入"。此时升级从"手动触发"变"按需检测+满足条件自动刷"。
 - **按需模式（推荐，非常驻）**：`router_watch.sh --now` 用户授权升级（保留 72h 发布沉淀闸）；`--check` 只检测；`--force` 跳过 72h 闸。无需 launchd 常驻。
+- **非交互安全**：未配置路由器地址时，非 tty（launchd 等）环境直接报错退出而非挂起；`--router` / `ROUTER` 环境变量 / `router-target.conf` 任一就绪即可无人值守运行。`--check` 为纯只读，不修改任何源码。
 - **安全闸（缺一不可）**：
   1. **发布沉淀闸**：新版本发布 < 72h 不刷（单维护者构建，避开发布当日热修炸机）。
   2. **独立校验**：下载官方 `sha256sums`，比对 itb 真实 sha256（防篡改）；并自动写入 `upgrade_router.sh` 的 `EXPECT_SHA`，避免人工改漏。

@@ -26,7 +26,7 @@ set -u
 #   --dry-run  只校验前置条件 + 打印将执行步骤, 不刷机
 #   --auto     强终验失败自动回退 (供 router_watch.sh 调用)
 #   --force    忽略 EXPECT_SHA 不匹配强制刷 (仅紧急恢复用, 慎用)
-DRY=0; AUTO=0; FORCE=0; ROUTER_OVERRIDE=""
+DRY=0; AUTO=0; FORCE=0; ROUTER_OVERRIDE=""; ITB_OVERRIDE=""; EXPECT_SHA_OVERRIDE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1;;
@@ -34,6 +34,10 @@ while [ $# -gt 0 ]; do
     --force)   FORCE=1;;
     --router)  ROUTER_OVERRIDE="${2:-}"; shift;;
     --router=*) ROUTER_OVERRIDE="${1#*=}";;
+    --itb)     ITB_OVERRIDE="${2:-}"; shift;;
+    --itb=*)   ITB_OVERRIDE="${1#*=}";;
+    --expect-sha) EXPECT_SHA_OVERRIDE="${2:-}"; shift;;
+    --expect-sha=*) EXPECT_SHA_OVERRIDE="${1#*=}";;
     *) ;;
   esac
   shift
@@ -44,10 +48,9 @@ trap 'rm -rf /tmp/kit_build /tmp/kit_injected.tar.gz 2>/dev/null' EXIT
 
 REPO="naoki66/ImmortalWrt-for-Gemtek-XR1710G"
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
-ITB=$(ls -t "$PREP_DIR"/*.itb 2>/dev/null | head -1)
 KIT="$PREP_DIR/kit.tar.gz"
 ROUTER="${ROUTER_OVERRIDE:-}"
-FW_NEW="20260908-4974641d84"
+EXPECT_SHA="${EXPECT_SHA_OVERRIDE:-}"
 # 回退镜像: 默认自动解析为"当前路由器正在运行的版本"对应的本地 itb (刷前预飞时按 commit hash 匹配)。
 # 旧 9/1 硬编码镜像仅作最后兜底 —— 升级到 9/8 后它已非当前版本, 不应再作为首选回退。
 FALLBACK_ITB="$PREP_DIR/../router-backup-20260901/immortalwrt-xr1710g-20260901-131ef84fe9.itb"
@@ -55,6 +58,23 @@ FALLBACK_ITB="$PREP_DIR/../router-backup-20260901/immortalwrt-xr1710g-20260901-1
 PREUPG_BACKUP=""
 
 die(){ echo "❌ $1"; exit 1; }
+
+# 解析待刷 itb: 优先级 --itb > 官方最新 release tag 本地匹配 > ls -t 最新(带警告)
+# 不依赖 mtime 选 target, 避免回退 itb 比目标新时被误选为刷机目标
+resolve_target_itb(){
+  [ -n "$ITB_OVERRIDE" ] && { [ -f "$ITB_OVERRIDE" ] && { printf '%s' "$ITB_OVERRIDE"; return 0; } || { echo "❌ --itb 指定文件不存在: $ITB_OVERRIDE" >&2; return 1; }; }
+  # 直接取官方最新 release 的 itb 资源名精确匹配(与 router_watch.sh 选源一致);
+  # 注意: release tag 的哈希与 itb 文件名内的 commit 哈希不同, 不能靠 tag 哈希去 grep 文件名
+  local name itb
+  name=$(gh api "repos/$REPO/releases/latest" --jq '[.assets[] | select(.name|test("gemtek_xr1710g")) | .name][0]' 2>/dev/null)
+  if [ -n "$name" ] && [ -f "$PREP_DIR/$name" ]; then
+    printf '%s' "$PREP_DIR/$name"; return 0
+  fi
+  # 兜底: 取最新 mtime 的 itb, 但可能误选回退镜像, 仅警告(本地未下载最新版时)
+  itb=$(ls -t "$PREP_DIR"/*.itb 2>/dev/null | head -1)
+  [ -n "$itb" ] && { echo "⚠️ 未能从官方 release 解析目标 itb(本地可能未下载最新版), 退回按 mtime 选最新(可能误选回退镜像): $(basename "$itb")" >&2; printf '%s' "$itb"; return 0; }
+  return 1
+}
 
 # macOS 桌面通知(仅本机提示, 远程无人值守时有反馈); 非 macOS 或无 osascript 时静默
 notify(){
@@ -79,15 +99,21 @@ resolve_router(){
     local cand
     cand=$(awk '/^[Hh]ost /{h=$2} {l=tolower($0)} (l ~ /openwrt/||l ~ /immortalwrt/||l ~ /router/) && h{print h; exit}' "$HOME/.ssh/config" 2>/dev/null)
     if [ -n "$cand" ]; then
-      printf '检测到 ~/.ssh/config 中的主机 "%s", 用作路由器地址? [Y/n] ' "$cand" >&2
-      local _ans=""
-      read -r _ans </dev/tty 2>/dev/null
-      case "$_ans" in n|N) ;; *) ROUTER="$cand";; esac
+      if [ -t 0 ]; then
+        printf '检测到 ~/.ssh/config 中的主机 "%s", 用作路由器地址? [Y/n] ' "$cand" >&2
+        local _ans=""
+        read -r _ans </dev/tty 2>/dev/null
+        case "$_ans" in n|N) ;; *) ROUTER="$cand";; esac
+      else
+        ROUTER="$cand"
+      fi
     fi
   fi
   if [ -z "$ROUTER" ]; then
-    printf '请输入路由器的 SSH 地址 (如 root@192.168.1.1, 或 ssh config 中的主机别名): ' >&2
-    read -r ROUTER </dev/tty 2>/dev/null
+    if [ -t 0 ]; then
+      printf '请输入路由器的 SSH 地址 (如 root@192.168.1.1, 或 ssh config 中的主机别名): ' >&2
+      read -r ROUTER </dev/tty 2>/dev/null
+    fi
   fi
   if [ -n "$ROUTER" ]; then
     printf '%s\n' "$ROUTER" > "$PREP_DIR/router-target.conf" 2>/dev/null
@@ -97,7 +123,7 @@ resolve_router(){
   return 1
 }
 
-[ -f "$ITB" ]    || die "找不到待刷 itb (期望 $PREP_DIR/*.itb, 应为最新下载的那个)"
+ITB=$(resolve_target_itb) || die "找不到待刷 itb (期望 $PREP_DIR/*.itb, 应为最新下载的那个; 或用 --itb 显式指定)"
 [ -f "$KIT" ]    || die "找不到 kit.tar.gz"
 
 # 自动解析回退镜像: 取路由器当前运行的 commit hash, 在本地 firmware-prep 匹配同名 itb。
@@ -105,7 +131,7 @@ resolve_router(){
 resolve_rollback(){
   local rev hash itb
   rev=$(ssh -o ConnectTimeout=8 "$ROUTER" 'grep DISTRIB_REVISION /etc/openwrt_release' 2>/dev/null) || return 1
-  hash=$(printf '%s' "$rev" | grep -oE '[0-9a-f]{7,40}$' | head -1)
+  hash=$(printf '%s' "$rev" | grep -oE '[0-9a-f]{7,40}' | tail -1)  # 取末尾 hex 串; 避开 DISTRIB_REVISION 行尾单引号对 $ 锚点的干扰
   [ -n "$hash" ] || return 1
   itb=$(ls "$PREP_DIR"/*.itb 2>/dev/null | grep -i "$hash" | head -1)
   [ -n "$itb" ] && { printf '%s' "$itb"; return 0; }
@@ -117,7 +143,7 @@ resolve_rollback(){
 backup_config(){
   local rev hash ts dest
   rev=$(ssh -o ConnectTimeout=8 "$ROUTER" 'grep DISTRIB_REVISION /etc/openwrt_release' 2>/dev/null) || return 0
-  hash=$(printf '%s' "$rev" | grep -oE '[0-9a-f]{7,40}$' | head -1)
+  hash=$(printf '%s' "$rev" | grep -oE '[0-9a-f]{7,40}' | tail -1)  # 取末尾 hex 串; 避开 DISTRIB_REVISION 行尾单引号对 $ 锚点的干扰
   ts=$(date +%Y%m%d-%H%M%S)
   mkdir -p "$PREP_DIR/backups"
   dest="$PREP_DIR/backups/pre-upg-${hash:-unknown}-$ts.tar.gz"
@@ -211,39 +237,30 @@ fi
 backup_config
 collect_runtime
 
-# 若 EXPECT_SHA 与实测不符且非 --force, 尝试从官方 release 拉最新 sha256sums 自动刷新
-# (消除"手动下了新 itb 却没先跑 watch"导致 EXPECT_SHA 过期直接 die 的 footgun)
-refresh_sha(){
-  command -v gh >/dev/null 2>&1 || { echo "  (无 gh CLI, 跳过自动刷新, 需手动更新 EXPECT_SHA 或加 --force)"; return 0; }
-  local sums_url remote_sha
-  sums_url=$(gh api "repos/$REPO/releases/latest" --jq '[.assets[] | select(.name=="sha256sums") | .browser_download_url][0]' 2>/dev/null)
-  [ -n "$sums_url" ] || { echo "  (未找到官方 sha256sums, 跳过自动刷新)"; return 0; }
-  remote_sha=$(curl -fsSL "$sums_url" 2>/dev/null | grep "$(basename "$ITB")" | awk '{print $1}')
-  if [ -n "$remote_sha" ] && [ "$remote_sha" = "$ACT_SHA" ]; then
-    EXPECT_SHA="$remote_sha"
-    sed -i '' "s/^EXPECT_SHA=\".*\"/EXPECT_SHA=\"$EXPECT_SHA\"/" "$0" 2>/dev/null \
-      && echo "  ✅ 已从官方 release 刷新 EXPECT_SHA 并校验通过 ($EXPECT_SHA)"
-  else
-    echo "  (官方 sha256 与实测仍不一致, 不自动通过)"
-  fi
-}
-
 echo "=== 上传固件与 kit ==="
 scp "$ITB" "$KIT" "$ROUTER:/tmp/" || die "上传失败"
 
 # 刷机前在路由器侧复核 itb 完整性: WiFi 上传若抖动传坏会直接刷入损坏镜像(变砖), 先拦截
-EXPECT_SHA="923520f95638a0d3a8b583d79f2aa63f8699a8ae121b684bdc5f2e7f7db50fae"
 ACT_SHA=$(ssh -o ConnectTimeout=10 "$ROUTER" "sha256sum /tmp/$(basename "$ITB")" 2>/dev/null | awk '{print $1}')
 [ -n "$ACT_SHA" ] || die "无法在路由器侧计算 itb sha256 (上传可能不完整)"
-if [ "$ACT_SHA" != "$EXPECT_SHA" ] && [ "$FORCE" != "1" ]; then
-  refresh_sha
+
+# EXPECT_SHA 优先级: --expect-sha 显式 > 官方 sha256sums 运行时派生 > 退出(防刷错)
+derive_expect_sha(){
+  command -v gh >/dev/null 2>&1 || { echo "  (无 gh CLI, 跳过官方校验, 需 --expect-sha 或 --force)"; return 1; }
+  local sums_url
+  sums_url=$(gh api "repos/$REPO/releases/latest" --jq '[.assets[] | select(.name=="sha256sums") | .browser_download_url][0]' 2>/dev/null)
+  [ -n "$sums_url" ] || { echo "  (未找到官方 sha256sums)"; return 1; }
+  curl -fsSL "$sums_url" 2>/dev/null | grep "$(basename "$ITB")" | awk '{print $1}'; return 0
+}
+if [ -z "$EXPECT_SHA" ]; then
+  EXPECT_SHA=$(derive_expect_sha)
 fi
-if [ "$ACT_SHA" = "$EXPECT_SHA" ]; then
-  echo "✅ itb 完整性校验通过 (sha256 匹配, 可安全刷入)"
+if [ -n "$EXPECT_SHA" ] && [ "$ACT_SHA" = "$EXPECT_SHA" ]; then
+  echo "✅ itb 完整性校验通过 (sha256 匹配官方, 可安全刷入)"
 elif [ "$FORCE" = "1" ]; then
-  echo "⚠️ itb sha256 不匹配 (期望 $EXPECT_SHA, 实得 $ACT_SHA), 但 --force 已忽略此校验, 继续刷入"
+  echo "⚠️ itb sha256 未校验(期望 ${EXPECT_SHA:-未知}, 实得 $ACT_SHA), --force 已忽略, 继续刷入"
 else
-  die "itb sha256 不匹配 (期望 $EXPECT_SHA, 实得 $ACT_SHA) — 上传可能损坏或 EXPECT_SHA 过期, 请重试上传, 或先跑 router_watch.sh 刷新 EXPECT_SHA"
+  die "itb sha256 校验未通过 (期望 ${EXPECT_SHA:-未能获取官方校验值}, 实得 $ACT_SHA) — 上传可能损坏或无法获取官方校验值; 重试上传, 或用 --force / --expect-sha 跳过"
 fi
 
 echo "=== 触发干净刷 (严格全清 -n + uci-defaults 自举) ==="
@@ -290,7 +307,7 @@ echo "升级后请改 root 密码: ssh \"$ROUTER\" 'passwd root'"
 # 判定: 外网通 + 代理DNS通(clash@7874) + radio0/1 启用 + clash 进程在 → 成功
 verify_router(){
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$ROUTER" '
-    ping -c2 -W3 8.8.8.8 >/dev/null 2>&1 || { echo "FAIL: 外网不通"; exit 1; }
+    curl -fsS --max-time 6 https://www.google.com >/dev/null 2>&1 || ping -c2 -W3 8.8.8.8 >/dev/null 2>&1 || { echo "FAIL: 外网不通"; exit 1; }
     nslookup github.com 127.0.0.1 >/dev/null 2>&1 || { echo "FAIL: 代理DNS不通"; exit 1; }
     for r in radio0 radio1; do
       [ "$(uci get wireless.$r.disabled 2>/dev/null)" = "1" ] && { echo "FAIL: $r 被禁用"; exit 1; }
