@@ -213,6 +213,10 @@ fi
 chown root:root /etc/dropbear /etc/dropbear/authorized_keys 2>/dev/null
 chmod 700 /etc/dropbear 2>/dev/null
 chmod 600 /etc/dropbear/authorized_keys 2>/dev/null
+# 升级前由 Mac 侧注入的 SSH host key 已随 sysupgrade -f 还原到 /etc/dropbear; 确保属主/权限正确,
+# dropbear 首启动直接复用 -> host key 不变, 各终端 known_hosts 仍有效(避免全清刷后 host key 变更陷阱)
+chown root:root /etc/dropbear/dropbear_*_host_key 2>/dev/null
+chmod 600 /etc/dropbear/dropbear_*_host_key 2>/dev/null
 
 # ---------- 6. 应用网络与无线(写盘即可, 系统正常启动流程会采纳) ----------
 /etc/init.d/network restart >>$LOG 2>&1 || true
