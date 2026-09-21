@@ -45,9 +45,13 @@ if [ -z "$ROUTER" ] && [ -f "$HOME/.ssh/config" ] && command -v awk >/dev/null 2
   ROUTER=$(awk '/^[Hh]ost /{h=$2} {l=tolower($0)} (l ~ /openwrt/||l ~ /immortalwrt/||l ~ /router/) && h{print h; exit}' "$HOME/.ssh/config" 2>/dev/null)
 fi
 if [ -z "$ROUTER" ]; then
-  printf '请输入路由器的 SSH 地址 (如 root@192.168.1.1, 或 ssh config 中的主机别名): ' >&2
-  read -r ROUTER </dev/tty 2>/dev/null
-  [ -n "$ROUTER" ] && printf '%s\n' "$ROUTER" > "$PREP_DIR/router-target.conf" 2>/dev/null
+  if [ -t 0 ]; then
+    printf '请输入路由器的 SSH 地址 (如 root@192.168.1.1, 或 ssh config 中的主机别名): ' >&2
+    read -r ROUTER </dev/tty 2>/dev/null
+    [ -n "$ROUTER" ] && printf '%s\n' "$ROUTER" > "$PREP_DIR/router-target.conf" 2>/dev/null
+  else
+    log "❌ 非交互环境且未配置路由器 SSH 地址 (用 --router 或 ROUTER 环境变量, 或预先创建 router-target.conf)"; exit 1
+  fi
 fi
 [ -n "$ROUTER" ] || { log "❌ 未配置路由器 SSH 地址 (用 --router 或 ROUTER 环境变量指定)"; exit 1; }
 
@@ -82,7 +86,7 @@ if [ "$FORCE" = "0" ]; then
   if [ -n "$pub_epoch" ]; then
     age=$(( (now_epoch - pub_epoch) / 3600 ))
     if [ "$age" -lt 72 ]; then
-      log "⏸ 安全闸: 发布仅 ${age}h (<72h), 暂不自动升级, 等版本沉淀"
+      log "⏸ 安全闸: 发布仅 ${age}h (<72h), 暂不自动升级, 等版本沉淀 (用 --force 可强制跳过)"
       exit 0
     fi
   fi
@@ -115,12 +119,9 @@ if [ -n "$sums_url" ]; then
   fi
 fi
 
-# ---------- 6. 更新 upgrade_router.sh 的 EXPECT_SHA / FW_NEW ----------
-if [ -n "$expect" ]; then
-  sed -i '' "s/^EXPECT_SHA=\".*\"/EXPECT_SHA=\"$expect\"/" "$PREP_DIR/upgrade_router.sh" 2>/dev/null \
-    && sed -i '' "s/^FW_NEW=\".*\"/FW_NEW=\"$rel_tag\"/" "$PREP_DIR/upgrade_router.sh" 2>/dev/null \
-    && log "已更新 upgrade_router.sh 的 EXPECT_SHA/FW_NEW"
-fi
+# ---------- 6. (已移除) EXPECT_SHA/FW_NEW 同步 -----
+# upgrade_router.sh 现在运行时自行从官方 sha256sums 派生 EXPECT_SHA, 无需此处 sed 改写脚本文件;
+# 本步骤保持只读, 不再修改任何源码(避免 --check 产生副作用)。
 
 # ---------- 7. 是否真正刷机 ----------
 if [ "$CHECK_ONLY" = "1" ]; then
@@ -134,5 +135,5 @@ fi
 
 # ---------- 8. 触发升级 (--auto: 强终验失败自动回退) ----------
 log "🚀 触发升级 (--auto)"
-"$PREP_DIR/upgrade_router.sh" --auto --router "$ROUTER"
+"$PREP_DIR/upgrade_router.sh" --auto ${FORCE:+--force} --router "$ROUTER"
 log "=== watch 流程结束 ==="
