@@ -194,7 +194,6 @@ collect_runtime(){
   else
     echo "⚠️ DHCP 静态租约抓取失败(不影响升级, 升级后无静态租约)"
   fi
-  mkdir -p "$build/etc"
   {
     [ -n "$s" ]  && echo "ROOT_SHADOW=$s"
     echo "WIFI_KEY=$w"
