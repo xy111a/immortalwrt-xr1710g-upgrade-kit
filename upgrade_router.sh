@@ -19,7 +19,7 @@
 #   - 恢复/诊断时若路由在出厂态, 你的路由器地址/别名连不上, 改用出厂默认: ssh root@192.168.1.1
 #   - Mac 的 SSH 公钥已内置在 kit.tar.gz 的 etc/dropbear/authorized_keys (全清刷后仍可 key 登录)
 #   - 升级后 root 密码由升级前从活路由器抓取的 shadow hash 自动恢复, 与升级前一致; 如需改密: ssh <路由器地址> 'passwd root'
-#   - 在 ~/.ssh/config 配置你的路由器 SSH 地址 (如 Host <router> -> 192.168.x.1); 刷机后 host key 会变, 终验用 accept-new
+#   - 在 ~/.ssh/config 配置你的路由器 SSH 地址 (如 Host <router> -> 192.168.x.1); 本工具会在刷前抓取活路由 host key 随 kit 还原, 故其他终端无需更新 known_hosts
 
 set -u
 # ---------- 参数解析 ----------
@@ -51,6 +51,8 @@ PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 KIT="$PREP_DIR/kit.tar.gz"
 ROUTER="${ROUTER_OVERRIDE:-}"
 EXPECT_SHA="${EXPECT_SHA_OVERRIDE:-}"
+# host key 是否已在升级前抓取并随 kit 还原(成功=1): 决定升级后是否需清本地 known_hosts / 提示其他终端
+HOSTKEY_PRESERVED=0
 # 回退镜像: 默认自动解析为"当前路由器正在运行的版本"对应的本地 itb (刷前预飞时按 commit hash 匹配)。
 # 旧 9/1 硬编码镜像仅作最后兜底 —— 升级到 9/8 后它已非当前版本, 不应再作为首选回退。
 FALLBACK_ITB="$PREP_DIR/../router-backup-20260901/immortalwrt-xr1710g-20260901-131ef84fe9.itb"
@@ -194,6 +196,22 @@ collect_runtime(){
   else
     echo "⚠️ DHCP 静态租约抓取失败(不影响升级, 升级后无静态租约)"
   fi
+  # 抓取活路由当前 SSH host key (dropbear), 注入 kit 的 etc/dropbear/
+  # 升级后由 sysupgrade -f 原样还原 -> host key 不变 -> 其他终端的 known_hosts 依然有效, 无需 ssh-keygen -R
+  HOSTKEY_PRESERVED=0
+  mkdir -p "$build/etc/dropbear"
+  if ssh -o ConnectTimeout=10 "$ROUTER" 'cd / && tar -czf - etc/dropbear/dropbear_*_host_key 2>/dev/null' 2>/dev/null \
+       | tar -xzf - -C "$build" 2>/dev/null; then
+    hk_n=$(ls "$build"/etc/dropbear/dropbear_*_host_key 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${hk_n:-0}" -gt 0 ]; then
+      HOSTKEY_PRESERVED=1
+      echo "✅ 已抓取活路由 SSH host key ($hk_n 个) 注入 kit (升级后其他终端无需更新 known_hosts)"
+    else
+      echo "⚠️ 活路由无 dropbear host key, 升级后 host key 会变(各终端需 ssh-keygen -R)"
+    fi
+  else
+    echo "⚠️ host key 抓取失败, 升级后 host key 会变(各终端需 ssh-keygen -R)"
+  fi
   {
     [ -n "$s" ]  && echo "ROOT_SHADOW=$s"
     echo "WIFI_KEY=$w"
@@ -240,7 +258,8 @@ if [ "$DRY" = "1" ]; then
   echo "  2. ssh $ROUTER 'sysupgrade -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (n=不保留当前配置, 严格全清)"
   echo "     (nohup 后台执行, 路由器重启, SSH 断开, 本脚本随后轮询重连)"
   echo "  3. 轮询重连 (每 5s, 最多 40 次) 于路由器地址 / 常见出厂 IP (192.168.1.1 等)"
-  echo "  4. 终验: 版本 / flow offload / 三频 / OpenClash / DNS / U-Boot (accept-new 接受新 host key)"
+  echo "  4. 终验: 版本 / flow offload / 三频 / OpenClash / DNS / U-Boot"
+  echo "     (host key 将在刷前从活路由抓取并随 kit 还原, 成功则其他终端无需更新 known_hosts; 失败则降级为 accept-new)"
   echo "=== DRY-RUN 结束 ==="
   exit 0
 fi
@@ -280,8 +299,14 @@ echo "⚠️ 路由器即将重启, SSH 会断开, 本脚本自动轮询重连, 
 # nohup + & 让 sysupgrade 在路由后台跑, ssh 立即返回, 避免连接在 reboot 时被重置误判
 ssh "$ROUTER" "nohup sysupgrade -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB") >/tmp/upg.log 2>&1 &" || true
 
-# 干净刷后路由器生成全新 SSH host key; 先清掉本地旧 key, 否则 accept-new 会把"密钥变更"误判为拒绝 → 误报重连失败
-ssh-keygen -R "$R_HOST" 2>/dev/null; ssh-keygen -R "$ROUTER" 2>/dev/null
+# host key 若已随 kit 保留(升级前从活路由抓取并 sysupgrade -f 还原), 则密钥不变 -> 不清除本机 known_hosts, 其他终端零感知;
+# 仅当未成功保留时才清本地旧 key 并提示各终端更新(降级路径)
+if [ "$HOSTKEY_PRESERVED" = "1" ]; then
+  echo "✅ SSH host key 已随 kit 保留, 本机 known_hosts 无需清理, 其他终端亦可照常连接"
+else
+  ssh-keygen -R "$R_HOST" 2>/dev/null; ssh-keygen -R "$ROUTER" 2>/dev/null
+  echo "⚠️ host key 未保留(已变更), 其他终端需执行: ssh-keygen -R $R_HOST ; ssh-keygen -R $ROUTER"
+fi
 echo "=== 等待路由器重启(先确认断开, 再等重连, 避免刷写 race 误判) ==="
 DOWN=0
 for i in $(seq 1 12); do
@@ -323,6 +348,11 @@ echo "=== 升级流程结束 ==="
 echo "若终验全部通过, 升级成功。若 OpenClash 仍未起(rc.local 未跑完), 在 Mac 侧执行:"
 echo "  ssh \"$ROUTER\" 'apk add luci-app-openclash && /etc/init.d/openclash restart'"
 echo "升级后请改 root 密码: ssh \"$ROUTER\" 'passwd root'"
+if [ "$HOSTKEY_PRESERVED" = "1" ]; then
+  echo "✅ SSH host key 已随 kit 还原, host key 不变 —— 所有终端(含其他设备)的 known_hosts 仍有效, 无需 ssh-keygen -R"
+else
+  echo "⚠️ SSH host key 未保留(已变更), 各终端需执行: ssh-keygen -R <路由器IP/别名> 后重新连接"
+fi
 
 # ---------- 强终验 (仅 --auto 模式: 判定成败并触发回退) ----------
 # 判定: 外网通 + 代理DNS通(clash@7874) + radio0/1 启用 + clash 进程在 → 成功
@@ -356,7 +386,10 @@ auto_rollback(){
     echo "   同时还原升级前配置快照(配置级回退): $(basename "$PREUPG_BACKUP")"
   fi
   ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" "nohup $rbcmd >/tmp/rb.log 2>&1 &" || true
-  ssh-keygen -R "$R_HOST" 2>/dev/null; ssh-keygen -R "$ROUTER" 2>/dev/null
+  # 回退保留当前 config(sysupgrade -F 不带 -n), host key 不变 -> 仅当本次升级未保留 key 时才清本地 known_hosts
+  if [ "$HOSTKEY_PRESERVED" != "1" ]; then
+    ssh-keygen -R "$R_HOST" 2>/dev/null; ssh-keygen -R "$ROUTER" 2>/dev/null
+  fi
   for i in $(seq 1 40); do
     if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then break; fi
     sleep 5
