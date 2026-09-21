@@ -176,7 +176,7 @@ for h in $(uci show dhcp 2>/dev/null | grep -oE 'dhcp\.@host\[[0-9]+\]' | sort -
 done
 uci commit dhcp 2>/dev/null || true
 if [ -f "$DHCP_HOSTS" ]; then
-  while read -r _name _mac _ip _lease; do
+  while read -r _ _name _mac _ip _lease; do
     [ -z "$_name" ] && continue
     _sid=$(printf '%s' "$_name" | tr -c 'A-Za-z0-9' '_')   # uci section 名仅允许 [A-Za-z0-9_]
     uci set "dhcp.$_sid=host"
