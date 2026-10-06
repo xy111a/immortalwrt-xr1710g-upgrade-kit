@@ -46,7 +46,7 @@ done
 # 退出即清理: 升级过程中在 /tmp 生成的注入 kit / 构建目录含 root shadow hash, 绝不落盘
 trap 'rm -rf /tmp/kit_build /tmp/kit_injected.tar.gz 2>/dev/null' EXIT
 
-REPO="naoki66/ImmortalWrt-for-Gemtek-XR1710G"
+REPO="naoki66/ImmortalWrt-for-Gemtek-brightspeed"
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 KIT="$PREP_DIR/kit.tar.gz"
 ROUTER="${ROUTER_OVERRIDE:-}"
@@ -68,7 +68,9 @@ resolve_target_itb(){
   # 直接取官方最新 release 的 itb 资源名精确匹配(与 router_watch.sh 选源一致);
   # 注意: release tag 的哈希与 itb 文件名内的 commit 哈希不同, 不能靠 tag 哈希去 grep 文件名
   local name itb
-  name=$(gh api "repos/$REPO/releases/latest" --jq '[.assets[] | select(.name|test("gemtek_xr1710g")) | .name][0]' 2>/dev/null)
+  # 上游把 XG2010G 机型 build 设为 GitHub "Latest", releases/latest 不含 XR1710G 固件; 改遍历 releases 取首个含 gemtek_xr1710g itb 的 release
+  # (gojq 子集不支持 any(.name; test()), 改用 any(.assets[]; .name|test()) 存在量词写法)
+  name=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0].assets[] | select(.name|test("gemtek_xr1710g")) | .name' 2>/dev/null | head -1)
   if [ -n "$name" ] && [ -f "$PREP_DIR/$name" ]; then
     printf '%s' "$PREP_DIR/$name"; return 0
   fi
@@ -279,7 +281,8 @@ ACT_SHA=$(ssh -o ConnectTimeout=10 "$ROUTER" "sha256sum /tmp/$(basename "$ITB")"
 derive_expect_sha(){
   command -v gh >/dev/null 2>&1 || { echo "  (无 gh CLI, 跳过官方校验, 需 --expect-sha 或 --force)"; return 1; }
   local sums_url
-  sums_url=$(gh api "repos/$REPO/releases/latest" --jq '[.assets[] | select(.name=="sha256sums") | .browser_download_url][0]' 2>/dev/null)
+  # 取首个含 XR1710G 固件(与待刷 itb 同 release)的 sha256sums, 避免 releases/latest 取到 XG2010G 机型 build
+  sums_url=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0].assets[] | select(.name=="sha256sums") | .browser_download_url' 2>/dev/null | head -1)
   [ -n "$sums_url" ] || { echo "  (未找到官方 sha256sums)"; return 1; }
   curl -fsSL "$sums_url" 2>/dev/null | grep "$(basename "$ITB")" | awk '{print $1}'; return 0
 }
