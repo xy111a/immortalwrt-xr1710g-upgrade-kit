@@ -16,7 +16,7 @@
 # 建议由 launchd 每天 03:00 调用本脚本 (见 com.huajun.router-watch.plist)
 
 set -u
-REPO="naoki66/ImmortalWrt-for-Gemtek-XR1710G"
+REPO="naoki66/ImmortalWrt-for-Gemtek-brightspeed"
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$PREP_DIR/watch.log"
 ENABLE_FILE="$HOME/.router_autoupgrade_enabled"
@@ -62,10 +62,12 @@ cur_hash=$(printf '%s' "$cur_rev" | grep -oE '[0-9a-f]{7,40}' | tail -1)
 log "当前固件 commit: $cur_hash"
 
 # ---------- 2. 最新 release ----------
-rel_tag=$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null)
-pub=$(gh api "repos/$REPO/releases/latest" --jq '.published_at' 2>/dev/null)
-itb_url=$(gh api "repos/$REPO/releases/latest" --jq '[.assets[] | select(.name|test("gemtek_xr1710g")) | .browser_download_url][0]' 2>/dev/null)
-sums_url=$(gh api "repos/$REPO/releases/latest" --jq '[.assets[] | select(.name=="sha256sums") | .browser_download_url][0]' 2>/dev/null)
+# 上游把 XG2010G 机型 build 设为 GitHub "Latest", releases/latest 不含 XR1710G 固件;
+# 故遍历全部 releases(默认按时间倒序), 取首个含 gemtek_xr1710g itb 的 release, 单次 gh 调用取齐四字段(TSV)
+# (gojq 子集不支持 any(.name; test()), 改用 any(.assets[]; .name|test()) 存在量词写法)
+REL_TSV=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0] | [.tag_name, .published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name=="sha256sums")) | .[0].browser_download_url)] | @tsv' 2>/dev/null)
+[ -n "$REL_TSV" ] || { log "❌ 未找到含 XR1710G 固件的 release (仓库可能改名或上游未发布 XR1710G build)"; exit 1; }
+IFS=$'\t' read -r rel_tag pub itb_url sums_url <<< "$REL_TSV"
 [ -n "$rel_tag" ] || { log "❌ 无法获取 release (gh 未登录/限流/无网络?)"; exit 1; }
 rel_hash=$(printf '%s' "$rel_tag" | grep -oE '[0-9a-f]{7,40}$')
 log "最新 release: $rel_tag (发布 $pub)"
