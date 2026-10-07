@@ -54,8 +54,9 @@ EXPECT_SHA="${EXPECT_SHA_OVERRIDE:-}"
 # host key 是否已在升级前抓取并随 kit 还原(成功=1): 决定升级后是否需清本地 known_hosts / 提示其他终端
 HOSTKEY_PRESERVED=0
 # 回退镜像: 默认自动解析为"当前路由器正在运行的版本"对应的本地 itb (刷前预飞时按 commit hash 匹配)。
-# 旧 9/1 硬编码镜像仅作最后兜底 —— 升级到 9/8 后它已非当前版本, 不应再作为首选回退。
-FALLBACK_ITB="$PREP_DIR/../router-backup-20260901/immortalwrt-xr1710g-20260901-131ef84fe9.itb"
+# 注意: 路由器 DISTRIB_REVISION 末尾 commit(a2535c4f2c, 10 位) 与 GitHub itb 文件名中的 commit(a2535c4f, 8 位) 长度不同,
+#   resolve_rollback 的 grep 因此匹配不到 —— 故显式将 FALLBACK_ITB 指向当前运行版本(20260916)的回退镜像, 使 T3 回退可用。
+FALLBACK_ITB="$PREP_DIR/immortalwrt-naoki66-20260916-a2535c4f-airoha-an7581-gemtek_xr1710g-ubi-squashfs-sysupgrade.itb"
 # 升级前配置快照(sysupgrade -b)的本地路径, 供自动回退连带还原; 空=未备份
 PREUPG_BACKUP=""
 
