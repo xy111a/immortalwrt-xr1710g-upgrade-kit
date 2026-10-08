@@ -156,7 +156,8 @@ config wifi-iface 'default_radio2'
 	option ssid '${SSID2:-Router-6G}'
 	option encryption 'sae-mixed'
 	option key '$WIFI_KEY'
-	option disabled '0'
+	# 6G 默认关闭(监管灰区/仅少数设备受益, 用户明确"6G不用"); 设备层 radio2 也已 disabled=1
+	option disabled '1'
 WIFIEOF
 
 # ---------- 3. firewall: 确保 flow offload + fullcone 开启 ----------
@@ -239,6 +240,37 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
     echo "apk 重试 $i ..." >>/tmp/zzz-postinstall.log
     sleep 10
   done
+  # ---------- OpenClash 内核(clash_meta 二进制)恢复: P1 根治"全清刷后内核丢失" ----------
+  # 优先用 kit 烘焙的内核(sysupgrade -f 已还原到 /etc/openclash/core/clash_meta);
+  # 若缺失/不可执行(例如 kit 未烘焙且配置级回退), 运行时从官方 CDN 下载(mihomo-linux-arm64),
+  # 带多源重试; 失败仅告警(notify)不阻断启动 —— 避免重蹈"UI 报没有内核"的覆辙。
+  if [ -x /etc/openclash/core/clash_meta ]; then
+    echo "OpenClash 内核已就位(kit 烘焙), 跳过下载" >>/tmp/zzz-postinstall.log
+  else
+    echo "OpenClash 内核缺失, 尝试运行时下载 (mihomo-linux-arm64 v1.19.32)" >>/tmp/zzz-postinstall.log
+    mkdir -p /etc/openclash/core
+    _ok=0
+    # 下载源: 官方 GitHub + ghproxy 镜像; 若日后重烘焙了更新内核, 同步更新此处版本号
+    for _u in \
+      "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-arm64-v1.19.32.gz" \
+      "https://ghproxy.net/https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-arm64-v1.19.32.gz" ; do
+      for _t in 1 2 3; do
+        if curl -fsSL --max-time 120 -o /tmp/clash_meta.gz "$_u" 2>/dev/null; then _ok=1; break 2; fi
+        echo "  内核下载重试 $_t (源 $_u)" >>/tmp/zzz-postinstall.log
+        sleep 5
+      done
+    done
+    if [ "$_ok" = "1" ]; then
+      if gunzip -f /tmp/clash_meta.gz 2>/dev/null && mv -f /tmp/clash_meta /etc/openclash/core/clash_meta 2>/dev/null && chmod 755 /etc/openclash/core/clash_meta 2>/dev/null; then
+        echo "✅ OpenClash 内核下载并安装完成" >>/tmp/zzz-postinstall.log
+      else
+        echo "❌ OpenClash 内核解压/安装失败" >>/tmp/zzz-postinstall.log
+      fi
+    else
+      echo "❌ OpenClash 内核下载失败, OpenClash 将无法启动(需手动补救)" >>/tmp/zzz-postinstall.log
+      notify "路由器升级后 OpenClash 内核缺失" "内核 CDN 下载失败, 需手动安装 clash_meta" 2>/dev/null || true
+    fi
+  fi
   chmod 755 /etc/openclash 2>/dev/null
   chmod +x /etc/openclash/core/clash_meta 2>/dev/null
   /etc/init.d/openclash enable >>/tmp/zzz-postinstall.log 2>&1
