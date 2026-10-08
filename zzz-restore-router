@@ -302,6 +302,12 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
     echo "ℹ️ 未找到 kit 另存的 OpenClash 订阅数据(沿用 sysupgrade -f 还原路径)" >>/tmp/zzz-postinstall.log
   fi
   /etc/init.d/openclash enable >>/tmp/zzz-postinstall.log 2>&1
+  # 双保险: 显式确保两个开关都为 1. 本构建 OpenClash 的 start_service(/etc/init.d/openclash:3594)
+  # 检查的是 option enable (不带 d), 而非 enabled; 两者都设 1 才稳(仅设 enabled 会被它判为禁用,
+  # 报 "Now Disabled, Need Start From Luci Page" 拒绝启动 -> 重启路由后 OpenClash 不启动 -> 连上没网).
+  uci set openclash.config.enable='1' 2>/dev/null
+  uci set openclash.config.enabled='1' 2>/dev/null
+  uci commit openclash 2>/dev/null
   /etc/init.d/openclash restart >>/tmp/zzz-postinstall.log 2>&1
   # DNS 卫生(P1): OpenClash 未真正监听本地端口时, 不把客户端 DNS 指死(否则连WiFi没网)
   sleep 3
