@@ -16,7 +16,7 @@ REPO="xy111a/immortalwrt-xr1710g-upgrade-kit"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 WORK="${GIT_WORK_DIR:-/tmp/kit_repo}"
 # 白名单: 仅这些纯文本源码入库; itb/kit.tar.gz/backups 永不入库
-FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh LICENSE README.md"
+FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh LICENSE README.md"
 
 echo "=== 准备 Git 工作副本: $WORK ==="
 if [ -d "$WORK/.git" ]; then
