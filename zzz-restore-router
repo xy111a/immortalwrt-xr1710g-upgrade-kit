@@ -289,6 +289,18 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
   fi
   chmod 755 /etc/openclash 2>/dev/null
   chmod +x /etc/openclash/core/clash_meta 2>/dev/null
+  # ---------- OpenClash 订阅数据还原(P1 之后发现: apk add 重装会清空 /etc/openclash/config) ----------
+  # Mac 侧 collect_runtime 已把活路由 openclash 数据(除内核)另存进 kit 的 etc/zzz-oc-data/,
+  # 该路径不被 apk add 触碰; 此处(重装之后、启动之前)原样还原, 杜绝 clean 刷后订阅丢失。
+  if [ -d /etc/zzz-oc-data ] && [ -n "$(ls -A /etc/zzz-oc-data 2>/dev/null)" ]; then
+    cp -a /etc/zzz-oc-data/. /etc/openclash/ 2>/dev/null
+    chown -R root:root /etc/openclash 2>/dev/null
+    rm -f /etc/openclash/config/._* 2>/dev/null
+    echo "✅ 已从 kit 另存数据还原 OpenClash 订阅配置(防 apk 重装清空)" >>/tmp/zzz-postinstall.log
+    rm -rf /etc/zzz-oc-data 2>/dev/null
+  else
+    echo "ℹ️ 未找到 kit 另存的 OpenClash 订阅数据(沿用 sysupgrade -f 还原路径)" >>/tmp/zzz-postinstall.log
+  fi
   /etc/init.d/openclash enable >>/tmp/zzz-postinstall.log 2>&1
   /etc/init.d/openclash restart >>/tmp/zzz-postinstall.log 2>&1
   # DNS 卫生(P1): OpenClash 未真正监听本地端口时, 不把客户端 DNS 指死(否则连WiFi没网)
