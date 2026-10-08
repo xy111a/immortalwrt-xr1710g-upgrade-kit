@@ -5,14 +5,18 @@
 #        kit.tar.gz 由本脚本在本地生成, 并已在 .gitignore 中排除, 因此永远不会进 Git。
 #
 # 用法:
-#   ./build_kit.sh --keys ~/.ssh/router_authorized_keys [--openclash /path/to/openclash-dir] [--out <path>] [--force]
+#   ./build_kit.sh --keys ~/.ssh/router_authorized_keys [--openclash /path/to/openclash-dir] [--openclash-core /path/to/clash_meta] [--out <path>] [--force]
 #
-#   --keys        (必填) 你的 Mac SSH 公钥文件 (一行一把, 可多把), 刷机后仍可 key 免密登录
-#   --openclash   (可选) 一个含 OpenClash 配置的目录 (会被复制到 etc/openclash 作为离线兜底)
-#                 不提供时, kit 不含 OpenClash 配置 —— 升级时 upgrade_router.sh 的
-#                 collect_runtime 会从活路由器重新抓取当前 OpenClash 覆盖进去
-#   --out         产物路径 (默认 dist/kit.tar.gz, 已 gitignore)。⚠️ 默认绝不覆盖仓库根的 kit.tar.gz
-#   --force       仅当 --out 指向已存在的 kit.tar.gz 时才需要, 显式允许覆盖
+#   --keys           (必填) 你的 Mac SSH 公钥文件 (一行一把, 可多把), 刷机后仍可 key 免密登录
+#   --openclash      (可选) 一个含 OpenClash 配置的目录 (会被复制到 etc/openclash 作为离线兜底)
+#                    不提供时, kit 不含 OpenClash 配置 —— 升级时 upgrade_router.sh 的
+#                    collect_runtime 会从活路由器重新抓取当前 OpenClash 覆盖进去 (core 除外)
+#   --openclash-core (可选但强烈建议) clash_meta 内核二进制路径 (如 mihomo-linux-arm64 解压后)
+#                    烘焙进 kit 的 etc/openclash/core/clash_meta, 由 sysupgrade -f 还原 ——
+#                    彻底摆脱"大文件经 SSH tar 管道"的脆弱链路, 全清刷后内核不再丢失。
+#                    不提供时, kit 不含内核, 依赖 zzz-restore 运行时从 CDN 兜底下載。
+#   --out          产物路径 (默认 dist/kit.tar.gz, 已 gitignore)。⚠️ 默认绝不覆盖仓库根的 kit.tar.gz
+#   --force        仅当 --out 指向已存在的 kit.tar.gz 时才需要, 显式允许覆盖
 #
 # 设计要点 (安全): 默认产物写到 dist/ 而非仓库根的 kit.tar.gz —— 仓库根的 kit.tar.gz 是你正在
 #   使用的真 kit (含 OpenClash 订阅 + 你的公钥), 误覆盖会让下次升级连不上代理。本脚本默认
@@ -22,13 +26,14 @@
 set -eu
 
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
-KEYS=""; OC=""; OUT="$PREP_DIR/dist/kit.tar.gz"; FORCE=0
+KEYS=""; OC=""; CORE=""; OUT="$PREP_DIR/dist/kit.tar.gz"; FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --keys)      KEYS="$2"; shift 2;;
-    --openclash) OC="$2";   shift 2;;
-    --out)       OUT="$2";  shift 2;;
-    --force)     FORCE=1;   shift 1;;
+    --keys)           KEYS="$2"; shift 2;;
+    --openclash)      OC="$2";   shift 2;;
+    --openclash-core) CORE="$2"; shift 2;;
+    --out)            OUT="$2";  shift 2;;
+    --force)          FORCE=1;   shift 1;;
     *) echo "未知参数: $1"; exit 1;;
   esac
 done
@@ -68,10 +73,23 @@ else
   echo "ℹ️  未提供 --openclash: kit 不含 OpenClash 配置 (升级时由 collect_runtime 从活路由器抓取)"
 fi
 
+# 烘焙 OpenClash 内核(clash_meta) —— P1 根治"全清刷后内核丢失":
+# 内核二进制随 kit 整包 scp 传输(比 57MB 经 SSH tar 管道稳), sysupgrade -f 还原后即到位,
+# 不再依赖 collect_runtime 抓取的脆弱大文件链路。zzz-restore 运行时还会再做一次兜底下载。
+if [ -n "$CORE" ] && [ -f "$CORE" ]; then
+  mkdir -p "$BUILD/etc/openclash/core"
+  cp "$CORE" "$BUILD/etc/openclash/core/clash_meta"
+  chmod 0755 "$BUILD/etc/openclash/core/clash_meta"
+  echo "✅ 已烘焙 OpenClash 内核 clash_meta ($(wc -c < "$CORE") B) -> kit 的 etc/openclash/core/"
+else
+  echo "ℹ️  未提供 --openclash-core: kit 不含内核二进制 (升级时依赖 zzz-restore 运行时兜底下载)"
+fi
+
 mkdir -p "$(dirname "$OUT")"
 tar -czf "$OUT" -C "$BUILD" .
 rm -rf "$BUILD"
 
 echo "✅ 已生成 kit -> $OUT"
-echo "   升级时 upgrade_router.sh 会从活路由器抓取 root shadow / WiFi key / 三频 SSID / OpenClash"
+echo "   升级时 upgrade_router.sh 会从活路由器抓取 root shadow / WiFi key / 三频 SSID / OpenClash 配置(core 除外)"
 echo "   注入临时 kit (仅存于 /tmp, 脚本退出即清理), 源码与仓库均无任何明文敏感信息。"
+echo "   若提供了 --openclash-core, 内核已烘焙进 kit, 全清刷后内核不丢; 否则 zzz-restore 运行时兜底下载。"

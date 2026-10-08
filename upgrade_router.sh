@@ -235,7 +235,9 @@ collect_runtime(){
   rm -rf "$build"; mkdir -p "$build/etc"
   tar -xzf "$KIT" -C "$build" 2>/dev/null || { echo "❌ 解包 kit 失败"; exit 1; }
   # 用活路由当前 OpenClash 配置覆盖 kit 内烘焙的旧订阅/规则 (保持订阅有效, 避免升级后连不上)
-  if ssh -o ConnectTimeout=10 "$ROUTER" "tar -czf - -C / etc/config/openclash etc/openclash" 2>/dev/null \
+  # 注意: 排除 etc/openclash/core —— 内核二进制(57MB)由 kit 烘焙(见 build_kit.sh --openclash-core),
+  #       随 kit 整包 scp + sysupgrade -f 还原, 不再走"大文件经 SSH tar 管道"的脆弱链路(P1 根治)。
+  if ssh -o ConnectTimeout=10 "$ROUTER" "tar --exclude=etc/openclash/core -czf - -C / etc/config/openclash etc/openclash" 2>/dev/null \
        | tar -xzf - -C "$build" 2>/dev/null; then
     echo "✅ 已抓取活路由 OpenClash 配置(订阅/规则)覆盖 kit 内旧文件"
   else
@@ -444,6 +446,11 @@ verify_router(){
     done
     # 软终验(可选): 仅当用户真正启用 OpenClash 时才要求 7874 代理DNS通(P1)
     if pgrep -f clash >/dev/null 2>&1 || [ "$(uci get openclash.config.enabled 2>/dev/null)" = "1" ]; then
+      # P1: 内核二进制必须存在且可执行, 否则"内核丢了却误判成功" —— 直接判 FAIL 暴露问题
+      if [ ! -x /etc/openclash/core/clash_meta ]; then
+        echo "FAIL: OpenClash 已启用但内核 clash_meta 缺失/不可执行 (全清刷内核丢失?)"
+        exit 1
+      fi
       nslookup github.com 127.0.0.1 >/dev/null 2>&1 || { echo "FAIL: 代理DNS不通(已启用OpenClash)"; exit 1; }
     fi
     exit 0
