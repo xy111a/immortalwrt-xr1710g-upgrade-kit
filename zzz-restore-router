@@ -39,6 +39,19 @@ if [ -f "$SECRETS" ]; then
 fi
 
 # ---------- 1. network: 还原 LAN IP / 桥接 / WAN ----------
+# 优先使用 kit 携带的真实配置(由 Mac 侧 collect_runtime 从活路由抓取, 含用户自定义信道/功率/桥接);
+# 仅当标记文件不存在(例如配置级回退未携带真实配置, 或抓取失败)时, 才降级为已知良好 heredoc 写死默认。
+REALCFG=0
+if [ -f /etc/zzz-realconfig.flag ] && [ -s /etc/config/network ] && [ -s /etc/config/wireless ]; then
+  # 健全性校验: 真实配置须含 lan 接口与 radio0, 否则视为损坏, 退回 heredoc
+  if grep -q "config interface 'lan'" /etc/config/network 2>/dev/null && grep -q "config wifi-device 'radio0'" /etc/config/wireless 2>/dev/null; then
+    REALCFG=1
+    echo "使用 kit 携带的真实 network/wireless 配置(还原用户自定义设置), 跳过 heredoc" >>$LOG
+  else
+    echo "⚠️ 真实配置健全性校验失败, 退回已知良好 heredoc" >>$LOG
+  fi
+fi
+if [ "$REALCFG" != "1" ]; then
 cat > /etc/config/network <<NETEOF
 config interface 'loopback'
 	option device 'lo'
@@ -159,6 +172,9 @@ config wifi-iface 'default_radio2'
 	# 6G 默认关闭(监管灰区/仅少数设备受益, 用户明确"6G不用"); 设备层 radio2 也已 disabled=1
 	option disabled '1'
 WIFIEOF
+fi
+# 清理标记文件(用后即删, 避免残留误导后续首启动)
+rm -f /etc/zzz-realconfig.flag 2>/dev/null
 
 # ---------- 3. firewall: 确保 flow offload + fullcone 开启 ----------
 uci set firewall.@defaults[0].flow_offloading='1' 2>/dev/null || true
