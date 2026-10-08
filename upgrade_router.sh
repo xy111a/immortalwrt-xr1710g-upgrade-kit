@@ -149,6 +149,13 @@ post_upgrade_report(){
     echo "## 4. OpenClash"
     if pgrep -f clash >/dev/null 2>&1; then echo "- ✅ clash 进程运行中"; else echo "- ⚠️ clash 未运行"; fi
     if [ -x /etc/openclash/core/clash_meta ]; then echo "- ✅ 内核 clash_meta 存在且可执行"; else echo "- ❌ 内核 clash_meta 缺失/不可执行"; fi
+    OC_CFG=$(ps w | grep "[c]lash" | grep -oE "\-f [^ ]+" | awk "{print \$2}")
+    [ -z "$OC_CFG" ] && OC_CFG=/etc/openclash/config.yaml
+    SEC=$(grep -m1 "secret:" "$OC_CFG" 2>/dev/null | sed -E "s/.*secret:[ ]*[\"]?([A-Za-z0-9_]+)[\"]?.*/\1/")
+    REAL_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l)
+    ACTIVE_CONN=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/connections" 2>/dev/null | grep -oE "\"id\":\"[^\"]+\"" | wc -l)
+    echo "- 真实节点数(经控制器): $REAL_NODES 个"
+    echo "- 当前活跃外部连接: $ACTIVE_CONN 条 (证明代理正在承载上网)"
     echo ""
     echo "## 5. DHCP 静态租约数"
     echo "- $(uci show dhcp 2>/dev/null | grep -c "dhcp.@host") 条"
@@ -563,7 +570,8 @@ verify_router(){
     for r in radio0 radio1; do
       [ "$(uci get wireless.$r.disabled 2>/dev/null)" = "1" ] && { echo "FAIL: $r 被禁用"; exit 1; }
     done
-    # 软终验(可选): 仅当用户真正启用 OpenClash 时才要求 7874 代理DNS通(P1)
+    # 软终验(可选): 仅当用户真正启用 OpenClash 时才查(P1). 注意: 本路由 OpenClash 实为上网网关(fake-ip+TCP重定向+DNS 7874),
+    # 一旦"启用但 0 真实节点"用户会静默断网(进程在/7874在/DNS通, 但出不去) —— 必须暴露, 不能误判成功.
     if pgrep -f clash >/dev/null 2>&1 || [ "$(uci get openclash.config.enabled 2>/dev/null)" = "1" ]; then
       # P1: 内核二进制必须存在且可执行, 否则"内核丢了却误判成功" —— 直接判 FAIL 暴露问题
       if [ ! -x /etc/openclash/core/clash_meta ]; then
@@ -571,6 +579,28 @@ verify_router(){
         exit 1
       fi
       nslookup github.com 127.0.0.1 >/dev/null 2>&1 || { echo "FAIL: 代理DNS不通(已启用OpenClash)"; exit 1; }
+      # ★ 真实节点健康检查: 控制器 secret 在 clash 实际加载的配置文件(-f 参数所指), 而非生成的 /etc/openclash/config.yaml
+      REAL_NODES=0
+      for _i in 1 2 3 4; do
+        OC_CFG=$(ps w | grep "[c]lash" | grep -oE "\-f [^ ]+" | awk "{print \$2}")
+        [ -z "$OC_CFG" ] && OC_CFG=/etc/openclash/config.yaml
+        SEC=$(grep -m1 "secret:" "$OC_CFG" 2>/dev/null | sed -E "s/.*secret:[ ]*[\"]?([A-Za-z0-9_]+)[\"]?.*/\1/")
+        REAL_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l)
+        [ "$REAL_NODES" -gt 0 ] && break
+        sleep 5
+      done
+      if [ "$REAL_NODES" -eq 0 ]; then
+        # 仅当 OpenClash 真正接管 DNS(网关)时, 0 节点 = 用户无可用外网 = 升级失败; 否则仅告警
+        DNS_VIA_OC=$(uci get dhcp.@dnsmasq[0].server 2>/dev/null | grep -q "7874" && echo 1 || echo 0)
+        if [ "$DNS_VIA_OC" = "1" ]; then
+          echo "FAIL: OpenClash 是 DNS 网关但控制器查到 0 个真实节点(订阅未加载/节点全失效?) -> 用户实际无可用外网"
+          exit 1
+        else
+          echo "WARN: OpenClash 启用但 0 真实节点(非 DNS 网关, 仅告警不判失败)"
+        fi
+      else
+        echo "  OpenClash 真实节点: $REAL_NODES 个 (正在承载上网)"
+      fi
     fi
     exit 0
   ' 2>/dev/null
