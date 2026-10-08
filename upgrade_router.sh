@@ -99,14 +99,68 @@ precheck_executor_location(){
   fi
 }
 
-# 把路由器侧关键日志归档回执行机, 失联后也能保留"已触发/完成"的证据(P2)
+# 升级日志持久化(P3): 归档到固定目录而非易失的 /tmp, 升级当次及日后复盘均可追溯
+LOG_DIR="$HOME/router-upgrade-logs"
 archive_logs(){
-  local d="/tmp/router_upgrade_$(date +%Y%m%d-%H%M%S)"; mkdir -p "$d"
+  local d="$LOG_DIR/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$d"
   local f got=0
   for f in /tmp/upg.log /tmp/zzz-restore.log /tmp/zzz-postinstall.log /tmp/rb.log; do
     if scp -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER:$f" "$d/" 2>/dev/null; then got=1; fi
   done
   if [ "$got" = "1" ]; then echo "📦 已归档路由日志到 $d"; else echo "⚠️ 日志归档失败(可能已失联, 路由重启后重连再试)"; fi
+}
+
+# 升级后结构化报告(P3, SRE 视角): 一眼看清"到底恢复全了没", 落持久化目录
+post_upgrade_report(){
+  mkdir -p "$LOG_DIR"
+  local d rep
+  d="$LOG_DIR/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$d"
+  rep="$d/report.md"
+  {
+    echo "# 路由器升级后结构化报告"
+    echo ""
+    echo "- 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "- 目标版本 commit: ${TARGET_COMMIT:-?}"
+    echo "- 回退镜像: $(basename "${ROLLBACK:-}")"
+    echo ""
+  } > "$rep"
+  if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then
+    echo "⚠️ 连不上路由器, 无法生成结构化报告(可待重连后手动跑本函数)" >> "$rep"
+    echo "⚠️ 连不上路由器, 无法生成结构化报告"
+    return 0
+  fi
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
+    rev=$(grep DISTRIB_REVISION /etc/openwrt_release 2>/dev/null)
+    r=$(printf "%s" "$rev" | grep -oE "[0-9a-f]{7,40}" | tail -1)
+    echo "## 1. 版本"
+    echo "- 当前固件: $rev"
+    echo "- 目标版本: '"$TARGET_COMMIT"'"
+    echo "- 版本匹配: $(printf "%s" "$r" | grep -q "'"$TARGET_COMMIT"'" && echo "✅ 是" || echo "❌ 否")"
+    echo ""
+    echo "## 2. 外网直连 DNS(不依赖 OpenClash)"
+    if curl -fsS --max-time 6 https://www.baidu.com >/dev/null 2>&1; then echo "- ✅ baidu 直连可达 (HTTP 2xx/3xx)"; else echo "- ❌ 外网直连不通"; fi
+    echo ""
+    echo "## 3. 三频状态"
+    for rad in radio0 radio1 radio2; do
+      st=$(uci get wireless.$rad.disabled 2>/dev/null)
+      echo "- $rad: $([ "$st" = "1" ] && echo "disabled(关闭)" || echo "enabled(开启)")"
+    done
+    echo ""
+    echo "## 4. OpenClash"
+    if pgrep -f clash >/dev/null 2>&1; then echo "- ✅ clash 进程运行中"; else echo "- ⚠️ clash 未运行"; fi
+    if [ -x /etc/openclash/core/clash_meta ]; then echo "- ✅ 内核 clash_meta 存在且可执行"; else echo "- ❌ 内核 clash_meta 缺失/不可执行"; fi
+    echo ""
+    echo "## 5. DHCP 静态租约数"
+    echo "- $(uci show dhcp 2>/dev/null | grep -c "dhcp.@host") 条"
+    echo ""
+    echo "## 6. 防火墙 fw4 check"
+    fw4 check 2>&1 | tail -1
+    echo ""
+    echo "## 7. 配置持久化(uci changes 应为空)"
+    ch=$(uci changes 2>/dev/null)
+    if [ -z "$ch" ]; then echo "- ✅ uci changes 为空(已全部 commit)"; else echo "- ⚠️ 存在未提交改动:"; echo "$ch"; fi
+  ' 2>/dev/null >> "$rep"
+  echo "📄 已生成升级后结构化报告: $rep"
 }
 
 # 解析待刷 itb: 优先级 --itb > 官方最新 release tag 本地匹配 > ls -t 最新(带警告)
@@ -196,7 +250,38 @@ resolve_rollback(){
   return 1
 }
 
-# 升级前对当前运行配置做快照(sysupgrade -b), 落本地 backups/ 作为"配置级回退点"。
+# 固件级回退点自动化(P2): 确保"当前路由器正在运行的版本"的 itb 本地存在;
+# 不存在则 best-effort 从官方 release 下载(按日期/commit 匹配), 与 backup_config 的
+# 配置级备份形成"固件+配置"双保险。失败不阻断升级, 回落到 FALLBACK_ITB。
+ensure_rollback_itb(){
+  [ -n "$ROLLBACK" ] && [ -f "$ROLLBACK" ] && { echo "✅ 回退镜像已本地就位: $(basename "$ROLLBACK")"; return 0; }
+  [ "$DRY" = "1" ] && { echo "ℹ️ dry-run 不下载回退镜像(仅本地检查)"; return 0; }
+  command -v gh >/dev/null 2>&1 || { echo "⚠️ 无 gh CLI, 跳过回退镜像下载(依赖 FALLBACK_ITB)"; return 0; }
+  local rev ymd y m d date hash jqf url name
+  rev=$(ssh -o ConnectTimeout=8 "$ROUTER" 'grep DISTRIB_REVISION /etc/openwrt_release' 2>/dev/null) || { echo "⚠️ 读不到当前版本, 跳过回退镜像下载"; return 0; }
+  ymd=$(printf '%s' "$rev" | grep -oE '[0-9]{4}-[0-9]+-[0-9]+' | head -1)
+  y=$(printf '%s' "$ymd" | cut -d- -f1); m=$(printf '%s' "$ymd" | cut -d- -f2); d=$(printf '%s' "$ymd" | cut -d- -f3)
+  date=$(printf '%s%02d%02d' "$y" "$m" "$d")
+  hash=$(printf '%s' "$rev" | grep -oE '[0-9a-f]{7,40}' | tail -1)
+  # 在含 XR1710G 的 releases 中找含当前版本 date 或 hash 的 itb 资产
+  jqf=$(printf '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[] | .assets[] | select(.name|test("gemtek_xr1710g") and (.name|test("%s"))) | .browser_download_url' "$date")
+  url=$(gh api "repos/$REPO/releases?per_page=100" --jq "$jqf" 2>/dev/null | head -1)
+  if [ -z "$url" ] && [ -n "$hash" ]; then
+    jqf=$(printf '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[] | .assets[] | select(.name|test("gemtek_xr1710g") and (.name|test("%s"))) | .browser_download_url' "$hash")
+    url=$(gh api "repos/$REPO/releases?per_page=100" --jq "$jqf" 2>/dev/null | head -1)
+  fi
+  [ -z "$url" ] && { echo "⚠️ 未找到当前版本($date/$hash)的回退 itb 下载源, 依赖 FALLBACK_ITB"; return 0; }
+  name=$(basename "$url")
+  if [ -f "$PREP_DIR/$name" ]; then echo "✅ 回退镜像已本地就位: $name"; ROLLBACK="$PREP_DIR/$name"; return 0; fi
+  echo "⬇️ 下载当前版本回退镜像: $name"
+  if curl -fL "$url" -o "$PREP_DIR/$name" 2>/dev/null && [ -s "$PREP_DIR/$name" ]; then
+    echo "✅ 已下载回退镜像到 $PREP_DIR/$name"
+    ROLLBACK="$PREP_DIR/$name"
+  else
+    rm -f "$PREP_DIR/$name"
+    echo "⚠️ 回退镜像下载失败, 依赖 FALLBACK_ITB"
+  fi
+}
 # 与 resolve_rollback 的固件级回退互补: 固件刷成功但配置被搞坏时, 可手动 scp 此备份回路由 sysupgrade -f 还原。
 backup_config(){
   local rev hash ts dest
@@ -270,6 +355,25 @@ collect_runtime(){
   else
     echo "⚠️ host key 抓取失败, 升级后 host key 会变(各终端需 ssh-keygen -R)"
   fi
+  # 抓取真实 network/wireless 配置(P2): 还原用户自定义信道/功率/桥接/额外SSID, 不再写死成作者默认。
+  # 仅当两者都抓取成功才写标记文件 etc/zzz-realconfig.flag, zzz-restore 据此跳过 heredoc 改用真实配置;
+  # 任一失败则删除, 首启动降级回写死 heredoc。注入的是运行时临时 kit(/tmp, 不进Git), 与源码零明文泄露。
+  if ssh -o ConnectTimeout=10 "$ROUTER" 'cat /etc/config/network' 2>/dev/null > "$build/etc/config/network" && [ -s "$build/etc/config/network" ]; then
+    echo "✅ 已抓取活路由 network 配置(还原自定义网络设置)"
+  else
+    rm -f "$build/etc/config/network"
+  fi
+  if ssh -o ConnectTimeout=10 "$ROUTER" 'cat /etc/config/wireless' 2>/dev/null > "$build/etc/config/wireless" && [ -s "$build/etc/config/wireless" ]; then
+    echo "✅ 已抓取活路由 wireless 配置(还原自定义信道/功率/SSID)"
+  else
+    rm -f "$build/etc/config/wireless"
+  fi
+  if [ -f "$build/etc/config/network" ] && [ -f "$build/etc/config/wireless" ]; then
+    : > "$build/etc/zzz-realconfig.flag"
+    echo "✅ 真实 network/wireless 配置已就位, 首启动将还原用户自定义设置(而非写死默认)"
+  else
+    echo "⚠️ 真实配置抓取不完整, 首启动将降级为已知良好 heredoc 默认"
+  fi
   {
     [ -n "$s" ]  && echo "ROOT_SHADOW=$s"
     echo "WIFI_KEY=$w"
@@ -308,6 +412,9 @@ if [ -z "$ROLLBACK" ]; then
 else
   echo "回退: $(basename "$ROLLBACK") (已自动匹配当前运行版本)"
 fi
+
+# 固件级回退点: 确保当前运行版本 itb 本地存在(缺失则 best-effort 下载), 与配置级备份互补(P2)
+ensure_rollback_itb
 
 if [ "$DRY" = "1" ]; then
   echo "=== DRY-RUN: 不执行升级 ==="
@@ -417,6 +524,7 @@ echo "--- 首启动自举日志尾部 ---"; tail -5 /tmp/zzz-restore.log 2>/dev/
 '
 echo "=== 升级流程结束 ==="
 archive_logs
+post_upgrade_report
 echo "若终验全部通过, 升级成功。若 OpenClash 仍未起(rc.local 未跑完), 在 Mac 侧执行:"
 echo "  ssh \"$ROUTER\" 'apk add luci-app-openclash && /etc/init.d/openclash restart'"
 echo "升级后请改 root 密码: ssh \"$ROUTER\" 'passwd root'"
@@ -504,6 +612,7 @@ auto_rollback(){
     notify "路由器升级回退失败" "回退后仍终验失败, 需手动进 U-Boot Recovery"
   fi
   archive_logs
+  post_upgrade_report
 }
 
 # 保守清理旧 itb: 保留最新 3 个, 且永不删除回退镜像(上一版本)与兜底镜像
@@ -524,13 +633,20 @@ prune_old_itbs(){
 
 if [ "$AUTO" = "1" ]; then
   echo "=== 强终验 (--auto) ==="
-  verify_router; RC=$?
+  # RC=2(连不上路由器)重试(P2): 早启动/执行机抖动可能暂时连不上, 重试避免误判或过早放弃
+  RC=2
+  for _att in 1 2 3 4 5 6; do
+    verify_router; RC=$?
+    if [ "$RC" = "0" ] || [ "$RC" = "1" ]; then break; fi
+    echo "⚠️ 第 $_att/6 次强终验连不上路由器(RC=2), 10s 后重试..."
+    sleep 10
+  done
   if [ "$RC" = "0" ]; then
     echo "✅ 强终验通过: 固件版本/外网直连/三频 均正常, 升级成功"
     prune_old_itbs
     notify "路由器升级成功" "固件已更新, 强终验通过"
   elif [ "$RC" = "2" ]; then
-    echo "⚠️ 连不上路由器, 不触发自动回退(避免误改状态), 需人工确认后手动处理"
+    echo "⚠️ 6 次重试后仍连不上路由器, 不触发自动回退(避免误改状态), 需人工确认后手动处理"
     notify "路由器升级终验中断" "连不上路由器, 未自动回退, 需人工确认"
   else
     echo "❌ 强终验未通过(连上但终验失败)"
