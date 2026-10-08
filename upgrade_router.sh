@@ -433,6 +433,9 @@ verify_router(){
   fi
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
     rev=$(grep DISTRIB_REVISION /etc/openwrt_release 2>/dev/null | grep -oE "[0-9a-f]{7,40}" | tail -1)
+    # 关键防御: 版本读不到(早启动/连接抖动/文件瞬时不可读)一律归为"无法判定", 返回2 不回退;
+    # 只有"读到了但确实不是目标"才判 FAIL(返回1). 杜绝检测失败触发破坏性回退.
+    if [ -z "$rev" ]; then echo "WARN: 无法读取当前固件版本(可能为早启动/连接抖动), 不判定失败以免误回退"; exit 2; fi
     echo "$rev" | grep -q "'"$TARGET_COMMIT"'" || { echo "FAIL: 固件版本未变更 (期望 '"$TARGET_COMMIT"', 实得 $rev)"; exit 1; }
     # 硬终验: 外网直连(不依赖 OpenClash 7874) — 用国内可直连站点验证
     curl -fsS --max-time 6 https://www.baidu.com >/dev/null 2>&1 || ping -c2 -W3 8.8.8.8 >/dev/null 2>&1 || { echo "FAIL: 外网不通"; exit 1; }
