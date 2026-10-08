@@ -243,6 +243,21 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
   chmod +x /etc/openclash/core/clash_meta 2>/dev/null
   /etc/init.d/openclash enable >>/tmp/zzz-postinstall.log 2>&1
   /etc/init.d/openclash restart >>/tmp/zzz-postinstall.log 2>&1
+  # DNS 卫生(P1): OpenClash 未真正监听本地端口时, 不把客户端 DNS 指死(否则连WiFi没网)
+  sleep 3
+  _dns_up=$(uci get dhcp.@dnsmasq[0].server 2>/dev/null)
+  if echo "$_dns_up" | grep -q '127.0.0.1'; then
+    _port=$(echo "$_dns_up" | grep -oE '[0-9]+' | head -1)
+    if [ -n "$_port" ] && ! (nc -z -w2 127.0.0.1 "$_port" 2>/dev/null || ss -lun 2>/dev/null | grep -q ":$_port "); then
+      echo "DNS 上游 $_dns_up 指向本地死端口, 回退公共 DNS" >>/tmp/zzz-postinstall.log
+      uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
+      uci del dhcp.@dnsmasq[0].server 2>/dev/null
+      uci add_list dhcp.@dnsmasq[0].server='223.5.5.5'
+      uci add_list dhcp.@dnsmasq[0].server='8.8.8.8'
+      uci commit dhcp
+      /etc/init.d/dnsmasq restart >>/tmp/zzz-postinstall.log 2>&1
+    fi
+  fi
   touch /etc/zzz-postinstall-done
 fi
 exit 0

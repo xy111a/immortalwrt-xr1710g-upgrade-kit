@@ -62,6 +62,53 @@ PREUPG_BACKUP=""
 
 die(){ echo "❌ $1"; exit 1; }
 
+# 执行机拓扑自检(P0): 升级"担任网关/隧道路由器"时, 执行机绝不能依赖该设备通信。
+# 方法: 在路由侧读 SSH_CONNECTION 取执行机源 IP; 落在路由器 LAN 网段 -> 直连(安全); 否则 -> 经隧道(危险)。
+executor_online(){ curl -s --max-time 6 -o /dev/null https://www.baidu.com 2>/dev/null || ping -c1 -W3 8.8.8.8 >/dev/null 2>&1; }
+precheck_executor_location(){
+  local rip lanip srcip lan_net src_net
+  rip="${ROUTER#*@}"; rip="${rip%:*}"
+  lanip=$(ssh -o ConnectTimeout=8 "$ROUTER" 'uci get network.lan.ipaddr' 2>/dev/null | cut -d/ -f1)
+  srcip=$(ssh -o ConnectTimeout=8 "$ROUTER" 'echo $SSH_CONNECTION' 2>/dev/null | awk '{print $1}')
+  echo "---- 执行机拓扑自检 ----"
+  echo "路由器 LAN IP: ${lanip:-?}; 路由侧看到的执行机源 IP: ${srcip:-?}"
+  if [ -n "$srcip" ] && [ -n "$lanip" ]; then
+    lan_net=$(printf '%s' "$lanip" | awk -F. '{print $1"."$2"."$3}')
+    src_net=$(printf '%s' "$srcip" | awk -F. '{print $1"."$2"."$3}')
+    if [ "$lan_net" = "$src_net" ]; then
+      echo "✅ 执行机经 LAN 直连路由器(${lan_net}.0/24), 重启后 WiFi/有线可重连, 风险可控"
+      return 0
+    fi
+    echo "🔴 执行机源 IP($srcip) 不在路由器 LAN 网段(${lan_net}.0/24) —— 极可能经隧道/VPN 回家"
+    echo "   升级会重启路由器, 隧道将断, 执行机将永久失联, 无法终验/回退!"
+    echo "   请改用: 执行机用独立上网路径(手机热点/另一网卡), 并用有线直连路由器 LAN 口后再升级。"
+    if [ -t 0 ]; then
+      printf '仍要继续(自担风险)? [y/N] ' >&2; read -r _a </dev/tty 2>/dev/null
+      case "$_a" in y|Y) echo "已确认继续(自担风险)";; *) die "已中止: 请有线直连路由器 LAN 口后重试";; esac
+    else
+      die "非交互环境检测到执行机疑似经隧道回家, 为安全中止。请有线直连路由器 LAN 口后重试"
+    fi
+  else
+    echo "⚠️ 无法判定执行机拓扑, 按高风险处理"
+    if [ -t 0 ]; then
+      printf '确认执行机已用有线直连路由器 LAN 口(非隧道)? [y/N] ' >&2; read -r _a </dev/tty 2>/dev/null
+      case "$_a" in y|Y) echo "已确认";; *) die "已中止";; esac
+    else
+      die "非交互环境无法判定拓扑, 为安全中止"
+    fi
+  fi
+}
+
+# 把路由器侧关键日志归档回执行机, 失联后也能保留"已触发/完成"的证据(P2)
+archive_logs(){
+  local d="/tmp/router_upgrade_$(date +%Y%m%d-%H%M%S)"; mkdir -p "$d"
+  if scp -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null         "$ROUTER":'/tmp/upg.log /tmp/zzz-restore.log /tmp/zzz-postinstall.log /tmp/rb.log' "$d/" 2>/dev/null; then
+    echo "📦 已归档路由日志到 $d"
+  else
+    echo "⚠️ 日志归档失败(可能已失联, 路由重启后重连再试)"
+  fi
+}
+
 # 解析待刷 itb: 优先级 --itb > 官方最新 release tag 本地匹配 > ls -t 最新(带警告)
 # 不依赖 mtime 选 target, 避免回退 itb 比目标新时被误选为刷机目标
 resolve_target_itb(){
@@ -134,11 +181,17 @@ ITB=$(resolve_target_itb) || die "找不到待刷 itb (期望 $PREP_DIR/*.itb, �
 # 自动解析回退镜像: 取路由器当前运行的 commit hash, 在本地 firmware-prep 匹配同名 itb。
 # 这样每次升级都会把"刚跑的版本"作为回退目标 —— 即自动备份当前版本。
 resolve_rollback(){
-  local rev hash itb
+  local rev date hash itb
   rev=$(ssh -o ConnectTimeout=8 "$ROUTER" 'grep DISTRIB_REVISION /etc/openwrt_release' 2>/dev/null) || return 1
-  hash=$(printf '%s' "$rev" | grep -oE '[0-9a-f]{7,40}' | tail -1)  # 取末尾 hex 串; 避开 DISTRIB_REVISION 行尾单引号对 $ 锚点的干扰
-  [ -n "$hash" ] || return 1
-  itb=$(ls "$PREP_DIR"/*.itb 2>/dev/null | grep -i "$hash" | head -1)
+  # 优先按日期(YYYYMMDD, 补零)匹配: 路由器 DISTRIB_REVISION 形如 2026-9-16-...-<commit>, itb 文件名含 20260916-<commit>
+  # 避坑: 文件名 commit 为 8 位, 运行固件 commit 为 10 位, 子串 grep 易失配; 用日期更稳
+  #       且 DISTRIB_REVISION 月/日可能是单数字(9/16), 需补零成 8 位才能匹配文件名 20260916
+  ymd=$(printf '%s' "$rev" | grep -oE '[0-9]{4}-[0-9]+-[0-9]+' | head -1)
+  y=$(printf '%s' "$ymd" | cut -d- -f1); m=$(printf '%s' "$ymd" | cut -d- -f2); d=$(printf '%s' "$ymd" | cut -d- -f3)
+  date=$(printf '%s%02d%02d' "$y" "$m" "$d")
+  hash=$(printf '%s' "$rev" | grep -oE '[0-9a-f]{7,40}$' | head -1)
+  [ -n "$date" ] && itb=$(ls "$PREP_DIR"/*.itb 2>/dev/null | grep -i "$date" | head -1)
+  [ -z "$itb" ] && [ -n "$hash" ] && itb=$(ls "$PREP_DIR"/*.itb 2>/dev/null | grep -i "$hash" | head -1)
   [ -n "$itb" ] && { printf '%s' "$itb"; return 0; }
   return 1
 }
@@ -231,6 +284,8 @@ collect_runtime(){
 
 resolve_router || die "未配置路由器 SSH 地址 — 请用 --router root@192.168.1.1 或 ROUTER 环境变量指定, 或在首次运行时按提示输入"
 
+precheck_executor_location
+
 echo "=== 预检 ==="
 echo "ITB : $(basename "$ITB")"
 echo "KIT : $(basename "$KIT")"
@@ -320,10 +375,15 @@ for i in $(seq 1 12); do
   sleep 5
 done
 [ "$DOWN" = "1" ] || echo "⚠️ 12 次探测内未检测到断开 — 可能 sysupgrade 未触发重启, 继续尝试重连并终验"
-echo "=== 轮询重连 (每 5s, 最多 40 次 = 200s) ==="
+echo "=== 轮询重连 (每 5s, 最多 80 次 = 400s) ==="
 OK=0
-for i in $(seq 1 40); do
-  # 先试用户配置的地址(别名或 IP), 再退到常见出厂默认 IP (首启动自举可能重置为出厂态)
+for i in $(seq 1 80); do
+  # 先判断执行机自身链路是否健康: 若执行机自己都上不了网, "连不上路由"可能是执行机问题, 不应急于判定路由故障(P0)
+  if ! executor_online; then
+    echo "⚠️ 第 $i 轮: 执行机自身外网不可达(可能经路由上网, 重启导致断网), 继续等待链路恢复..."
+    sleep 5; continue
+  fi
+  # 试用户配置的地址(别名或 IP), 再退到常见出厂默认 IP (首启动自举可能重置为出厂态)
   tried="$ROUTER"
   for ip in 192.168.1.1 192.168.0.1 10.0.0.1; do tried="$tried root@$ip"; done
   for target in $tried; do
@@ -333,7 +393,12 @@ for i in $(seq 1 40); do
   done
   sleep 5
 done
-[ "$OK" = "1" ] || die "重连失败 — 可能进入 Recovery 或需手动介入 (U-Boot 兜底已就位, 可访问 HTTP Recovery 重刷)"
+if [ "$OK" != "1" ]; then
+  echo "❌ 重连失败 — 可能进入 Recovery 或执行机链路仍异常"
+  echo "   诊断: 执行机出口 IP=$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null || echo '?'); 路由器=$ROUTER"
+  echo "   若执行机本就不经此路由上网, 请确认有线已直连路由器 LAN 口; U-Boot 兜底已就位, 可访问 HTTP Recovery 重刷"
+  die "重连失败, 需人工介入"
+fi
 
 echo "=== 终验 (在路由器上, accept-new 接受全清后的新 host key) ==="
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
@@ -349,6 +414,7 @@ echo "--- U-Boot 兜底 (直接读活跃 UBI 卷 ubootenv2/ubootenv, 绕开 fw_e
 echo "--- 首启动自举日志尾部 ---"; tail -5 /tmp/zzz-restore.log 2>/dev/null
 '
 echo "=== 升级流程结束 ==="
+archive_logs
 echo "若终验全部通过, 升级成功。若 OpenClash 仍未起(rc.local 未跑完), 在 Mac 侧执行:"
 echo "  ssh \"$ROUTER\" 'apk add luci-app-openclash && /etc/init.d/openclash restart'"
 echo "升级后请改 root 密码: ssh \"$ROUTER\" 'passwd root'"
@@ -360,16 +426,23 @@ fi
 
 # ---------- 强终验 (仅 --auto 模式: 判定成败并触发回退) ----------
 # 判定: 外网通 + 代理DNS通(clash@7874) + radio0/1 启用 + clash 进程在 → 成功
+# 返回: 0=成功; 1=连上但终验不通过(真失败, 可回退); 2=连不上路由器(执行机/路由不可达, 不触发回退)
 verify_router(){
+  if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then
+    echo "WARN: 连不上路由器, 跳过终验(不触发回退以免误改状态)"; return 2
+  fi
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
     rev=$(grep DISTRIB_REVISION /etc/openwrt_release 2>/dev/null | grep -oE "[0-9a-f]{7,40}$")
     [ "$rev" = "'"$TARGET_COMMIT"'" ] || { echo "FAIL: 固件版本未变更 (期望 '"$TARGET_COMMIT"', 实得 $rev)"; exit 1; }
-    curl -fsS --max-time 6 https://www.google.com >/dev/null 2>&1 || ping -c2 -W3 8.8.8.8 >/dev/null 2>&1 || { echo "FAIL: 外网不通"; exit 1; }
-    nslookup github.com 127.0.0.1 >/dev/null 2>&1 || { echo "FAIL: 代理DNS不通"; exit 1; }
+    # 硬终验: 外网直连(不依赖 OpenClash 7874) — 用国内可直连站点验证
+    curl -fsS --max-time 6 https://www.baidu.com >/dev/null 2>&1 || ping -c2 -W3 8.8.8.8 >/dev/null 2>&1 || { echo "FAIL: 外网不通"; exit 1; }
     for r in radio0 radio1; do
       [ "$(uci get wireless.$r.disabled 2>/dev/null)" = "1" ] && { echo "FAIL: $r 被禁用"; exit 1; }
     done
-    pgrep -f clash >/dev/null 2>&1 || { echo "FAIL: clash 未运行"; exit 1; }
+    # 软终验(可选): 仅当用户真正启用 OpenClash 时才要求 7874 代理DNS通(P1)
+    if pgrep -f clash >/dev/null 2>&1 || [ "$(uci get openclash.config.enabled 2>/dev/null)" = "1" ]; then
+      nslookup github.com 127.0.0.1 >/dev/null 2>&1 || { echo "FAIL: 代理DNS不通(已启用OpenClash)"; exit 1; }
+    fi
     exit 0
   ' 2>/dev/null
 }
@@ -398,12 +471,29 @@ auto_rollback(){
     if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then break; fi
     sleep 5
   done
+  # DNS 兜底(P1): 回退还原旧配置可能含 7874 死端口, 若 OpenClash 未监听则回退公共DNS
+  ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
+    up=$(uci get dhcp.@dnsmasq[0].server 2>/dev/null)
+    if echo "$up" | grep -q "127.0.0.1"; then
+      p=$(echo "$up" | grep -oE "[0-9]+" | head -1)
+      if [ -n "$p" ] && ! nc -z -w2 127.0.0.1 "$p" 2>/dev/null; then
+        uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
+        uci del dhcp.@dnsmasq[0].server 2>/dev/null
+        uci add_list dhcp.@dnsmasq[0].server="223.5.5.5"
+        uci add_list dhcp.@dnsmasq[0].server="8.8.8.8"
+        uci commit dhcp
+        /etc/init.d/dnsmasq restart
+        echo "DNS 兜底: 回退公共 DNS"
+      fi
+    fi
+  ' 2>/dev/null || true
   if verify_router; then
     echo "✅ 回退后强终验通过"; notify "路由器已自动回退" "旧固件+旧配置已恢复, 强终验通过"
   else
     echo "❌ 回退后仍失败, 需手动进 U-Boot Recovery"
     notify "路由器升级回退失败" "回退后仍终验失败, 需手动进 U-Boot Recovery"
   fi
+  archive_logs
 }
 
 # 保守清理旧 itb: 保留最新 3 个, 且永不删除回退镜像(上一版本)与兜底镜像
@@ -424,12 +514,16 @@ prune_old_itbs(){
 
 if [ "$AUTO" = "1" ]; then
   echo "=== 强终验 (--auto) ==="
-  if verify_router; then
-    echo "✅ 强终验通过: 外网/代理DNS/三频/clash 均正常, 升级成功"
+  verify_router; RC=$?
+  if [ "$RC" = "0" ]; then
+    echo "✅ 强终验通过: 固件版本/外网直连/三频 均正常, 升级成功"
     prune_old_itbs
     notify "路由器升级成功" "固件已更新, 强终验通过"
+  elif [ "$RC" = "2" ]; then
+    echo "⚠️ 连不上路由器, 不触发自动回退(避免误改状态), 需人工确认后手动处理"
+    notify "路由器升级终验中断" "连不上路由器, 未自动回退, 需人工确认"
   else
-    echo "❌ 强终验未通过"
+    echo "❌ 强终验未通过(连上但终验失败)"
     auto_rollback
   fi
 fi
