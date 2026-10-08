@@ -328,6 +328,17 @@ collect_runtime(){
   else
     echo "⚠️ OpenClash 配置抓取失败, 沿用 kit 内烘焙版本"
   fi
+  # 订阅数据兜底(P1 之后发现: clean 刷机后 rc.local 的 apk add 重装 OpenClash 会清空 /etc/openclash/config,
+  #  仅靠 sysupgrade -f 还原不够可靠 —— 本次实机就因此丢了订阅, 只能从升级前备份回拷)。
+  # 把活路由 openclash 数据(除 57MB 内核)另存到 kit 的 etc/zzz-oc-data/(apk add 不会触碰此路径),
+  # 由 zzz-restore 的 rc.local 在 apk add 之后、启动 openclash 之前据此还原。
+  mkdir -p "$build/etc/zzz-oc-data"
+  if ssh -o ConnectTimeout=10 "$ROUTER" 'tar --exclude=etc/openclash/core -czf - -C / etc/openclash' 2>/dev/null \
+       | tar -xzf - --strip-components=2 -C "$build/etc/zzz-oc-data" 2>/dev/null; then
+    echo "✅ 已另存 OpenClash 订阅数据(除内核)到 kit 的 etc/zzz-oc-data/ (防 apk 重装清空)"
+  else
+    echo "⚠️ OpenClash 订阅数据另存失败(依赖上方 sysupgrade -f 还原路径)"
+  fi
   # 抓取活路由当前 DHCP 静态租约(host 段) -> 写入 kit 的 etc/dhcp-hosts.uci
   # 格式: 每行 "host <name> <mac> <ip> <leasetime>"; 首启动自举据此重建, 不写死 MAC
   if ssh -o ConnectTimeout=8 "$ROUTER" 'for sec in $(uci show dhcp 2>/dev/null | grep -oE "dhcp.@host\[[0-9]+\]" | sort -u); do n=$(uci -q get "${sec}.name"); m=$(uci -q get "${sec}.mac"); ip=$(uci -q get "${sec}.ip"); lt=$(uci -q get "${sec}.leasetime"); [ -n "$m" ] && [ -n "$ip" ] && echo "host ${n:-unknown} $m $ip ${lt:-infinite}"; done' 2>/dev/null > "$build/etc/dhcp-hosts.uci"; then
