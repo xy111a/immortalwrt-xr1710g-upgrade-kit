@@ -18,6 +18,13 @@ LOG=/tmp/zzz-restore.log
 exec 2>>$LOG
 echo "=== zzz-restore-router 开始 $(date) ===" >>$LOG
 
+# ---------- 0. 清理 macOS AppleDouble 垃圾(._*) ----------
+# 历史 kit 经 Mac tar 打包时附带 ._* 伴随文件, 曾随 sysupgrade -f 落进路由器 /etc
+# (如 /etc/uci-defaults/._zzz-restore-router、/etc/dropbear/._*)。新版 kit 已在
+# Mac 侧(COPYFILE_DISABLE=1)与抓取端(tar --exclude)双重排除, 此处对存量做兜底清理。
+find /etc -name '._*' -type f -exec rm -f {} \; 2>/dev/null
+echo "已清理 /etc 下 AppleDouble 垃圾(._*)" >>$LOG
+
 # 升级后 root 密码(全清刷后 root 无密码, 必须设置, 否则:
 #   a) 内网任何设备可空密码 LAN SSH 进 root; b) 非交互脚本 ssh 连不上无法终验)
 # root 密码 / WiFi key / 三频 SSID / LAN IP / DHCP 静态租约 均不再硬编码: 升级前由 Mac 侧
@@ -180,13 +187,35 @@ rm -f /etc/zzz-realconfig.flag 2>/dev/null
 uci set firewall.@defaults[0].flow_offloading='1' 2>/dev/null || true
 uci set firewall.@defaults[0].flow_offloading_hw='1' 2>/dev/null || true
 uci set firewall.@defaults[0].fullcone='1' 2>/dev/null || true
+# 剥离 firewall 中指向 /var 运行时文件的 config include(openclash + zerotier 共 4 个具名段,
+# 形如 firewall.openclash / firewall.zerotier_input/srcnat/forward, 均指向 /var/etc 或 /var/run)。
+# 背景(2026-10-27 修复 R5): 现网 firewall 含用户 129 行自定义区域/转发/规则 + 上述 /var include 段。
+# 全清刷(sysupgrade -n -f)还原 firewall 后, 首启动 fw4 reload 时这些 /var 文件尚不存在(OpenClash/
+# zerotier 由 rc.local 延后启动)会致加载失败。故首启动剥离 /var include, 保留全部自定义规则;
+# 这些 include 由 OpenClash/zerotier 自身启动时重新添加(作者原设计即如此)。
+# 注意: 现网用的是具名段(firewall.openclash 等)而非匿名 @include[N], 故此处两类都匹配。
+for s in $(uci show firewall 2>/dev/null | grep -E "=include$" | sed -E 's/=include$//'); do
+  p=$(uci -q get "$s.path" 2>/dev/null)
+  case "$p" in
+    /var/*)
+      uci delete "$s" 2>/dev/null || true
+      echo "剥离 firewall include: $s ($p, 由对应服务启动时重建)" >>$LOG
+      ;;
+  esac
+done
 uci commit firewall 2>/dev/null || true
 
 # ---------- 3.5 dhcp: 恢复静态租约(全清刷 -n 会抹掉 /etc/config/dhcp) ----------
 # 不写死 MAC: 升级前由 Mac 侧 upgrade_router.sh 从活路由器抓取当前 DHCP 静态租约,
 # 写入 kit 的 etc/dhcp-hosts.uci (每行: host <name> <mac> <ip> <leasetime>),
 # 本脚本按文件重建具名段(幂等, 重复运行不追加重复)。文件中无明文密码, 可随 kit 携带。
+# 2026-10-21 起: 真实 /etc/config/dhcp(含静态租约 + dnsmasq 定制: 7874/noresolv/cachesize)
+# 已随 kit 整配置还原(EXTRA_CONFIGS), 此时跳过"清空+重建", 避免把已还原的匿名 host 段
+# 无谓churn 成具名段; 仅当 kit 未携带真实 dhcp 配置(旧 kit/抓取失败)时才走确定性重建。
 DHCP_HOSTS=/etc/dhcp-hosts.uci
+if uci -q get dhcp.@host[0].ip >/dev/null 2>&1; then
+  echo "dhcp 静态租约已随真实配置还原($(uci show dhcp 2>/dev/null | grep -c 'dhcp.@host') 条), 跳过清空重建" >>$LOG
+else
 # 先清空可能残留的匿名 host 段, 再用具名段确定性重建(幂等)
 for h in $(uci show dhcp 2>/dev/null | grep -oE 'dhcp\.@host\[[0-9]+\]' | sort -u); do
   uci -q delete "$h" 2>/dev/null || true
@@ -206,6 +235,23 @@ if [ -f "$DHCP_HOSTS" ]; then
   echo "已恢复 DHCP 静态租约 ($(wc -l < "$DHCP_HOSTS" 2>/dev/null || echo 0) 条, 抓取自活路由)" >>$LOG
 else
   echo "ℹ️ 未找到 DHCP 静态租约抓取文件, 跳过(升级前未配置静态租约)" >>$LOG
+fi
+fi
+
+# ---------- 3.6 恢复"用户禁用"的服务(overlay 白名单化) ----------
+# 全清刷后 /etc/rc.d 会重新暴露出厂(/rom 下层)的开机链; kit 携带的禁用清单里的服务
+# 必须在此显式删链(rm 在 overlay upper 重建 whiteout), 否则 watchcat/igmpproxy 等被默默启动
+# (2026-10-08 升级后实际复发过)。清单由 Mac 侧 collect_runtime 刷前生成, 用后即删。
+DISABLED_SVC=/etc/zzz-disabled-services
+if [ -f "$DISABLED_SVC" ]; then
+  while read -r _link; do
+    [ -z "$_link" ] && continue
+    rm -f "/etc/rc.d/$_link" 2>/dev/null
+  done < "$DISABLED_SVC"
+  echo "已按清单禁用服务: $(tr '\n' ' ' < "$DISABLED_SVC" 2>/dev/null)" >>$LOG
+  rm -f "$DISABLED_SVC" 2>/dev/null
+else
+  echo "ℹ️ 无禁用服务清单(或已被处理)" >>$LOG
 fi
 
 # ---------- 4. root 密码(从升级前抓取的 shadow hash 恢复, 无明文) ----------
@@ -295,7 +341,8 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
   if [ -d /etc/zzz-oc-data ] && [ -n "$(ls -A /etc/zzz-oc-data 2>/dev/null)" ]; then
     cp -a /etc/zzz-oc-data/. /etc/openclash/ 2>/dev/null
     chown -R root:root /etc/openclash 2>/dev/null
-    rm -f /etc/openclash/config/._* 2>/dev/null
+    # 全树清理 AppleDouble 垃圾(旧 kit 曾在 custom/rule_provider 留下 ._*; 新 kit 源头已排除, 此处兜底)
+    find /etc/openclash -name '._*' -type f -exec rm -f {} \; 2>/dev/null
     echo "✅ 已从 kit 另存数据还原 OpenClash 订阅配置(防 apk 重装清空)" >>/tmp/zzz-postinstall.log
     rm -rf /etc/zzz-oc-data 2>/dev/null
   else

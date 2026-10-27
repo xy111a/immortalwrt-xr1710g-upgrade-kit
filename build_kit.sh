@@ -24,6 +24,8 @@
 #
 # 产物: <out> (含 etc/uci-defaults/zzz-restore-router + etc/dropbear/authorized_keys + 可选 etc/openclash)
 set -eu
+# 同 upgrade_router.sh: 阻止 Mac tar 附加 AppleDouble ._* 伴随文件污染 kit
+export COPYFILE_DISABLE=1
 
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 KEYS=""; OC=""; CORE=""; OUT="$PREP_DIR/dist/kit.tar.gz"; FORCE=0
@@ -68,6 +70,8 @@ chmod 600 "$BUILD/etc/dropbear/authorized_keys"
 if [ -n "$OC" ] && [ -d "$OC" ]; then
   mkdir -p "$BUILD/etc/openclash"
   cp -R "$OC"/. "$BUILD/etc/openclash"/ 2>/dev/null || true
+  # cp -R 可能带入源目录的 ._* AppleDouble 垃圾, 打包前清掉
+  find "$BUILD" -name '._*' -type f -delete 2>/dev/null
   echo "✅ 已烘焙 OpenClash 配置 (离线兜底; 升级时会从活路由器重新抓取覆盖)"
 else
   echo "ℹ️  未提供 --openclash: kit 不含 OpenClash 配置 (升级时由 collect_runtime 从活路由器抓取)"
@@ -86,10 +90,12 @@ else
 fi
 
 mkdir -p "$(dirname "$OUT")"
-tar -czf "$OUT" -C "$BUILD" .
+# --no-mac-files 双保险(不支持该旗标的 tar 会报错, 此时退回普通打包, COPYFILE_DISABLE 仍生效)
+tar --no-mac-files -czf "$OUT" -C "$BUILD" . 2>/dev/null || tar -czf "$OUT" -C "$BUILD" .
 rm -rf "$BUILD"
 
 echo "✅ 已生成 kit -> $OUT"
 echo "   升级时 upgrade_router.sh 会从活路由器抓取 root shadow / WiFi key / 三频 SSID / OpenClash 配置(core 除外)"
+echo "   以及审计确认的额外配置(dhcp rpcd luci cpufreq watchcat dawn system)与定制路径(crontabs/rc.d/lan_report/token/apk源/http.lua补丁)"
 echo "   注入临时 kit (仅存于 /tmp, 脚本退出即清理), 源码与仓库均无任何明文敏感信息。"
 echo "   若提供了 --openclash-core, 内核已烘焙进 kit, 全清刷后内核不丢; 否则 zzz-restore 运行时兜底下载。"

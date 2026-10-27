@@ -22,6 +22,10 @@
 #   - 在 ~/.ssh/config 配置你的路由器 SSH 地址 (如 Host <router> -> 192.168.x.1); 本工具会在刷前抓取活路由 host key 随 kit 还原, 故其他终端无需更新 known_hosts
 
 set -u
+# macOS tar(bsdtar) 归档时会为每个文件附加 AppleDouble ._* 伴随文件 —— 曾随 kit 刷进路由器,
+# 在 /etc 留下 ._zzz-restore-router / ._authorized_keys 等垃圾。COPYFILE_DISABLE=1 让 bsdtar
+# 跳过伴随文件(2026-10-21 卫生整治; GNU tar 无此行为, 设为无害)。
+export COPYFILE_DISABLE=1
 # ---------- 参数解析 ----------
 #   --dry-run  只校验前置条件 + 打印将执行步骤, 不刷机
 #   --auto     强终验失败自动回退 (供 router_watch.sh 调用)
@@ -49,6 +53,21 @@ trap 'rm -rf /tmp/kit_build /tmp/kit_injected.tar.gz 2>/dev/null' EXIT
 REPO="naoki66/ImmortalWrt-for-Gemtek-brightspeed"
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 KIT="$PREP_DIR/kit.tar.gz"
+# ---------- 全清还原范围(2026-10-21 活机审计后扩充, 见 SKILL.md「备份机制」节) ----------
+# 出厂之上有实质差异、须随 kit 全清还原的 /etc/config 文件。
+# 不含 network/wireless(已有专门的真实配置通道) 与 firewall(openclash/zerotier 的 include 段
+# 由各自 init 自动增删, 见 zzz-restore 3.5 说明) 与 openclash(已有专门抓取通道)。
+EXTRA_CONFIGS="dhcp rpcd luci cpufreq watchcat dawn system"
+# 出厂之上新增/改写的非 /etc/config 路径(定制脚本/补丁/令牌/启用态, 全清刷即丢):
+#   etc/crontabs             root 计划任务(lan_report.sh 上报 + 关灯计划模板)
+#   etc/lan_report.token     lan_report.sh 的上报令牌(无它 crontab 静默失败)
+#   etc/apk/repositories.d   自定义 apk 镜像源(rc.local 的 apk add 依赖; 出厂走官方源, 国内可能不可达)
+#   usr/sbin/lan_report.sh   LAN 设备快照上报脚本(crontab 引用)
+#   usr/lib/lua/luci/http.lua + usr/share/ucode/luci/http.uc  用户手工补丁(上传上限 100kB->10MB)
+#   root/.ssh/known_hosts    root 侧 known_hosts
+# 均排除 macOS AppleDouble ._* 与 *.bak 垃圾。
+# 注意: etc/rc.d(服务启用态)不走整包 —— openclash 开机链须排除, 见下方专门拉取。
+EXTRA_PATHS="etc/crontabs etc/lan_report.token etc/apk/repositories.d usr/sbin/lan_report.sh usr/lib/lua/luci/http.lua usr/share/ucode/luci/http.uc root/.ssh/known_hosts"
 ROUTER="${ROUTER_OVERRIDE:-}"
 EXPECT_SHA="${EXPECT_SHA_OVERRIDE:-}"
 # host key 是否已在升级前抓取并随 kit 还原(成功=1): 决定升级后是否需清本地 known_hosts / 提示其他终端
@@ -324,13 +343,21 @@ collect_runtime(){
   lanip=$(ssh -o ConnectTimeout=8 "$ROUTER" "uci get network.lan.ipaddr 2>/dev/null") || lanip=""
 
   local build=/tmp/kit_build newkit=/tmp/kit_injected.tar.gz
-  rm -rf "$build"; mkdir -p "$build/etc"
+  rm -rf "$build"; mkdir -p "$build/etc/config"
   tar -xzf "$KIT" -C "$build" 2>/dev/null || { echo "❌ 解包 kit 失败"; exit 1; }
+  # 清理从旧 kit 继承的 AppleDouble 垃圾(._*), 避免再次刷进路由器 /etc
+  find "$build" -name '._*' -type f -delete 2>/dev/null
   # 用活路由当前 OpenClash 配置覆盖 kit 内烘焙的旧订阅/规则 (保持订阅有效, 避免升级后连不上)
   # 注意: 排除 etc/openclash/core —— 内核二进制(57MB)由 kit 烘焙(见 build_kit.sh --openclash-core),
   #       随 kit 整包 scp + sysupgrade -f 还原, 不再走"大文件经 SSH tar 管道"的脆弱链路(P1 根治)。
-  if ssh -o ConnectTimeout=10 "$ROUTER" "tar --exclude=etc/openclash/core -czf - -C / etc/config/openclash etc/openclash" 2>/dev/null \
-       | tar -xzf - -C "$build" 2>/dev/null; then
+  # ⚠️ BusyBox tar 不支持 GNU 的 --exclude(会 unrecognized option 静默失败, 曾导致本抓取长期
+  #    走 fallback 而无人察觉); 必须用 -X <模式文件>。模式文件写在路由 /tmp, 用完即删。
+  #    排除 core(57MB, kit 已烘焙)与 ._*(路由器 /etc/openclash 里存量 AppleDouble 垃圾;
+  #    bsdtar 解包 busybox 流时对 ._ 条目会报 Truncated 并使退出码非零, 故必须在源头排除)。
+  #    注意: bsdtar 对 busybox tar 流偶发非零退出(内容已抽全), 故成功判定以落盘内容为准, 不信退出码。
+  ssh -o ConnectTimeout=10 "$ROUTER" 'printf "%s\n" "etc/openclash/core" "._*" "*/._*" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / etc/config/openclash etc/openclash; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+       | tar -xzf - -C "$build" 2>/dev/null || true
+  if [ -s "$build/etc/config/openclash" ]; then
     echo "✅ 已抓取活路由 OpenClash 配置(订阅/规则)覆盖 kit 内旧文件"
   else
     echo "⚠️ OpenClash 配置抓取失败, 沿用 kit 内烘焙版本"
@@ -340,8 +367,9 @@ collect_runtime(){
   # 把活路由 openclash 数据(除 57MB 内核)另存到 kit 的 etc/zzz-oc-data/(apk add 不会触碰此路径),
   # 由 zzz-restore 的 rc.local 在 apk add 之后、启动 openclash 之前据此还原。
   mkdir -p "$build/etc/zzz-oc-data"
-  if ssh -o ConnectTimeout=10 "$ROUTER" 'tar --exclude=etc/openclash/core -czf - -C / etc/openclash' 2>/dev/null \
-       | tar -xzf - --strip-components=2 -C "$build/etc/zzz-oc-data" 2>/dev/null; then
+  ssh -o ConnectTimeout=10 "$ROUTER" 'printf "%s\n" "etc/openclash/core" "._*" "*/._*" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / etc/openclash; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+       | tar -xzf - --strip-components=2 -C "$build/etc/zzz-oc-data" 2>/dev/null || true
+  if [ -n "$(ls -A "$build/etc/zzz-oc-data" 2>/dev/null)" ]; then
     echo "✅ 已另存 OpenClash 订阅数据(除内核)到 kit 的 etc/zzz-oc-data/ (防 apk 重装清空)"
   else
     echo "⚠️ OpenClash 订阅数据另存失败(依赖上方 sysupgrade -f 还原路径)"
@@ -392,6 +420,88 @@ collect_runtime(){
   else
     echo "⚠️ 真实配置抓取不完整, 首启动将降级为已知良好 heredoc 默认"
   fi
+  # ---------- 抓取额外配置(2026-10-21 审计扩充) ----------
+  # 背景: 全清刷(sysupgrade -n)只保留 kit 内文件, 此前 dhcp 的 dnsmasq 定制(7874/noresolv)、
+  # rpcd 的 homepage 只读用户、luci 主题、cpufreq governor、crontab、lan_report.sh+token、
+  # apk 镜像源、http.lua 上传上限补丁、rc.d 启用态均不在抓取范围, 升级后丢失。
+  # 单项失败不阻断(该配置全清后回出厂默认), 仅告警。
+  local cfg n_ok=0 n_all=0
+  for cfg in $EXTRA_CONFIGS; do
+    n_all=$((n_all+1))
+    if ssh -o ConnectTimeout=10 "$ROUTER" "cat /etc/config/$cfg" 2>/dev/null > "$build/etc/config/$cfg" \
+       && [ -s "$build/etc/config/$cfg" ] && grep -q '^config' "$build/etc/config/$cfg"; then
+      n_ok=$((n_ok+1))
+    else
+      rm -f "$build/etc/config/$cfg"
+      echo "⚠️ /etc/config/$cfg 抓取失败或为空, 跳过(全清后将回出厂默认)"
+    fi
+  done
+  [ "$n_ok" -gt 0 ] && echo "✅ 已抓取额外配置 $n_ok/$n_all 个: $EXTRA_CONFIGS"
+  # ---------- 全量 /etc/config 兜底(2026-10-27 修复 R5: 全清刷后配置漂移丢失) ----------
+  # 背景: 此前仅白名单式抓取 EXTRA_CONFIGS + openclash/network/wireless, 全清刷(sysupgrade -n -f)
+  #   后其余所有 /etc/config(如 firewall/ddns-go/lucky/wechatpush/zerotier/smartdns/upnpd/usteer/...)
+  #   会回退包默认, 需升级后手动重建(实测 firewall 有 129 行自定义规则, ddns-go/lucky 等均含实质配置)。
+  #   改为黑名单式: 抓取活机全部 /etc/config 作兜底, 覆盖所有未被上面单独处理的包配置; 未来新增包自动覆盖。
+  #   排除 ._*(AppleDouble 垃圾) 与 *.bak(如 dawn.bak-<日期>, 非有效配置)。
+  #   ⚠️ firewall 的 openclash/zerotier 等指向 /var 运行时文件的 config include 段, 由 zzz-restore 在首启动
+  #      还原后、fw4 reload 前剥离(见 zzz-restore 第 3 节), 避免首启动 fw4 加载失败; 这些 include 由
+  #      OpenClash/zerotier 自身启动时重新添加。etc/config/openclash 已被上面单独通道处理, 此处重复抓取同一
+  #      UCI 文件, 内容一致无害。
+  mkdir -p "$build/etc/config"
+  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak*" > /tmp/kit_tar.ex; cd / && tar -czX /tmp/kit_tar.ex -f - etc/config; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+       | tar -xzf - -C "$build" 2>/dev/null || true
+  if [ -n "$(ls -A "$build/etc/config" 2>/dev/null)" ]; then
+    cfg_all=$(find "$build/etc/config" -type f 2>/dev/null | wc -l | tr -d ' ')
+    echo "✅ 已全量兜底抓取活机 /etc/config ($cfg_all 个文件), 覆盖 EXTRA_CONFIGS 之外的所有包配置(R5 修复)"
+  else
+    echo "⚠️ 全量 /etc/config 兜底抓取失败(仅 EXTRA_CONFIGS 等显式配置会被还原)"
+  fi
+  # ---------- 抓取定制路径(目录/文件混合, tar 一次拉取; 排除 ._* 与 *.bak) ----------
+  # rc.d 单独拉: 排除 openclash 开机链(首启动时 init.d/openclash 尚未安装, 悬空符号链接无意义,
+  # 由 zzz-restore 的 rc.local 在 apk add 后 /etc/init.d/openclash enable 重建)。
+  # ⚠️ BusyBox tar 无 --exclude, 一律用 -X <模式文件>(见上方说明)。
+  #    bsdtar 解 busybox 流退出码不可靠, 成功判定以落盘内容为准(crontabs/root 为探针)。
+  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / '"$EXTRA_PATHS"'; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+       | tar -xzf - -C "$build" 2>/dev/null || true
+  if [ -f "$build/etc/crontabs/root" ]; then
+    echo "✅ 已抓取定制路径(排除 ._*/bak): $EXTRA_PATHS"
+  else
+    echo "⚠️ 定制路径整包抓取失败, 逐个降级重试"
+    local p
+    for p in $EXTRA_PATHS; do
+      if ssh -o ConnectTimeout=10 "$ROUTER" "cat /$p" 2>/dev/null > "$build/$p" 2>/dev/null && [ -s "$build/$p" ]; then
+        echo "  ✅ $p"
+      else
+        rm -f "$build/$p"
+        echo "  ⚠️ $p 抓取失败, 跳过"
+      fi
+    done
+  fi
+  ssh -o ConnectTimeout=10 "$ROUTER" 'printf "%s\n" "etc/rc.d/*openclash*" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / etc/rc.d; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+       | tar -xzf - -C "$build" 2>/dev/null || true
+  if [ -d "$build/etc/rc.d" ] && [ -n "$(ls -A "$build/etc/rc.d" 2>/dev/null)" ]; then
+    echo "✅ 已抓取 /etc/rc.d 服务启用态(排除 openclash 链, 由 rc.local enable 重建)"
+  else
+    echo "⚠️ /etc/rc.d 抓取失败(启用态将回出厂默认)"
+  fi
+  # ---------- 抓取"用户禁用"的服务清单(overlay 白名单不在 tar 可见文件里!) ----------
+  # 背景: 禁用服务 = 删 /etc/rc.d 的开机链, 在 overlay upper 留下 whiteout(字符设备 0/0)。
+  #   whiteout 不是普通文件, tar 抓不到; 全清刷后 upper 被清空, /rom 下层的出厂链重新可见
+  #   -> watchcat/igmpproxy 等会被默默重启(2026-10-08 升级后就复发过, 用户手动补禁用)。
+  # 修法: 刷前算出"出厂有链、现网无链、且 init.d 仍在(包未卸=用户主动禁用)"的清单, 写入 kit;
+  #   zzz-restore 首启动对每个链 rm -f(重建 whiteout)恢复禁用态。
+  # 区分"包被卸"($init.d 不存在): 那种链缺失是包的默认状态, 不能禁(新固件自带该包时应保持出厂启用)。
+  if ssh -o ConnectTimeout=10 "$ROUTER" 'for l in $(ls /rom/etc/rc.d 2>/dev/null); do [ -e "/etc/rc.d/$l" ] && continue; svc=$(printf "%s" "$l" | sed "s/^[SK][0-9][0-9]//"); [ -x "/etc/init.d/$svc" ] && printf "%s\n" "$l"; done' 2>/dev/null > "$build/etc/zzz-disabled-services"; then
+    if [ -s "$build/etc/zzz-disabled-services" ]; then
+      echo "✅ 已抓取用户禁用服务清单: $(tr '\n' ' ' < "$build/etc/zzz-disabled-services")"
+    else
+      rm -f "$build/etc/zzz-disabled-services"
+      echo "ℹ️ 无用户禁用服务(出厂链与现网一致)"
+    fi
+  else
+    rm -f "$build/etc/zzz-disabled-services"
+    echo "⚠️ 禁用服务清单抓取失败(全清后禁用态可能回退)"
+  fi
   {
     [ -n "$s" ]  && echo "ROOT_SHADOW=$s"
     echo "WIFI_KEY=$w"
@@ -401,9 +511,11 @@ collect_runtime(){
     [ -n "$lanip" ] && echo "LAN_IP=$lanip"
   } > "$build/etc/router-secrets"
   chmod 600 "$build/etc/router-secrets"
+  # 打包前最后一道 AppleDouble 防线: 清掉抓取/烘焙路径可能残留的 ._*(源头排除 + 本地清理双保险)
+  find "$build" -name '._*' -type f -delete 2>/dev/null
   tar -czf "$newkit" -C "$build" . || { echo "❌ 重打 kit 失败"; exit 1; }
   KIT="$newkit"
-  if [ -n "$s" ]; then echo "✅ 已注入 root hash + WiFi key + 三频 SSID + LAN IP + OpenClash 配置到 kit (无明文存储)"; else echo "⚠️ 已注入 WiFi key/SSID/LAN IP/OpenClash, 但 root shadow 抓取失败(升级后仅 key 登录)"; fi
+  if [ -n "$s" ]; then echo "✅ 已注入 root hash + WiFi key + 三频 SSID + LAN IP + OpenClash 配置 + 额外配置/定制路径到 kit (无明文存储)"; else echo "⚠️ 已注入 WiFi key/SSID/LAN IP/OpenClash/额外配置, 但 root shadow 抓取失败(升级后仅 key 登录)"; fi
 }
 
 resolve_router || die "未配置路由器 SSH 地址 — 请用 --router root@192.168.1.1 或 ROUTER 环境变量指定, 或在首次运行时按提示输入"
@@ -437,7 +549,7 @@ ensure_rollback_itb
 if [ "$DRY" = "1" ]; then
   echo "=== DRY-RUN: 不执行升级 ==="
   echo "将执行的步骤:"
-  echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 并从活路由抓取 root/WiFi key/三频 SSID/OpenClash/DHCP 静态租约 注入 kit"
+  echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 并从活路由抓取 root/WiFi key/三频 SSID/OpenClash/DHCP 静态租约/额外配置(dhcp rpcd luci cpufreq watchcat dawn system)/定制路径(crontabs lan_report.sh+token apk源 http.lua补丁 rc.d启用态) 注入 kit"
   echo "  1. scp $(basename "$ITB") $(basename "$KIT") -> $ROUTER:/tmp/"
   echo "  1b. 路由器侧复核 itb sha256 (防止 WiFi 上传损坏)"
   echo "  2. ssh $ROUTER 'sysupgrade -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (n=不保留当前配置, 严格全清)"
