@@ -64,6 +64,35 @@ SEC=$(grep -m1 "secret:" "$OC_CFG" 2>/dev/null | sed -E "s/.*secret:[ ]*[\"]?([A
 echo "控制器 secret: ${SEC:-<未找到>}"
 
 echo ""
+echo "===== 2b. config_path 与实际加载一致性 ====="
+CUR=$(uci get openclash.config.config_path 2>/dev/null)
+echo "uci config_path: ${CUR:-<未设置>}"
+echo "clash 实际 -f : $OC_CFG"
+if [ -z "$CUR" ] || [ "$CUR" = "$OC_CFG" ]; then
+  echo "✅ 一致。"
+elif echo "$CUR" | grep -q "/config/" && [ "$(dirname "$OC_CFG")" = "/etc/openclash" ]; then
+  echo "ℹ️ 不同属正常: config_path 指向 config/ 源配置, -f 指向根目录编译产物(订阅模式常态)。"
+else
+  echo "🟡 不一致且非标准订阅布局, 建议核对 config_path 是否指错(可能导致重启加载旧配置)。"
+fi
+
+echo ""
+echo "===== 2c. 订阅自动更新三层闸门 ====="
+AU=$(uci get openclash.config.auto_update 2>/dev/null)
+AUM=$(uci get openclash.config.config_auto_update_mode 2>/dev/null)
+INT=$(uci get openclash.config.config_update_interval 2>/dev/null)
+SE=$(uci get openclash.@config_subscribe[0].enabled 2>/dev/null)
+echo "auto_update             = ${AU:-<未设>}"
+echo "config_auto_update_mode = ${AUM:-<未设>}   (默认 0, 不开则 watchdog 不触发)"
+echo "config_update_interval  = ${INT:-<未设>} 分钟 (本版按间隔触发, 非 cron)"
+echo "订阅 enabled            = ${SE:-<未设>}   (禁用的订阅会被更新循环跳过)"
+if [ "$AU" = "1" ] && [ "$AUM" = "1" ] && [ "$SE" = "1" ]; then
+  echo "✅ 三层闸门全开, 订阅会自动刷新节点。"
+else
+  echo "🟡 有闸门未开 -> 订阅不会自动更新(机场换节点后你仍用旧配置)!"
+fi
+
+echo ""
 echo "===== 3. 真实节点数(排除代理组) ====="
 REAL=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l | tr -d " ")
 echo "真实服务器节点: $REAL 个"
@@ -90,6 +119,24 @@ echo ""
 echo "===== 6. 工作模式 + 重定向规则 ====="
 grep -E "enhanced-mode|fake-ip-range" "$OC_CFG" 2>/dev/null | head
 nft list ruleset 2>/dev/null | grep -qE "jump openclash" && echo "nft 重定向规则: ✅ 已安装" || echo "nft 重定向规则: ❌ 未见"
+
+echo ""
+echo "===== 6b. 当前出口节点 -> Google/TikTok 可达性(识别能连TCP但被App封的节点) ====="
+EXIT_NODE=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/connections" 2>/dev/null \
+  | jq -r "[.connections[] | select((.chains|length)>0 and (.chains[-1]!=\"DIRECT\") and (.chains[-1]!=\"REJECT\")) | .chains[0]][0] // empty" 2>/dev/null)
+if [ -n "$EXIT_NODE" ]; then
+  echo "当前出口节点: $EXIT_NODE"
+  ENC=$(jq -rn --arg n "$EXIT_NODE" "\$n|@uri" 2>/dev/null)
+  for U in "https://www.google.com" "https://www.tiktok.com"; do
+    UE=$(jq -rn --arg u "$U" "\$u|@uri" 2>/dev/null)
+    printf "  -> %-26s " "$U"
+    R=$(curl -s --max-time 9 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies/$ENC/delay?timeout=7000&url=$UE" 2>/dev/null)
+    echo "$R"
+  done
+  echo "  (出现 An error occurred 但 Google 正常 = 该节点被 TikTok 等站点封 IP, 换可用节点即可)"
+else
+  echo "(暂无活跃代理连接, 有流量后再跑)"
+fi
 
 echo ""
 echo "===== 7. 真实节点服务器可达性(绕过 fake-ip, 用公共DNS解析) ====="

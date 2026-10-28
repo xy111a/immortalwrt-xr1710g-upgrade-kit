@@ -71,14 +71,25 @@ agent_created: true
 - **6G**：`zzz-restore-router` 已默认关闭 6G（设备层 `radio2` 与接口层 `default_radio2` 均 `disabled='1'`，用户明确"6G不用"）；如需启用，改这两处 + `wifi reload`。
 - **OpenClash 内核固化（P1，已根治"全清刷后报没有内核"）**：`build_kit.sh` 用 `--openclash-core <clash_meta 路径>` 把内核二进制烘焙进 kit 的 `etc/openclash/core/`（随 kit 整包 scp + `sysupgrade -f` 还原，不再走 57MB 经 SSH tar 管道的脆弱链路）；`collect_runtime` 抓取活路由 OpenClash 时**排除 `etc/openclash/core`**，避免重复搬运。双保险：`zzz-restore` 的 `rc.local` 在 apk 装完 OpenClash 后若发现内核缺失/不可执行，会运行时从官方 CDN（GitHub + ghproxy 镜像，v1.19.32）多源重试下载，失败仅 `notify` 告警不阻断启动；`verify_router` 在 OpenClash 启用时额外校验内核存在且可执行，缺失则判 FAIL 暴露问题。**重建真 kit 必须带 `--openclash-core`**，否则下次全清刷仍会丢内核。
 - **进程名**：判代理活死用端口 `7874` 监听或 `ps w | grep [c]lash`（进程名是 `clash` 非 `clash_meta`，`grep clash_meta` 必误报 0）。
-- **⚠️ OpenClash 实为上网网关（本机模型，务必牢记）**：本路由 OpenClash 是 **fake-ip 模式（`enhanced-mode: fake-ip`，`198.18.0.0/16`）+ TCP 重定向（nftables `jump openclash`）+ DNS 由 `127.0.0.1#7874` 接管**。即**全屋出网实际都走 OpenClash 代理**，不是"可选加速"。由此推出两个铁律：① 启动开关 `uci set openclash.config.enable='1'`（**注意是本构建 `start_service` 实际检查的 `enable` 不带 d**，见 `/etc/init.d/openclash:3594`；`enabled` 带 d 只是 LuCI 显示开关，两者都设 1 才稳）必须为真，否则开机 `start` 提前返回（报 `Now Disabled, Need Start From Luci Page`）→ 重启路由后 OpenClash 不启动 → dnsmasq 仍把 DNS 指死 7874 → **连上 WiFi 没网**。`zzz-restore` 现已显式把 `enable` 和 `enabled` 都设 1 双保险。② "已启用但 **0 真实节点**" = 用户**静默断网**（进程在、7874 在、DNS 通，但出不去）。`verify_router` 软终验在"OpenClash 是 DNS 网关"时若查到 0 节点直接判 FAIL 暴露此故障。
+- **⚠️ OpenClash 实为上网网关（本机模型，务必牢记）**：本路由 OpenClash 是 **DNS 接管 + TCP 透明重定向（nftables `jump openclash`）+ DNS 由 `127.0.0.1#7874` 接管**，**全屋出网实际都走 OpenClash 代理**，不是"可选加速"。注意 DNS 模式**随订阅模板而变**：当前订阅（bingling）是 **`redir-host`**（返回真实 IP），历史本地配置曾是 **`fake-ip`（`198.18.0.0/16`）**——不要写死假设它是 fake-ip，排错前先 `grep enhanced-mode $(ps w|grep [c]lash|grep -oE '-f [^ ]+'|awk '{print $2}')`。由此推出两个铁律（与模式无关，始终成立）：① 启动开关 `uci set openclash.config.enable='1'`（**注意是本构建 `start_service` 实际检查的 `enable` 不带 d**，见 `/etc/init.d/openclash:3594`；`enabled` 带 d 只是 LuCI 显示开关，两者都设 1 才稳）必须为真，否则开机 `start` 提前返回（报 `Now Disabled, Need Start From Luci Page`）→ 重启路由后 OpenClash 不启动 → dnsmasq 仍把 DNS 指死 7874 → **连上 WiFi 没网**。`zzz-restore` 现已显式把 `enable` 和 `enabled` 都设 1 双保险。② "已启用但 **0 真实节点**" = 用户**静默断网**（进程在、7874 在、DNS 通，但出不去）。`verify_router` 软终验在"OpenClash 是 DNS 网关"时若查到 0 节点直接判 FAIL 暴露此故障。
 
 ## ⚠️ OpenClash 诊断陷阱（排错时别再踩，已固化为 check_openclash.sh）
-日常排查用仓库自带的 **`check_openclash.sh`**（Mac 侧 `bash check_openclash.sh`，自动定位路由器），它已固化正确方法。手动排错避开这 3 个坑：
-1. **控制器 secret 在 clash 实际加载的配置文件**，即 `ps w | grep [c]lash` 里 `-f <file>` 所指（本机是 `/etc/openclash/lipa_bingling_click.yaml`），**不是**生成的 `/etc/openclash/config.yaml`。抓错文件 → 控制器鉴权失败 → 返回 0 节点 → **误判"没节点"**。
+日常排查用仓库自带的 **`check_openclash.sh`**（Mac 侧 `bash check_openclash.sh`，自动定位路由器），它已固化正确方法。手动排错避开这几个坑：
+1. **控制器 secret 在 clash 实际加载的配置文件**，即 `ps w | grep [c]lash` 里 `-f <file>` 所指（**订阅模式**下运行时是 `/etc/openclash/<name>.yaml`，如 `bingling.yaml`；本地配置时代曾是 `lipa_bingling_click.yaml`），**不是**生成的 `/etc/openclash/config.yaml`。抓错文件 → 控制器鉴权失败 → 返回 0 节点 → **误判"没节点"**。⚠️ **根/子目录架构**：OpenClash 订阅把「源配置」放在 `/etc/openclash/config/<name>.yaml`（`uci openclash.config.config_path` 指向它），每次启动再**编译同步到根目录** `/etc/openclash/<name>.yaml` 供 clash `-f` 加载；两个位置内容/md5 不同是**正常**（根目录是编译后的运行时）。若 `config_path` 与 `-f` 不一致或两份长期不同步，才需留意。
 2. **mixed 端口（7890/7893 等）需要认证**：`curl -x http://127.0.0.1:7890` 会返回 `407 Proxy Authentication Required`，**这不是节点故障**！用户设备走的是透明重定向（TPROXY/REDIRECT）进代理，那条路不需要认证、上网不受影响。**绝不要用 `curl -x` 判断代理通不通。**
-3. **fake-ip 模式下，经 7874 解析任意域名都返回 `198.18.x` 假 IP**，不能据此判断真实服务器（`mjl.sahytg.top` 等）是否可达；要判断真实节点服务器可达性，须用**公共 DNS**（如 `nslookup mjl.sahytg.top 223.5.5.5`）解析。
+3. **经 7874 解析域名不能当"服务器可达性"判据**：`fake-ip` 模式下经 7874 解析任意域名都返回 `198.18.x` 假 IP；`redir-host` 模式下虽返回真实 IP，但受 DNS 污染/缓存影响也未必可靠。判断真实节点服务器可达性，须用**公共 DNS**（如 `nslookup <节点域名> 223.5.5.5`）或直接看控制器节点延迟。
+4. **`curl -x http://127.0.0.1:7890`（或 `[::1]:7890`）多半返回 407 或 `HTTP=000`，都是假象**，不代表代理挂了：前者要认证、后者是路由器自身回环被 `router_self_proxy`/回环路由吃掉。**判断代理是否在服务，用控制器 `/proxies` 的真实节点数 + `/connections` 活跃连接**（真实 LAN 客户端连接最可信），不要用路由器本机 curl。
+5. **节点"能连 TCP" ≠ "App 能用"（2026-10-28 TikTok 实战）**：`自动选择`(url-test) 会挑"延迟最低"的节点，但某节点可能**能被 TikTok/Netflix 等封 IP**（TCP 通、业务不给数据，App 反复重试/转圈）。定位：对每个候选节点测 `GET /proxies/<name>/delay?url=https://www.tiktok.com&timeout=7000`，返回 `{"delay":N}`=能连、`{"message":"An error occurred..."}`=被该站封/不可达；把可用节点固定或从自动选择池剔除即可。
 - **正确验证法**：查控制器统计"真实节点数"（过滤掉 Selector/URLTest/Fallback 等代理组，只数 `Vless/Vmess/Trojan/Hysteria2/...` 等真实类型）+ 看 `/connections` 活跃连接数 + 看 `nft` 的 `openclash` TCP 重定向包计数随出网探针**增长**。三者任一成立即证明代理真在扛流量。
+
+### 订阅自动更新：三层闸门缺一不可（2026-10-28 修复，实测）
+本构建的订阅自动更新由 **`openclash_watchdog.sh` 守护进程按"间隔"触发，不是系统 crontab**（`crontab -l` 里看不到 openclash 项是正常的；`auto_update_time` 时钟字段在本版本**未使用**）。要它真正跑，以下**三层闸门必须同时打开**，缺任一则静默不更新：
+1. `uci set openclash.config.auto_update='1'`（总开关）
+2. `uci set openclash.config.config_auto_update_mode='1'`（watchdog 判定条件，**默认 0**，只开 auto_update 没用）
+3. `uci set openclash.@config_subscribe[0].enabled='1'`（`sub_info_get` 对禁用订阅会直接 `return` 跳过，更新循环永远不碰它）
+- 另 `uci set openclash.config.config_update_interval='1440'`（分钟，每日一次；内容无变化则 `DOWNLOAD_RESULT=2` 跳过重启，不扰动）。
+- **验证管线真能跑**：手动 `/usr/share/openclash/openclash.sh`（=watchdog 同款无参调用）后看 `/tmp/openclash.log` 是否出现 `Start Updating Config File`；日志显示 `No Change, Do Nothing` 属正常（无实质变化）。**注意**：普通 `/etc/init.d/openclash restart` 不会重新下载订阅，只从现有源配置重编译。
+- 全清刷还原：订阅 uci（含上述开关+URL）在 `/etc/config/openclash`，订阅生成的 yaml 在 `/etc/openclash/*`，两者均由 kit 的 `sysupgrade -f` 原样还原（`apk add` 重装会清空 `/etc/openclash/config`，故另有 `etc/zzz-oc-data` 兜底）。
 
 ## 运维加固（阶段 2/3，已落地，非破坏性）
 

@@ -40,7 +40,7 @@ env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" add -A
 if env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" diff --cached --quiet 2>/dev/null; then
   echo "ℹ️ 无变更, 无需提交"
 else
-  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "fix(restore): -F安全护栏(拦异构镜像)+ 禁用服务双段强制+ OpenClash安装以apk update为准并自愈+ 排除*.apk-new (R7)" \
+  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "docs(check): 修正 SKILL.md fake-ip→redir-host 硬错误 + 订阅自动更新三层闸门 + 节点被封诊断; check_openclash 增 config_path一致性/闸门/出口节点TikTok可达性 (R8)" \
     && echo "✅ 已提交"
 fi
 
