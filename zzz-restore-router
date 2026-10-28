@@ -248,8 +248,10 @@ if [ -f "$DISABLED_SVC" ]; then
     [ -z "$_link" ] && continue
     rm -f "/etc/rc.d/$_link" 2>/dev/null
   done < "$DISABLED_SVC"
-  echo "已按清单禁用服务: $(tr '\n' ' ' < "$DISABLED_SVC" 2>/dev/null)" >>$LOG
-  rm -f "$DISABLED_SVC" 2>/dev/null
+  echo "已按清单禁用服务(早期): $(tr '\n' ' ' < "$DISABLED_SVC" 2>/dev/null)" >>$LOG
+  # 注意: 此处不删除清单文件。部分服务(如 watchcat)的包 postinst 会在本 uci-defaults 之后重建
+  # rc.d 链接, 导致禁用态失效(实测 2026-10-28 升级后 watchcat 被重新启用)。清单改由下方注入的
+  # rc.local 末段再强制一次并最终消费, 确保与升级前状态一致。
 else
   echo "ℹ️ 无禁用服务清单(或已被处理)" >>$LOG
 fi
@@ -294,6 +296,34 @@ cat > /etc/rc.local <<'RCEOF'
 # zzz-restore-router 注入: 首启动后网络就绪再装 OpenClash 并启动
 # 仅执行一次(sentinel: /etc/zzz-postinstall-done)
 if [ ! -f /etc/zzz-postinstall-done ]; then
+  # ---------- 0. 恢复"用户禁用"的服务(末段强制, 覆盖包 postinst 重建 rc.d 链接) ----------
+  # zzz-restore 早期已删过一次链接, 但 watchcat 等包的 postinst 会在其后重建, 致禁用态失效
+  # (实测 2026-10-28 升级后 watchcat 被重新启用)。此处开机末段再强制一次, 与升级前状态一致。
+  if [ -f /etc/zzz-disabled-services ]; then
+    while read -r _link; do
+      [ -z "$_link" ] && continue
+      rm -f "/etc/rc.d/$_link" 2>/dev/null
+    done < /etc/zzz-disabled-services
+    echo "rc.local 末段已强制禁用服务: $(tr '\n' ' ' < /etc/zzz-disabled-services 2>/dev/null)" >>/tmp/zzz-postinstall.log
+    rm -f /etc/zzz-disabled-services 2>/dev/null
+  fi
+  # ---------- 0.5 等待外网连通后再装 OpenClash ----------
+  # 首启动早期 WAN 可能未就绪/镜像瞬断, 直接 apk add 会失败(实测 2026-10-28 因此 OpenClash 未装,
+  # 需手动补救)。先轮询仓库主机可达再装, 上限 ~3 分钟。
+  _repo_host="mirrors.vsean.net"
+  _net_ok=0
+  for _w in $(seq 1 18); do
+    if curl -fsS --max-time 5 -o /dev/null "http://$_repo_host" 2>/dev/null || ping -c1 -W2 "$_repo_host" >/dev/null 2>&1; then
+      _net_ok=1; break
+    fi
+    echo "等待外网连通($_repo_host) 第 $_w 次..." >>/tmp/zzz-postinstall.log
+    sleep 10
+  done
+  if [ "$_net_ok" != "1" ]; then
+    echo "❌ 等待外网超时, 后续 apk add 可能失败(必要时手动: apk add luci-app-openclash)" >>/tmp/zzz-postinstall.log
+  else
+    echo "✅ 外网已连通($_repo_host), 开始安装 OpenClash" >>/tmp/zzz-postinstall.log
+  fi
   for i in 1 2 3 4 5 6; do
     if apk update >>/tmp/zzz-postinstall.log 2>&1 && apk add luci-app-openclash >>/tmp/zzz-postinstall.log 2>&1; then
       echo "apk add luci-app-openclash 成功 (尝试 $i)" >>/tmp/zzz-postinstall.log

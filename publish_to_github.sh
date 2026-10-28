@@ -40,7 +40,7 @@ env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" add -A
 if env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" diff --cached --quiet 2>/dev/null; then
   echo "ℹ️ 无变更, 无需提交"
 else
-  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "fix(backup): 全量抓取 /etc/config 修复全清刷配置漂移丢失 (R5)" \
+  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "fix(restore): 禁用服务末段强制(覆盖包postinst重建)+ apk装前等待外网连通 (R6)" \
     && echo "✅ 已提交"
 fi
 

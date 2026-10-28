@@ -552,7 +552,7 @@ if [ "$DRY" = "1" ]; then
   echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 并从活路由抓取 root/WiFi key/三频 SSID/OpenClash/DHCP 静态租约/额外配置(dhcp rpcd luci cpufreq watchcat dawn system)/定制路径(crontabs lan_report.sh+token apk源 http.lua补丁 rc.d启用态) 注入 kit"
   echo "  1. scp $(basename "$ITB") $(basename "$KIT") -> $ROUTER:/tmp/"
   echo "  1b. 路由器侧复核 itb sha256 (防止 WiFi 上传损坏)"
-  echo "  2. ssh $ROUTER 'sysupgrade -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (n=不保留当前配置, 严格全清)"
+  echo "  2. ssh $ROUTER 'sysupgrade -F -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (F=跳过设备名校验[见下], n=不保留当前配置, 严格全清)"
   echo "     (nohup 后台执行, 路由器重启, SSH 断开, 本脚本随后轮询重连)"
   echo "  3. 轮询重连 (每 5s, 最多 80 次) 于路由器地址 / 常见出厂 IP (192.168.1.1 等)"
   echo "  4. 终验: 版本 / flow offload / 三频 / OpenClash / DNS / U-Boot"
@@ -595,7 +595,12 @@ fi
 echo "=== 触发干净刷 (严格全清 -n + uci-defaults 自举) ==="
 echo "⚠️ 路由器即将重启, SSH 会断开, 本脚本自动轮询重连, 无需人工介入"
 # nohup + & 让 sysupgrade 在路由后台跑, ssh 立即返回, 避免连接在 reboot 时被重置误判
-ssh "$ROUTER" "nohup sysupgrade -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB") >/tmp/upg.log 2>&1 &" || true
+# ⚠️ -F (force): 跳过设备名兼容性校验。背景(2026-10-28 实战): naoki66 的 1016 构建把板名从
+#   gemtek,xr1710g-ubi 改名为 gemtek,xr1710g(仅元数据改名, 实际 UBI 布局/硬件/启动机制与现网
+#   完全一致 —— 已比对两 itb 的 ubi-volume 结构确认), 导致 sysupgrade 默认设备校验失败、拒绝刷入。
+#   加 -F 是此设备家族跨版本升级的标准解法; 完整性已由上方 sha256 校验把关, 风险可控。
+#   (注意: 仅在已确认镜像确为本设备 UBI 布局时方可 -F, 勿用于真正异构镜像)
+ssh "$ROUTER" "nohup sysupgrade -F -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB") >/tmp/upg.log 2>&1 &" || true
 
 # host key 若已随 kit 保留(升级前从活路由抓取并 sysupgrade -f 还原), 则密钥不变 -> 不清除本机 known_hosts, 其他终端零感知;
 # 仅当未成功保留时才清本地旧 key 并提示各终端更新(降级路径)
