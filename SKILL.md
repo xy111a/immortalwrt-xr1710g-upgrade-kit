@@ -120,7 +120,7 @@ agent_created: true
 - **非交互安全**：未配置路由器地址时，非 tty（launchd 等）环境直接报错退出而非挂起；`--router` / `ROUTER` 环境变量 / `router-target.conf` 任一就绪即可无人值守运行。`--check` 为纯只读，不修改任何源码。
 - **安全闸（缺一不可）**：
   1. **发布沉淀闸**：新版本发布 < 72h 不刷（单维护者构建，避开发布当日热修炸机）。
-  2. **独立校验**：下载官方 `sha256sums`，比对 itb 真实 sha256（防篡改）；并自动写入 `upgrade_router.sh` 的 `EXPECT_SHA`，避免人工改漏。
+  2. **独立校验**：下载官方 `sha256sums`，比对 itb 真实 sha256（防篡改）；`EXPECT_SHA` 由 `upgrade_router.sh` **运行时**从官方 sha256sums 派生（watch 已不再回写脚本文件，`--check` 零副作用，见 router_watch.sh 第 6 节）。
   3. **强终验+自动回退**：`--auto` 模式跑硬终验(版本/外网直连/三频) + 软终验(OpenClash代理DNS, 仅启用时)；连不上路由器不触发回退。终验失败才自动 `sysupgrade -F <回退itb>`，回退后同样做 DNS 兜底。
   4. **U-Boot 兜底**：最终防线，刷坏自动进 Recovery。
 

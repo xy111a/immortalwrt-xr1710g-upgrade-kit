@@ -13,7 +13,8 @@
 | 文件 | 作用 | 是否入库 |
 |---|---|---|
 | `upgrade_router.sh` | Mac 侧编排器：上传固件+kit、路由器侧 sha 复核、触发干净刷、轮询重连、终验、强终验失败自动回退 | ✅ 入库 |
-| `router_watch.sh` | 按需守护：查 naoki66 最新 release、72h 发布沉淀闸、独立 sha256 校验、自动改写 `EXPECT_SHA`、触发 `upgrade_router.sh --auto` | ✅ 入库 |
+| `router_watch.sh` | 按需守护：查 naoki66 最新 release、72h 发布沉淀闸、独立 sha256 校验（`EXPECT_SHA` 运行时派生，不回写脚本）、触发 `upgrade_router.sh --auto` | ✅ 入库 |
+| `check_openclash.sh` | Mac 侧 OpenClash 一键健康诊断：真实节点数 / 订阅自动更新三层闸门 / config_path 一致性 / 出口节点对关键站点可达性（识别被封节点） | ✅ 入库 |
 | `zzz-restore-router` | 路由器首启动自举（`/etc/uci-defaults`）：写 LAN/WAN/三频/防火墙、恢复 root 密码与 WiFi key、注入 OpenClash 安装步骤 | ✅ 入库 |
 | `build_kit.sh` | 本地从源码组装 `kit.tar.gz`（默认安全写到 `dist/`，**拒绝覆盖真 kit**） | ✅ 入库 |
 | `scripts/secret-scan.sh` | 提交前/CI 自动密钥扫描：拦截任何明文密码/订阅/token 进 Git | ✅ 入库 |
@@ -67,7 +68,7 @@
 ```bash
 ./router_watch.sh --now
 ```
-脚本会：查最新 release → 等发布满 72h → 下载 itb + 官方 `sha256sums` 校验 → 自动改写 `EXPECT_SHA` → 调 `upgrade_router.sh --auto`。
+脚本会：查最新 release → 等发布满 72h → 下载 itb + 官方 `sha256sums` 校验 → 调 `upgrade_router.sh --auto`（`EXPECT_SHA` 由其运行时派生）。
 
 ### 4. 直接手动升级（已手动下好 itb 时）
 ```bash

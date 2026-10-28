@@ -13,7 +13,7 @@
 #   router_watch.sh --force  # 跳过"发布满72h"闸, 立即升级 (手动测试新版本用)
 #   router_watch.sh --check  # 只检测报告, 绝不升级 (默认无开关文件时等价)
 #
-# 建议由 launchd 每天 03:00 调用本脚本 (见 com.huajun.router-watch.plist)
+# 可由 launchd / WorkBuddy 定时自动化按需调用（本仓库不含 plist, 按需自行配置调度）
 
 set -u
 REPO="naoki66/ImmortalWrt-for-Gemtek-brightspeed"
@@ -107,7 +107,7 @@ fi
 expect=""
 if [ -n "$sums_url" ]; then
   curl -fL "$sums_url" -o "$PREP_DIR/sha256sums" || log "⚠️ sha256sums 下载失败, 跳过独立校验"
-  expect=$(grep "$itb_name" "$PREP_DIR/sha256sums" 2>/dev/null | awk '{print $1}')
+  expect=$(grep -F "$itb_name" "$PREP_DIR/sha256sums" 2>/dev/null | awk '{print $1}')
   if [ -n "$expect" ]; then
     act=$(shasum -a 256 "$local_itb" | awk '{print $1}')
     if [ "$expect" != "$act" ]; then

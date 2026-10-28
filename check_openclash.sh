@@ -14,8 +14,8 @@
 #
 # 用法:
 #   bash check_openclash.sh                 # 自动按优先级确定路由器地址
-#   bash check_openclash.sh --router root@192.168.88.1
-#   ROUTER=root@192.168.88.1 bash check_openclash.sh
+#   bash check_openclash.sh --router root@192.168.1.1
+#   ROUTER=root@192.168.1.1 bash check_openclash.sh
 
 set -u
 
@@ -34,7 +34,7 @@ if [ -z "$ROUTER" ]; then
   # 探测 ~/.ssh/config 中主机名含 openwrt/immortalwrt/router 的条目
   ROUTER="$(grep -iE 'host .*(openwrt|immortalwrt|router)' ~/.ssh/config 2>/dev/null | head -1 | awk '{print $2}')"
 fi
-ROUTER="${ROUTER:-root@192.168.88.1}"
+ROUTER="${ROUTER:-root@192.168.1.1}"
 
 SSH="ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
@@ -58,7 +58,7 @@ pgrep -f clash >/dev/null 2>&1 && echo "clash 进程: ✅ 运行中" || echo "cl
 echo ""
 echo "===== 2. 实际加载配置 + 控制器 secret ====="
 OC_CFG=$(ps w | grep "[c]lash" | grep -oE "\-f [^ ]+" | awk "{print \$2}")
-[ -z "$OC_CFG" ] && OC_CFG=/etc/openclash/config.yaml
+[ -z "$OC_CFG" ] && OC_CFG=$(ls -1 /etc/openclash/*.yaml 2>/dev/null | head -1)
 echo "clash 实际配置文件: $OC_CFG"
 SEC=$(grep -m1 "secret:" "$OC_CFG" 2>/dev/null | sed -E "s/.*secret:[ ]*[\"]?([A-Za-z0-9_]+)[\"]?.*/\1/")
 echo "控制器 secret: ${SEC:-<未找到>}"

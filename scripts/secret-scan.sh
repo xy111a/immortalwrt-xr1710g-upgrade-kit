@@ -26,8 +26,11 @@ PATTERNS=(
   'AKIA[0-9A-Z]{16}'                # AWS access key
   'ROOT_PW='                         # 硬编码 root 密码
   "password=['\"][^'\"]{3,}"         # password='...'
-  '[REDACTED-WIFI-KEY]|[REDACTED-WIFI-KEY]'               # 本项目历史明文密码 ([REDACTED-WIFI-KEY] 带 # 才是密码, 不误伤命名/用户名)
 )
+# ⚠️ 刻意不包含任何真实密码/WiFi key 的明文特征：
+#   本仓库是公开的, 扫描规则里写明文特征=把密码本身公开(2026-10-28 审计发现, 已删除泄露条目)。
+#   真实 root 密码/WiFi key 由 upgrade_router.sh 运行期从活路由器抓取注入临时 kit, 源码零明文,
+#   因此"防止密码入库"靠的是"源码里根本没有密码" + .gitignore 排除 kit/backups, 不靠明文特征匹配。
 
 # 收集待扫描文件
 if [ $# -gt 0 ]; then

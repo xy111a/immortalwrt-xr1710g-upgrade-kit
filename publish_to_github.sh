@@ -16,7 +16,8 @@ REPO="xy111a/immortalwrt-xr1710g-upgrade-kit"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 WORK="${GIT_WORK_DIR:-/tmp/kit_repo}"
 # 白名单: 仅这些纯文本源码入库; itb/kit.tar.gz/backups 永不入库
-FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh LICENSE README.md"
+# 注: 远端另有 .gitignore / .github/workflows/secret-scan.yml 为"远端专管"(本地无副本, 不在同步范围)
+FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md"
 
 echo "=== 准备 Git 工作副本: $WORK ==="
 if [ -d "$WORK/.git" ]; then
@@ -40,7 +41,7 @@ env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" add -A
 if env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" diff --cached --quiet 2>/dev/null; then
   echo "ℹ️ 无变更, 无需提交"
 else
-  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "docs(check): 修正 SKILL.md fake-ip→redir-host 硬错误 + 订阅自动更新三层闸门 + 节点被封诊断; check_openclash 增 config_path一致性/闸门/出口节点TikTok可达性 (R8)" \
+  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "fix(audit): 移除secret-scan明文密码特征(公共仓库泄露WiFi key, 改为运行期抓取设计)+ 文档EXPECT_SHA矛盾修正 + watch grep -F + check_openclash去个人IP/更新fallback + 白名单补scripts/secret-scan.sh (R9)" \
     && echo "✅ 已提交"
 fi
 
