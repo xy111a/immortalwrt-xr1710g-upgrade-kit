@@ -64,7 +64,8 @@ agent_created: true
 升级"担任网关/隧道路由器"时，**执行机绝不能依赖该路由器通信**。`upgrade_router.sh` 现在在预检阶段做 `precheck_executor_location()`：在路由侧读 `SSH_CONNECTION` 取执行机源 IP，若**不在路由器 LAN 网段**（即疑似经隧道/VPN 回家），交互环境会要求确认、非交互环境直接拒绝——因为路由器一旦重启，执行机将永久失联，无法终验/回退。安全做法：执行机用独立上网路径（手机热点/另一网卡），并用**有线直连路由器 LAN 口**后再升级。
 
 ## 其他要点
-- **apk add 时机**：必须在 `rc.local`（S95done 后、网络就绪）执行，不可在 uci-defaults（S10boot，网络未起）。加 sentinel 文件防重复。**2026-10-28 修正**：`rc.local` 的 apk 循环前新增**外网连通等待**（轮询 `mirrors.vsean.net` 可达，上限 ~3 分钟）再装——根治首启动早期 WAN 未就绪/镜像瞬断导致 `apk add luci-app-openclash` 失败、OpenClash 未装需手动补救的问题。
+- **apk add 时机与自愈（2026-10-28 实战后修正）**：必须在 `rc.local`（S95done 后、网络就绪）执行，不可在 uci-defaults（S10boot，网络未起）。加 sentinel 文件（`zzz-postinstall-done`）防重复。**关键修正**：`rc.local` 的 apk 循环前以 **`apk update` 成功**为连通判据（不再只 ping 仓库主机——实测主机可达但 `.adb` 文件 `unexpected end of file` 时旧逻辑误判连通、6 次 `apk add` 全失败），上限 ~5 分钟；成功后重试 `apk add`（最多 8 次）。若最终 `/etc/init.d/openclash` 仍未安装（仓库仍不可用），**本次跳过、不设 sentinel，下次开机自动重试（自愈）**，限 6 次避免无限重试刷屏——根治"首启动 OpenClash 没装上、需手动补救"的问题。仓库主机改为从 `/etc/apk/repositories.d/*` 动态派生（不再硬编码 `mirrors.vsean.net`）。
+- **-F 强刷安全护栏（2026-10-28 新增）**：`sysupgrade -F` 跳过设备名校验是双刃剑（误指向异构镜像会直接变砖）。触发前新增**设备名兼容性预检**：归一化（去 `-ubi` 后缀）比对运行板名（`/tmp/sysinfo/board_name`）与 itb 支持设备（从 itb 字符串提取），**仅当差异仅为 `-ubi` 后缀时才允许 -F**，否则中止刷写。提取失败（字符串解析未命中）则放行并信任 sha256 完整性，不误伤已知可用路径。背景：naoki66 的 1016 构建把板名 `gemtek,xr1710g-ubi` 改名为 `gemtek,xr1710g`（仅元数据改名，UBI 布局/硬件与现网完全一致，已比对两 itb 的 ubi-volume 结构确认）。
 - **DNS 链（已修正）**：dnsmasq 上游指向 `127.0.0.1#7874` 必须以 OpenClash **实际监听该端口**为前提，绝不硬编码把 DNS 指死。自举脚本 `zzz-restore-router` 与 `auto_rollback` 均内置 **DNS 卫生检查**——若 7874 无进程监听则自动回退公共 DNS(223.5.5.5/8.8.8.8) 并重启 dnsmasq，避免"连WiFi没网"。
 - **itb 完整性（走 WiFi 专用）**：上传后路由器侧复核 sha256，防 WiFi 抖动传坏镜像变砖。
 - **6G**：`zzz-restore-router` 已默认关闭 6G（设备层 `radio2` 与接口层 `default_radio2` 均 `disabled='1'`，用户明确"6G不用"）；如需启用，改这两处 + `wifi reload`。

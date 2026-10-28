@@ -448,7 +448,7 @@ collect_runtime(){
   #      OpenClash/zerotier 自身启动时重新添加。etc/config/openclash 已被上面单独通道处理, 此处重复抓取同一
   #      UCI 文件, 内容一致无害。
   mkdir -p "$build/etc/config"
-  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak*" > /tmp/kit_tar.ex; cd / && tar -czX /tmp/kit_tar.ex -f - etc/config; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak*" "*.apk-new" > /tmp/kit_tar.ex; cd / && tar -czX /tmp/kit_tar.ex -f - etc/config; rm -f /tmp/kit_tar.ex' 2>/dev/null \
        | tar -xzf - -C "$build" 2>/dev/null || true
   if [ -n "$(ls -A "$build/etc/config" 2>/dev/null)" ]; then
     cfg_all=$(find "$build/etc/config" -type f 2>/dev/null | wc -l | tr -d ' ')
@@ -461,7 +461,7 @@ collect_runtime(){
   # 由 zzz-restore 的 rc.local 在 apk add 后 /etc/init.d/openclash enable 重建)。
   # ⚠️ BusyBox tar 无 --exclude, 一律用 -X <模式文件>(见上方说明)。
   #    bsdtar 解 busybox 流退出码不可靠, 成功判定以落盘内容为准(crontabs/root 为探针)。
-  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / '"$EXTRA_PATHS"'; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak" "*.apk-new" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / '"$EXTRA_PATHS"'; rm -f /tmp/kit_tar.ex' 2>/dev/null \
        | tar -xzf - -C "$build" 2>/dev/null || true
   if [ -f "$build/etc/crontabs/root" ]; then
     echo "✅ 已抓取定制路径(排除 ._*/bak): $EXTRA_PATHS"
@@ -590,6 +590,26 @@ elif [ "$FORCE" = "1" ]; then
   echo "⚠️ itb sha256 未校验(期望 ${EXPECT_SHA:-未知}, 实得 $ACT_SHA), --force 已忽略, 继续刷入"
 else
   die "itb sha256 校验未通过 (期望 ${EXPECT_SHA:-未能获取官方校验值}, 实得 $ACT_SHA) — 上传可能损坏或无法获取官方校验值; 重试上传, 或用 --force / --expect-sha 跳过"
+fi
+
+# ---------- 设备名兼容性预检(防 -F 误用于异构镜像) ----------
+# 背景: 本家族 naoki66 构建在 1016 把板名 gemtek,xr1710g-ubi 改名为 gemtek,xr1710g(仅元数据改名,
+#   实际 UBI 布局/硬件/启动机制与现网完全一致, 已比对两 itb 的 ubi-volume 结构确认)。故用 -F 跳过
+#   设备名校验。但 -F 是双刃剑: 若误指向真正异构镜像(如 XG2010G)会直接变砖。
+#   此处用归一化(去 -ubi 后缀)比对运行板名与 itb 支持设备, 仅当差异仅为 -ubi 后缀时才允许 -F;
+#   否则中止, 把"异构镜像"风险挡在刷写之前。提取失败(字符串解析未命中)则放行(信任上方 sha256 完整性)。
+RUNNING_BOARD=$(ssh -o ConnectTimeout=10 "$ROUTER" 'cat /tmp/sysinfo/board_name 2>/dev/null' 2>/dev/null)
+NB_RUNNING=${RUNNING_BOARD%-ubi}
+ITB_DEV=$(ssh -o ConnectTimeout=10 "$ROUTER" "strings /tmp/$(basename "$ITB") 2>/dev/null | grep -oE '${NB_RUNNING}[-a-z]*' | head -1" 2>/dev/null)
+if [ -n "$ITB_DEV" ]; then
+  NB_ITB=${ITB_DEV%-ubi}
+  if [ "$NB_RUNNING" = "$NB_ITB" ]; then
+    echo "✅ 设备名兼容 ($RUNNING_BOARD ↔ $ITB_DEV, 仅 -ubi 后缀差异, -F 安全)"
+  else
+    die "设备名不兼容: 运行板 $RUNNING_BOARD, itb 支持 $ITB_DEV —— 拒绝 -F 强刷(疑似异构镜像, 强刷会变砖)"
+  fi
+else
+  echo "⚠️ 无法从 itb 提取设备名(字符串解析未命中), 信任 sha256 完整性, 继续 -F"
 fi
 
 echo "=== 触发干净刷 (严格全清 -n + uci-defaults 自举) ==="

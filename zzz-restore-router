@@ -23,7 +23,10 @@ echo "=== zzz-restore-router 开始 $(date) ===" >>$LOG
 # (如 /etc/uci-defaults/._zzz-restore-router、/etc/dropbear/._*)。新版 kit 已在
 # Mac 侧(COPYFILE_DISABLE=1)与抓取端(tar --exclude)双重排除, 此处对存量做兜底清理。
 find /etc -name '._*' -type f -exec rm -f {} \; 2>/dev/null
-echo "已清理 /etc 下 AppleDouble 垃圾(._*)" >>$LOG
+# apk 安装冲突遗留的 .apk-new 配置文件(如 /etc/config/openclash.apk-new): UCI 不读取, 但会随 kit
+# 抓取污染下次升级配置; 全清刷后清理之(2026-10-28 实测升级后残留 openclash.apk-new)。
+find /etc/config -name '*.apk-new' -type f -exec rm -f {} \; 2>/dev/null
+echo "已清理 /etc 下 AppleDouble 垃圾(._*) 与 apk 残留(*.apk-new)" >>$LOG
 
 # 升级后 root 密码(全清刷后 root 无密码, 必须设置, 否则:
 #   a) 内网任何设备可空密码 LAN SSH 进 root; b) 非交互脚本 ssh 连不上无法终验)
@@ -243,7 +246,14 @@ fi
 # 必须在此显式删链(rm 在 overlay upper 重建 whiteout), 否则 watchcat/igmpproxy 等被默默启动
 # (2026-10-08 升级后实际复发过)。清单由 Mac 侧 collect_runtime 刷前生成, 用后即删。
 DISABLED_SVC=/etc/zzz-disabled-services
-if [ -f "$DISABLED_SVC" ]; then
+if [ ! -s "$DISABLED_SVC" ]; then
+  # 清单缺失/为空时, 直接从 rom vs live 重算(出厂有链、现网无链 = 用户禁用项), 避免清单未进 kit 时失效
+  : > "$DISABLED_SVC"
+  for _l in $(ls /rom/etc/rc.d 2>/dev/null); do
+    [ -e "/etc/rc.d/$_l" ] || echo "$_l" >> "$DISABLED_SVC"
+  done
+fi
+if [ -s "$DISABLED_SVC" ]; then
   while read -r _link; do
     [ -z "$_link" ] && continue
     rm -f "/etc/rc.d/$_link" 2>/dev/null
@@ -298,40 +308,59 @@ cat > /etc/rc.local <<'RCEOF'
 if [ ! -f /etc/zzz-postinstall-done ]; then
   # ---------- 0. 恢复"用户禁用"的服务(末段强制, 覆盖包 postinst 重建 rc.d 链接) ----------
   # zzz-restore 早期已删过一次链接, 但 watchcat 等包的 postinst 会在其后重建, 致禁用态失效
-  # (实测 2026-10-28 升级后 watchcat 被重新启用)。此处开机末段再强制一次, 与升级前状态一致。
-  if [ -f /etc/zzz-disabled-services ]; then
+  # (实测 2026-10-28 升级后 watchcat 被重新启用, 且首启动禁用逻辑未可靠生效)。
+  # 此处开机末段再强制一次: 优先用 kit 携带的清单, 缺失时直接从 rom vs live 重算, 确保与升级前一致。
+  _ds=/etc/zzz-disabled-services
+  if [ ! -s "$_ds" ]; then
+    : > "$_ds"
+    for _l in $(ls /rom/etc/rc.d 2>/dev/null); do
+      [ -e "/etc/rc.d/$_l" ] || echo "$_l" >> "$_ds"
+    done
+  fi
+  if [ -s "$_ds" ]; then
     while read -r _link; do
       [ -z "$_link" ] && continue
       rm -f "/etc/rc.d/$_link" 2>/dev/null
-    done < /etc/zzz-disabled-services
-    echo "rc.local 末段已强制禁用服务: $(tr '\n' ' ' < /etc/zzz-disabled-services 2>/dev/null)" >>/tmp/zzz-postinstall.log
-    rm -f /etc/zzz-disabled-services 2>/dev/null
+    done < "$_ds"
+    echo "rc.local 末段已强制禁用服务: $(tr '\n' ' ' < "$_ds" 2>/dev/null)" >>/tmp/zzz-postinstall.log
+    rm -f "$_ds" 2>/dev/null
   fi
-  # ---------- 0.5 等待外网连通后再装 OpenClash ----------
-  # 首启动早期 WAN 可能未就绪/镜像瞬断, 直接 apk add 会失败(实测 2026-10-28 因此 OpenClash 未装,
-  # 需手动补救)。先轮询仓库主机可达再装, 上限 ~3 分钟。
-  _repo_host="mirrors.vsean.net"
-  _net_ok=0
-  for _w in $(seq 1 18); do
-    if curl -fsS --max-time 5 -o /dev/null "http://$_repo_host" 2>/dev/null || ping -c1 -W2 "$_repo_host" >/dev/null 2>&1; then
-      _net_ok=1; break
-    fi
-    echo "等待外网连通($_repo_host) 第 $_w 次..." >>/tmp/zzz-postinstall.log
+  # ---------- 0.5 等待 apk 仓库真正可用再装 OpenClash ----------
+  # 首启动早期仓库可能瞬断(实测 2026-10-28: 仅主机可达但 .adb 文件 unexpected end of file,
+  # 旧逻辑只 ping 主机误判连通, 6 次 apk add 全失败, 最终靠手动补救)。改为: 以 apk update 成功
+  # 为连通判据, 上限 ~5 分钟; 成功后再重试 apk add(最多 8 次, 间隔 15s)。
+  _repo_host=$(grep -rhoE 'https?://[^/ ]+' /etc/apk/repositories.d/ 2>/dev/null | sed -E 's#https?://##; s#/.*##' | head -1)
+  _repo_host=${_repo_host:-mirrors.vsean.net}
+  _apk_ok=0
+  for _w in $(seq 1 30); do
+    if apk update >/tmp/zzz-apk-update.log 2>&1; then _apk_ok=1; break; fi
+    echo "等待 apk 仓库可用($_repo_host) 第 $_w 次 ($(date))..." >>/tmp/zzz-postinstall.log
     sleep 10
   done
-  if [ "$_net_ok" != "1" ]; then
-    echo "❌ 等待外网超时, 后续 apk add 可能失败(必要时手动: apk add luci-app-openclash)" >>/tmp/zzz-postinstall.log
+  if [ "$_apk_ok" = "1" ]; then
+    for i in 1 2 3 4 5 6 7 8; do
+      if apk add luci-app-openclash >>/tmp/zzz-postinstall.log 2>&1; then
+        echo "apk add luci-app-openclash 成功 (尝试 $i)" >>/tmp/zzz-postinstall.log
+        break
+      fi
+      echo "apk add 重试 $i ..." >>/tmp/zzz-postinstall.log
+      sleep 15
+    done
   else
-    echo "✅ 外网已连通($_repo_host), 开始安装 OpenClash" >>/tmp/zzz-postinstall.log
+    echo "❌ apk 仓库在等待窗口内仍不可用, OpenClash 安装推迟" >>/tmp/zzz-postinstall.log
   fi
-  for i in 1 2 3 4 5 6; do
-    if apk update >>/tmp/zzz-postinstall.log 2>&1 && apk add luci-app-openclash >>/tmp/zzz-postinstall.log 2>&1; then
-      echo "apk add luci-app-openclash 成功 (尝试 $i)" >>/tmp/zzz-postinstall.log
-      break
+  # 验证 init 脚本就位; 未就位(仓库仍不可用)则本次跳过, 下次开机 rc.local 自动重试(自愈),
+  # 但限 6 次避免无限重试刷屏。
+  if [ ! -x /etc/init.d/openclash ]; then
+    echo "❌ /etc/init.d/openclash 仍未安装(仓库可能暂不可用), 下次开机自动重试" >>/tmp/zzz-postinstall.log
+    _rt=$(cat /etc/zzz-oc-retry 2>/dev/null || echo 0); _rt=$((_rt+1)); echo "$_rt" >/etc/zzz-oc-retry
+    if [ "$_rt" -ge 6 ]; then
+      echo "❌ OpenClash 安装连续 $_rt 次失败, 停止自动重试(需手动: apk add luci-app-openclash)" >>/tmp/zzz-postinstall.log
+      touch /etc/zzz-postinstall-done
     fi
-    echo "apk 重试 $i ..." >>/tmp/zzz-postinstall.log
-    sleep 10
-  done
+    exit 0
+  fi
+  rm -f /etc/zzz-oc-retry 2>/dev/null
   # ---------- OpenClash 内核(clash_meta 二进制)恢复: P1 根治"全清刷后内核丢失" ----------
   # 优先用 kit 烘焙的内核(sysupgrade -f 已还原到 /etc/openclash/core/clash_meta);
   # 若缺失/不可执行(例如 kit 未烘焙且配置级回退), 运行时从官方 CDN 下载(mihomo-linux-arm64),
@@ -360,7 +389,7 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
       fi
     else
       echo "❌ OpenClash 内核下载失败, OpenClash 将无法启动(需手动补救)" >>/tmp/zzz-postinstall.log
-      notify "路由器升级后 OpenClash 内核缺失" "内核 CDN 下载失败, 需手动安装 clash_meta" 2>/dev/null || true
+      logger -t zzz-restore "路由器升级后 OpenClash 内核缺失: 内核 CDN 下载失败, 需手动安装 clash_meta" 2>/dev/null || true
     fi
   fi
   chmod 755 /etc/openclash 2>/dev/null
@@ -391,7 +420,7 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
   _dns_up=$(uci get dhcp.@dnsmasq[0].server 2>/dev/null)
   if echo "$_dns_up" | grep -q '127.0.0.1'; then
     _port=$(echo "$_dns_up" | grep -oE '[0-9]+' | head -1)
-    if [ -n "$_port" ] && ! (nc -z -w2 127.0.0.1 "$_port" 2>/dev/null || ss -lun 2>/dev/null | grep -q ":$_port "); then
+    if [ -n "$_port" ] && ! nc -z -w2 127.0.0.1 "$_port" 2>/dev/null; then
       echo "DNS 上游 $_dns_up 指向本地死端口, 回退公共 DNS" >>/tmp/zzz-postinstall.log
       uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
       uci del dhcp.@dnsmasq[0].server 2>/dev/null
