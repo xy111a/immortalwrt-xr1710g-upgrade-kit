@@ -46,10 +46,13 @@ else
 fi
 
 echo "=== 推送 (绕过本地出网代理, 走 gh 通道) ==="
-if env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" push origin main 2>&1 | tail -5; then
+# 注意: 不能写 `if git push | tail; then` —— 管道会取 tail 的退出码, git push 失败也被误判成功(2026-10-28 实踩)。
+push_out=$(env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" push origin main 2>&1); push_rc=$?
+printf '%s\n' "$push_out" | tail -5
+if [ "$push_rc" -eq 0 ]; then
   echo "✅ git push 成功"
 else
-  echo "⚠️ git push 失败, 回退到 gh api PUT 逐文件发布..."
+  echo "⚠️ git push 失败(rc=$push_rc), 回退到 gh api PUT 逐文件发布..."
   for f in $FILES; do
     [ -f "$SRC/$f" ] || continue
     _b64=$(base64 -i "$SRC/$f" | tr -d '\n')
