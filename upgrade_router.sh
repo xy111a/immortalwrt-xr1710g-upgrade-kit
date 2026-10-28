@@ -15,7 +15,7 @@
 #   - 主路径可走 WiFi: 上传 kit+itb、触发 sysupgrade 均经当前 WiFi; 路由器重启后 uci-defaults 自举恢复
 #     原 SSID 并 'wifi reload', Mac 自动重连, 全程无需插线。
 #   - 但请把一根以太网线放在手边: 万一自举失败(路由回退出厂, 原 SSID 消失), WiFi 即不可达,
-#     此时插有线是唯一入口; 插线后 Mac 有线网卡须设为 DHCP 自动获取(出厂态=192.168.1.x / 自举成功=192.168.88.x)。
+#     此时插有线是唯一入口; 插线后 Mac 有线网卡须设为 DHCP 自动获取(出厂态=192.168.1.x / 自举成功=升级前 LAN 网段)。
 #   - 恢复/诊断时若路由在出厂态, 你的路由器地址/别名连不上, 改用出厂默认: ssh root@192.168.1.1
 #   - Mac 的 SSH 公钥已内置在 kit.tar.gz 的 etc/dropbear/authorized_keys (全清刷后仍可 key 登录)
 #   - 升级后 root 密码由升级前从活路由器抓取的 shadow hash 自动恢复, 与升级前一致; 如需改密: ssh <路由器地址> 'passwd root'
