@@ -17,7 +17,10 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 WORK="${GIT_WORK_DIR:-/tmp/kit_repo}"
 # 白名单: 仅这些纯文本源码入库; itb/kit.tar.gz/backups 永不入库
 # 注: 远端另有 .gitignore / .github/workflows/secret-scan.yml 为"远端专管"(本地无副本, 不在同步范围)
-FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md"
+# skill/router-immortalwrt-upgrade/SKILL.md 是平台加载 skill 的入口副本(带 frontmatter),
+#   与根目录 SKILL.md 正文必须保持一致 —— 2026-10-30 发现它曾停留在旧版残桩(缺 OpenClash 排障章节),
+#   现同步为最新版, 避免两份文档打架导致平台加载到过期说明。
+FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md skill/router-immortalwrt-upgrade/SKILL.md"
 
 echo "=== 准备 Git 工作副本: $WORK ==="
 if [ -d "$WORK/.git" ]; then
@@ -30,6 +33,9 @@ fi
 echo "=== 复制源码文件到工作副本 ==="
 for f in $FILES; do
   if [ -f "$SRC/$f" ]; then
+    # 嵌套路径(如 skill/<name>/SKILL.md)需先建目录, 否则 cp 静默失败(2026-10-30 实踩:
+    # 目标目录不存在时 cp 报 "No such file or directory" 但循环继续, 造成远端漏文件)
+    mkdir -p "$(dirname "$WORK/$f")" 2>/dev/null
     cp "$SRC/$f" "$WORK/$f" && echo "  ✓ $f ($(wc -c < "$SRC/$f") B)" || echo "  ❌ 复制失败: $f"
   else
     echo "  - 跳过(本地不存在): $f"
@@ -55,7 +61,7 @@ else
   echo "⚠️ git push 失败(rc=$push_rc), 回退到 gh api PUT 逐文件发布..."
   for f in $FILES; do
     [ -f "$SRC/$f" ] || continue
-    _b64=$(base64 -i "$SRC/$f" | tr -d '\n')
+    _b64=$(base64 < "$SRC/$f" | tr -d '\n')
     _sha=$(gh api "repos/$REPO/contents/$f?ref=main" --jq '.sha' 2>/dev/null || true)
     _msg="chore: 同步 $f (发布即校验)"
     if [ -n "$_sha" ] && [ "$_sha" != "null" ]; then
