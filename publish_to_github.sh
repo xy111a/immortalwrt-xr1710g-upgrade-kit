@@ -41,7 +41,7 @@ env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" add -A
 if env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" diff --cached --quiet 2>/dev/null; then
   echo "ℹ️ 无变更, 无需提交"
 else
-  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "fix(audit): 移除secret-scan明文密码特征(公共仓库泄露WiFi key, 改为运行期抓取设计)+ 文档EXPECT_SHA矛盾修正 + watch grep -F + check_openclash去个人IP/更新fallback + 白名单补scripts/secret-scan.sh (R9)" \
+  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "feat(diag): 新增入口IP被封诊断(第8节真实握手/第9节规则防丢/第10节注入校验) + provider模式节点数与延迟读取修正 + 诊断脚本改用ssh stdin传参(避裸单引号截断) + secret-scan新增订阅token规则 (R10)" \
     && echo "✅ 已提交"
 fi
 

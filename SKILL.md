@@ -80,7 +80,36 @@ agent_created: true
 3. **经 7874 解析域名不能当"服务器可达性"判据**：`fake-ip` 模式下经 7874 解析任意域名都返回 `198.18.x` 假 IP；`redir-host` 模式下虽返回真实 IP，但受 DNS 污染/缓存影响也未必可靠。判断真实节点服务器可达性，须用**公共 DNS**（如 `nslookup <节点域名> 223.5.5.5`）或直接看控制器节点延迟。
 4. **`curl -x http://127.0.0.1:7890`（或 `[::1]:7890`）多半返回 407 或 `HTTP=000`，都是假象**，不代表代理挂了：前者要认证、后者是路由器自身回环被 `router_self_proxy`/回环路由吃掉。**判断代理是否在服务，用控制器 `/proxies` 的真实节点数 + `/connections` 活跃连接**（真实 LAN 客户端连接最可信），不要用路由器本机 curl。
 5. **节点"能连 TCP" ≠ "App 能用"（2026-10-28 TikTok 实战）**：`自动选择`(url-test) 会挑"延迟最低"的节点，但某节点可能**能被 TikTok/Netflix 等封 IP**（TCP 通、业务不给数据，App 反复重试/转圈）。定位：对每个候选节点测 `GET /proxies/<name>/delay?url=https://www.tiktok.com&timeout=7000`，返回 `{"delay":N}`=能连、`{"message":"An error occurred..."}`=被该站封/不可达；把可用节点固定或从自动选择池剔除即可。
-- **正确验证法**：查控制器统计"真实节点数"（过滤掉 Selector/URLTest/Fallback 等代理组，只数 `Vless/Vmess/Trojan/Hysteria2/...` 等真实类型）+ 看 `/connections` 活跃连接数 + 看 `nft` 的 `openclash` TCP 重定向包计数随出网探针**增长**。三者任一成立即证明代理真在扛流量。
+6. **provider 模式下节点不在 `/proxies` 顶层**（2026-10-30）：机场新订阅是 `proxy-providers` 结构，节点在 `/providers/proxies` 里。只查 `/proxies` 会**误报 0 节点**并触发"静默断网"结论。两个来源都要查、取大值。
+7. **provider 内节点的 delay API 两条路径都 404**（2026-10-30）：`GET /proxies/<name>/delay` 和 `GET /providers/proxies/<prov>/proxies/<name>/delay` 对 provider 内节点都返回 `{"message":"Resource not found"}`（emoji 名 URL 编码亦然）。**唯一可靠的读法是直接读 `/providers/proxies` 响应里的 `history` 数组**：`{n:.name, d:((.history//[])[-1].delay // 0)}`，配合 `.alive` 字段。
+8. **路由器 shell 直连会被 nft 劫持，测出来是假阳性**（2026-10-30）：`openclash_output` 链最后一条是 `ip protocol tcp → redirect to :7892`，凡 gid≠65534 的本机出向 TCP 都被劫持到本地 clash 端口。于是 `bash -c 'exec 3<>/dev/tcp/<服务器IP>/<端口>'` 会**秒连成功**，但连的其实是本地 7892，**根本不是远端服务器**——我据此差点误判"入口正常"。要测真实路径必须先插豁免：`nft insert rule inet fw4 openclash_output ip daddr <IP> return`，测完按 handle 删除。（另：BusyBox `nc` **不支持 `-z`**，一切 `nc -z` 探测都是假阴性；`/dev/tcp` 需 bash，路由器有 `/bin/bash`。）
+- **正确验证法**：查控制器统计"真实节点数"（过滤掉 Selector/URLTest/Fallback 等代理组，只数 `Vless/Vmess/Trojan/Hysteria2/...` 等真实类型，**且要合并 `/proxies` 与 `/providers/proxies` 两个来源**）+ 看 `/connections` 活跃连接数 + 看 `nft` 的 `openclash` TCP 重定向包计数随出网探针**增长**。三者任一成立即证明代理真在扛流量。
+
+### 🚨 入口 IP 被封：全体节点超时但 DNS 正常（2026-10-30 实战，故障率最高）
+
+**症状**：所有走代理的流量报 `dial tcp <入口IP>:<端口>: i/o timeout`（日志里连你家里每台设备都在刷），但**DNS 解析完全正常**、国内站直连正常、`/proxies` 节点数一个不少。极易误判成"节点坏了/订阅过期/机场倒闭"。
+
+**根因**：机场入口域名（形如 `entry.<机场域名>`，常带 CNAME 到另一子域）会在**多个 IP 间轮转**。旧 IP 被墙后，clash 仍**缓存**着旧 A 记录并一直往那个死 IP 上连，而 DNS 查出来"看着没问题"。上游 DNS 其实早已返回新 IP——**只有 clash 自己缓存没刷新**。
+
+**判定流程**（`check_openclash.sh` 第 8 节已固化）：
+1. 从 provider 缓存 `/etc/openclash/proxy_provider/*.yaml` 提取入口域名分布（`grep -oE "server: [a-zA-Z0-9._-]+" | sort | uniq -c | sort -rn`），找**出现次数最多的那个**（机场往往 36 个节点共用一个入口）。
+2. 对比各上游 DNS（`192.168.1.1` / `223.5.5.5` / `114.114.114.114`）对该域名的解析 —— 若**上游已是新 IP，而 clash DNS(7874) 还是旧 IP**，即确诊。
+3. 真实握手验证（见上文陷阱 8，必须先插 nft 豁免）：`timeout 10 bash -c "exec 3<>/dev/tcp/<IP>/<端口>"`。**不可达 = 入口 IP 被封**；同时用 `nc`/多端口扫描确认是不是整个 IP 段全灭（我那次是 19 个端口全不通，含 80/443）。
+4. 处置：**重启 clash 清 DNS 缓存**（`/etc/init.d/openclash restart`）通常即刻恢复；再配 `nameserver-policy` 把入口域名绑到多个上游，降低再次命中死 IP 的概率。
+
+**持久化配置（`nameserver-policy`）的两个硬坑**：
+- `overwrite` 钩子里 `ruby_edit` 的 hash 参数必须是**合法 Ruby 源码**（用 `=>` 而非 YAML 的 `:`），否则被 OpenClash 的 overwrite 安全检查判为 `skip unsafe Overwrite command` **静默跳过**（日志在 `/tmp/openclash.log`）。
+- mihomo 的 `nameserver-policy` 里 `+` 通配符**必须独占一个标签**：`+.entry.example.com` ✅，`+entry.example.com` ❌（后者直接让 clash 启动失败：`invalid domain "+entry.example.com": "+" wildcard must occupy the entire label 1`）。
+- **OpenClash 启动失败会自动把 `uci openclash.config.enable` 置 0**，日志打 `OpenClash Now Disabled, Need Start From Luci Page`。恢复：`uci set openclash.config.enable=1` + `/etc/init.d/openclash start`。
+
+### 自定义规则的持久化（2026-10-30 修复）
+
+`/etc/openclash/custom/openclash_custom_rules.list` **会被订阅更新 / LuCI 保存设置重置**（`luci/model/cbi/openclash/config-overwrite.lua` 会在保存时覆盖它）。所以自定义规则不能只写这个文件，必须配 **`/etc/openclash/custom/openclash_custom_overwrite.sh`** 钩子（该脚本由 `/etc/init.d/openclash` 在**每次启动后**调用），在钩子里**幂等**补回规则：先 `sed -i` 删掉旧行再 `sed "/^rules:/a\\..."` 插入，保证重复执行不产生重复条目。
+
+**规则目标必须是"代理组"而非 provider 内的节点名**：像 `DOMAIN-SUFFIX,tiktok.com,🇭🇰香港01【防失联↑↑↑】` 这种写法会被 `yml_rules_change.sh` 的 `CONFIG_GROUP` 校验**过滤掉**（`CONFIG_GROUP` 只含组名 + 内联 proxies，不含 provider 里的节点名），规则静默消失。正确写法指向组（如 `🚀 HK`）。运行配置里中文/emoji 会以 Ruby 的 Unicode 转义形式出现（`"\U0001F680 HK"`），**这是正常的 YAML 写法，能正确解析**。
+
+**验证规则是否真的生效**：看控制器 `/rules` 返回的 `type,payload -> proxy` 三元组，而不是只看运行配置文件里有没有那行文本；再用 `/tmp/openclash.log` 的 `match DomainSuffix(xxx) using <目标>` 确认实际路由决策。
+
 
 ### 订阅自动更新：三层闸门缺一不可（2026-10-28 修复，实测）
 本构建的订阅自动更新由 **`openclash_watchdog.sh` 守护进程按"间隔"触发，不是系统 crontab**（`crontab -l` 里看不到 openclash 项是正常的；`auto_update_time` 时钟字段在本版本**未使用**）。要它真正跑，以下**三层闸门必须同时打开**，缺任一则静默不更新：
