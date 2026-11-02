@@ -74,8 +74,8 @@ EXPECT_SHA="${EXPECT_SHA_OVERRIDE:-}"
 HOSTKEY_PRESERVED=0
 # 回退镜像: 默认自动解析为"当前路由器正在运行的版本"对应的本地 itb (刷前预飞时按 commit hash 匹配)。
 # 注意: 路由器 DISTRIB_REVISION 末尾 commit(a2535c4f2c, 10 位) 与 GitHub itb 文件名中的 commit(a2535c4f, 8 位) 长度不同,
-#   resolve_rollback 的 grep 因此匹配不到 —— 故显式将 FALLBACK_ITB 指向当前运行版本(20260916)的回退镜像, 使 T3 回退可用。
-FALLBACK_ITB="$PREP_DIR/immortalwrt-naoki66-20260916-a2535c4f-airoha-an7581-gemtek_xr1710g-ubi-squashfs-sysupgrade.itb"
+#   resolve_rollback 的 grep 因此匹配不到 —— 故显式将 FALLBACK_ITB 指向"当前运行版本(20261016)的回退镜像"作为最后兜底(正常 resolve_rollback 已按日期匹配本机当前 itb)
+FALLBACK_ITB="$PREP_DIR/immortalwrt-naoki66-xr1710g-20261016-1a34e17c-airoha-an7581-gemtek_xr1710g-squashfs-sysupgrade.itb"
 # 升级前配置快照(sysupgrade -b)的本地路径, 供自动回退连带还原; 空=未备份
 PREUPG_BACKUP=""
 
@@ -130,6 +130,39 @@ archive_logs(){
 }
 
 # 升级后结构化报告(P3, SRE 视角): 一眼看清"到底恢复全了没", 落持久化目录
+# 配置保真度独立校验(2026-11-02 修复 #1): 用升级前 sysupgrade -b 快照比对升级后运行态 /etc/config,
+# 暴露"抓进 kit 但首启动未还原"的配置漂移(此前 verify 只查连通性+节点数+信道+DHCP条数+uci changes,
+# 不比对还原前后一致性)。非 fail-closed, 仅告警, 不触发回退。
+config_fidelity_check(){
+  [ -n "$PREUPG_BACKUP" ] && [ -f "$PREUPG_BACKUP" ] || { echo "ℹ️ 无升级前配置快照, 跳过保真度校验"; return 0; }
+  local algo
+  algo=$(ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'command -v sha256sum >/dev/null 2>&1 && echo sha256 || echo none' 2>/dev/null)
+  if [ "$algo" != "sha256" ]; then
+    echo "ℹ️ 路由器不支持 sha256sum, 跳过配置保真度校验(仍可手工比对 $PREUPG_BACKUP)"
+    return 0
+  fi
+  local tmp; tmp=/tmp/cfg_pre_$$; rm -rf "$tmp"; mkdir -p "$tmp"
+  tar -xzf "$PREUPG_BACKUP" -C "$tmp" 2>/dev/null || { echo "⚠️ 升级前快照解包失败, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
+  local pre_dir="$tmp/etc/config"
+  [ -d "$pre_dir" ] || { echo "⚠️ 升级前快照无 /etc/config, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
+  echo "=== 配置保真度校验 (升级前快照 vs 升级后运行态) ==="
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'cd /etc/config && for f in *; do [ -f "$f" ] || continue; printf "%s %s\n" "$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)" "$f"; done' 2>/dev/null > "$tmp/post.txt" || { echo "⚠️ 无法读取升级后 /etc/config, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
+  local diffs=0 nf=0 bf pre_h post_h
+  for pre in "$pre_dir"/*; do
+    [ -f "$pre" ] || continue
+    bf=$(basename "$pre")
+    post_h=$(awk -v f="$bf" '$2==f{print $1}' "$tmp/post.txt")
+    if [ -z "$post_h" ]; then echo "  ⚠️ 升级后缺失: /etc/config/$bf"; nf=$((nf+1)); diffs=$((diffs+1)); continue; fi
+    pre_h=$(shasum -a 256 "$pre" 2>/dev/null | awk '{print $1}')
+    if [ "$pre_h" != "$post_h" ]; then echo "  ⚠️ 配置漂移: /etc/config/$bf (升级前/后不一致)"; diffs=$((diffs+1)); fi
+  done
+  while read -r _h bf; do
+    [ -f "$pre_dir/$bf" ] || echo "  ℹ️ 升级后新增 config(一般无害): $bf"
+  done < "$tmp/post.txt"
+  if [ "$diffs" -eq 0 ]; then echo "✅ 配置保真度校验通过: 升级前快照的全部 /etc/config 均已还原且内容一致"; else echo "⚠️ 配置保真度校验发现 $diffs 处差异(缺失 $nf), 请核查上面列出的文件(差异可能来自首启动自举的正常生成项)"; fi
+  rm -rf "$tmp"
+}
+
 post_upgrade_report(){
   mkdir -p "$LOG_DIR"
   local d rep
@@ -186,6 +219,7 @@ post_upgrade_report(){
     ch=$(uci changes 2>/dev/null)
     if [ -z "$ch" ]; then echo "- ✅ uci changes 为空(已全部 commit)"; else echo "- ⚠️ 存在未提交改动:"; echo "$ch"; fi
   ' 2>/dev/null >> "$rep"
+  config_fidelity_check >> "$rep"
   echo "📄 已生成升级后结构化报告: $rep"
 }
 
@@ -258,6 +292,31 @@ resolve_router(){
 ITB=$(resolve_target_itb) || die "找不到待刷 itb (期望 $PREP_DIR/*.itb, 应为最新下载的那个; 或用 --itb 显式指定)"
 [ -f "$KIT" ]    || die "找不到 kit.tar.gz"
 
+# ---------- 发布沉淀闸(与 router_watch.sh 一致, 2026-11-02 加固 #2) ----------
+# 背景: 此前手动跑本脚本(不带 --itb)会经 resolve_target_itb 自动选官方最新 release 刷入,
+#   绕过 router_watch.sh 的 72h 闸, 违背"发布满 72h 再升"的纪律。现补同一道闸:
+#   未显式 --itb 且非 --force 时, 取所选 release 的发布时间, <72h 拒绝自动升最新, 强制用户二选一:
+#     (a) 显式 --itb <经过确认的版本文件>  (b) 加 --force 跳过闸(自担风险)。
+#   dry-run 下仅告警不拦截(便于预演); 真实执行则 fail-closed。
+if [ -z "$ITB_OVERRIDE" ] && [ "$FORCE" = "0" ]; then
+  _pub=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0].published_at' 2>/dev/null | head -1)
+  if [ -n "$_pub" ]; then
+    _pub_utc="${_pub/Z/+0000}"
+    _pub_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$_pub_utc" +%s 2>/dev/null)
+    _now_epoch=$(date +%s)
+    if [ -n "$_pub_epoch" ]; then
+      _age=$(( ( _now_epoch - _pub_epoch ) / 3600 ))
+      if [ "$_age" -lt 72 ]; then
+        if [ "$DRY" = "1" ]; then
+          echo "⚠️ [dry-run] 沉淀闸: 最新 release($_pub) 发布仅 ${_age}h (<72h), 真实执行时本脚本会拒绝自动升最新版, 请显式 --itb 指定已确认版本或加 --force 跳过"
+        else
+          die "🛑 沉淀闸: 最新 release($_pub) 发布仅 ${_age}h (<72h)。为安全, 请勿自动刷最新版。请二选一: (a) 显式 --itb <指定版本 itb 文件> 升级到已确认版本; (b) 加 --force 跳过此闸(自担风险)。"
+        fi
+      fi
+    fi
+  fi
+fi
+
 # 自动解析回退镜像: 取路由器当前运行的 commit hash, 在本地 firmware-prep 匹配同名 itb。
 # 这样每次升级都会把"刚跑的版本"作为回退目标 —— 即自动备份当前版本。
 resolve_rollback(){
@@ -321,7 +380,7 @@ backup_config(){
     echo "✅ 升级前配置已备份: $(basename "$dest")"
     PREUPG_BACKUP="$dest"
   else
-    echo "⚠️ 配置备份失败(不影响升级, 仅失去配置级回退点)"
+    echo "⚠️ 配置备份失败(不影响升级, 但将失去本机唯一配置级回退点; 固件级回退仍由 ROLLBACK itb 提供)"
   fi
 }
 
@@ -743,6 +802,25 @@ verify_router(){
   ' 2>/dev/null
 }
 
+# 回退后终验(2026-11-02 修复 #3): 回退是把固件刷回旧版, 再用 verify_router(拿新 commit 比对)必然判 FAIL 误报。
+# 故独立判据: 已回到"非目标新版本"(即确实回退了) + 外网直连通 + 三频启用。不再与新 commit 比对。
+verify_rollback(){
+  if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then
+    echo "WARN: 回退后连不上路由器"; return 2
+  fi
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
+    rev=$(grep DISTRIB_REVISION /etc/openwrt_release 2>/dev/null | grep -oE "[0-9a-f]{7,40}" | tail -1)
+    [ -z "$rev" ] && { echo "WARN: 回退后无法读取版本(可能早启动/抖动)"; exit 2; }
+    echo "回退后版本: $rev"
+    if echo "$rev" | grep -q "'"$TARGET_COMMIT"'"; then echo "FAIL: 仍运行目标新版本, 回退可能未生效"; exit 1; fi
+    curl -fsS --max-time 6 https://www.baidu.com >/dev/null 2>&1 || ping -c2 -W3 8.8.8.8 >/dev/null 2>&1 || { echo "FAIL: 回退后外网不通"; exit 1; }
+    for r in radio0 radio1; do
+      [ "$(uci get wireless.$r.disabled 2>/dev/null)" = "1" ] && { echo "FAIL: 回退后 $r 被禁用"; exit 1; }
+    done
+    exit 0
+  ' 2>/dev/null
+}
+
 auto_rollback(){
   echo "⚠️ 强终验失败, 自动回退到 $(basename "$ROLLBACK")"
   if [ ! -f "$ROLLBACK" ]; then
@@ -783,14 +861,25 @@ auto_rollback(){
       fi
     fi
   ' 2>/dev/null || true
-  if verify_router; then
-    echo "✅ 回退后强终验通过"; notify "路由器已自动回退" "旧固件+旧配置已恢复, 强终验通过"
+  if verify_rollback; then
+    echo "✅ 回退后终验通过(已恢复到非目标旧版本, 外网+三频正常)"; notify "路由器已自动回退" "旧固件+旧配置已恢复, 终验通过"
   else
-    echo "❌ 回退后仍失败, 需手动进 U-Boot Recovery"
+    echo "❌ 回退后仍终验失败, 需手动进 U-Boot Recovery"
     notify "路由器升级回退失败" "回退后仍终验失败, 需手动进 U-Boot Recovery"
   fi
   archive_logs
   post_upgrade_report
+}
+
+# 清理过期的升级前配置快照(2026-11-02 修复 #5): backups/ 仅本机配置级回退点, 保留最近 10 份即可, 避免无限堆积
+prune_old_backups(){
+  local n f d
+  d="$PREP_DIR/backups"; [ -d "$d" ] || return 0
+  n=0
+  for f in $(ls -t "$d"/pre-upg-*.tar.gz 2>/dev/null); do
+    n=$((n+1))
+    if [ "$n" -gt 10 ]; then echo "🧹 清理旧配置快照: $(basename "$f")"; rm -f "$f"; fi
+  done
 }
 
 # 保守清理旧 itb: 保留最新 3 个, 且永不删除回退镜像(上一版本)与兜底镜像
@@ -811,23 +900,31 @@ prune_old_itbs(){
 
 if [ "$AUTO" = "1" ]; then
   echo "=== 强终验 (--auto) ==="
-  # RC=2(连不上路由器)重试(P2): 早启动/执行机抖动可能暂时连不上, 重试避免误判或过早放弃
+  # 2026-11-02 修复 #4: 原逻辑在首次 verify 返回 RC=1(连上但终验失败)即 break 并触发回退,
+  #   但首启动 rc.local(apk 装 OpenClash + 还原订阅)可能尚未跑完 -> 0 节点误判 -> 不必要回退。
+  #   现改为: RC=0 立即成功; RC=2(连不上)持续重试; RC=1(终验失败)也重试(10s 间隔, 给首启动留足时间),
+  #   连续 12 次仍失败才回退, 避免慢首启动被误判炸机。
   RC=2
-  for _att in 1 2 3 4 5 6; do
+  for _att in $(seq 1 12); do
     verify_router; RC=$?
-    if [ "$RC" = "0" ] || [ "$RC" = "1" ]; then break; fi
-    echo "⚠️ 第 $_att/6 次强终验连不上路由器(RC=2), 10s 后重试..."
+    if [ "$RC" = "0" ]; then break; fi
+    if [ "$RC" = "2" ]; then
+      echo "⚠️ 第 $_att/12 次强终验连不上路由器(RC=2), 10s 后重试..."
+    else
+      echo "⚠️ 第 $_att/12 次强终验未通过(RC=1), 首启动可能未就绪, 10s 后重试..."
+    fi
     sleep 10
   done
   if [ "$RC" = "0" ]; then
     echo "✅ 强终验通过: 固件版本/外网直连/三频 均正常, 升级成功"
     prune_old_itbs
+    prune_old_backups
     notify "路由器升级成功" "固件已更新, 强终验通过"
   elif [ "$RC" = "2" ]; then
-    echo "⚠️ 6 次重试后仍连不上路由器, 不触发自动回退(避免误改状态), 需人工确认后手动处理"
+    echo "⚠️ 12 次重试后仍连不上路由器, 不触发自动回退(避免误改状态), 需人工确认后手动处理"
     notify "路由器升级终验中断" "连不上路由器, 未自动回退, 需人工确认"
   else
-    echo "❌ 强终验未通过(连上但终验失败)"
+    echo "❌ 强终验持续未通过(连上但终验失败), 执行自动回退"
     auto_rollback
   fi
 fi

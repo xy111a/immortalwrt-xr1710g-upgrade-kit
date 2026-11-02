@@ -129,6 +129,18 @@ agent_created: true
 - **发布即校验固化（P3）**：仓库提供 `publish_to_github.sh`——提交→推送后，强制用 `gh api` 拉回每个文件的 blob 与本地 `diff`，非空且一致才算发布成功，杜绝空文件/截断事故（见该脚本）。
 - **OpenClash 订阅数据还原兜底（P1 后补）**：`sysupgrade -n -f` 全清刷后，`zzz-restore` 的 `rc.local` 里 `apk add luci-app-openclash` **重装会清空 `/etc/openclash/config`**，曾导致实机升级后订阅丢失（只能从升级前快照回拷）。现 `collect_runtime()` 在刷前把活路由 OpenClash 数据（**除 57MB 内核**，避免 kit 膨胀）另存进 kit 的 `etc/zzz-oc-data/`（`apk add` 不触碰此路径）；`zzz-restore` 在 `apk add` 之后、启动 OpenClash **之前**据此原样还原，并清掉 macOS `._` 垃圾文件。与内核的 kit 烘焙+运行时下载兜底一起，构成"内核+订阅"双保险。
 
+## 🔧 残留风险修复记录（2026-11-02，代码级审计的 5 项加固）
+
+对升级/备份流程做了一轮代码级审计，堵住此前定性评估遗留的 5 处残留风险（均非"变砖级"，最差是"升级没成自动退回旧版"）：
+
+1. **配置保真度独立校验（修复 #1）**：新增 `config_fidelity_check()`。`verify_router` 此前只查连通性/节点数/信道/DHCP 条数/`uci changes`，不比对"还原前后 `/etc/config` 是否一致"。现用升级前 `sysupgrade -b` 快照对比升级后运行态 `/etc/config`（SHA256 逐文件比对），暴露"抓进 kit 但首启动未还原"的漂移。非 fail-closed，仅告警不回退，`post_upgrade_report` 自动调用。
+2. **72h 沉淀闸兜底（修复 #2）**：此前手动跑 `upgrade_router.sh`（不带 `--itb`）会经 `resolve_target_itb` 自动选官方最新 release，绕过 `router_watch.sh` 的 72h 闸。现补同一道闸——无 `--itb` 且非 `--force` 时取 release 发布时间，`<72h` 真实执行直接 fail-closed 拒绝（dry-run 仅告警）。强制二选一：`--itb` 指定已确认版本 / `--force` 跳过。
+3. **回退误报修复（修复 #3）**：新增 `verify_rollback()` 取代 `auto_rollback` 里误用的 `verify_router`。旧逻辑拿新 commit 比对刚刷回的旧固件，必然判 FAIL 误报"回退后仍失败"。现判据：已回到非目标旧版本 + 外网通 + 三频启用。
+4. **慢首启动误回退修复（修复 #4）**：`--auto` 强终验原在首次 `verify` 返回 RC=1（连上但终验失败）即 break 并触发回退；但首启动 `rc.local`（apk 装 OpenClash+还原订阅）可能未跑完 → 0 节点误判 → 不必要回退。现 RC=1 也重试（12×10s），连续失败才回退。
+5. **FALLBACK_ITB 锚定 + 快照防堆积（修复 #5）**：`FALLBACK_ITB` 由过时的 9/16 锚到当前运行版本 10/16（本地已确认该 itb 存在）；`backup_config` 失败告警强化（提示失去本机唯一配置级回退点）；新增 `prune_old_backups()` 仅保留最近 10 份 `pre-upg-*` 快照，避免 `backups/` 无限膨胀。
+
+验证：`bash -n` 语法通过；`--dry-run` 只读预演确认沉淀闸在 `<72h` 时正确告警、回退镜像自动匹配 10/16、全流程无报错退出。未做真实刷机。
+
 ## 收尾
 - 升级后改默认密码：`ssh <路由器地址> 'passwd root'`。
 
