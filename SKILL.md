@@ -141,6 +141,24 @@ agent_created: true
 
 验证：`bash -n` 语法通过；`--dry-run` 只读预演确认沉淀闸在 `<72h` 时正确告警、回退镜像自动匹配 10/16、全流程无报错退出。未做真实刷机。
 
+## 🔧 升级风险复评后新暴露的 3 项修复（2026-11-04，实证 dry-run + GitHub API）
+
+11-03 路由器发生一次原因未明的卡死 + 异常硬复位；11-04 复评升级风险时，用 `--dry-run` 与 GitHub API 实证出 3 个此前未覆盖的问题，已全部代码级修复（**仍未执行真实刷机**）：
+
+1. **P0 · 静默 fallback 会白刷成当前版本**：`resolve_target_itb()` 原先在"官方 itb 本地不存在"时退回 `ls -t` 最新 itb；本地只有 9/16、9/23、10/16，于是静默选中 **1016（正在跑的版本）**——完整全清刷一遍收益为零、风险全担，回退镜像还是同一个。修复：删除 mtime 兜底，按官方元数据精确选片；本地缺失时真实执行自动下载（带官方 digest 校验），解析不出直接 fail-closed。另加**同版本白刷保护**（比对路由器 `DISTRIB_REVISION` 与目标 itb 的 commit 前 8 位）作为独立第二道闸。
+2. **P1 · 1029 缺 `sha256sums` 导致校验路径断裂 + `--force` 危险耦合**：该 release 只有 1 个 itb 资产、无校验文件，旧代码 `EXPECT_SHA` 取不到就 `die`，很容易让人顺手加 `--force`——而旧版 `--force` 会**同时关掉 sha256 完整性校验**（防 WiFi 传坏变砖最关键一环）并绕过沉淀闸。修复：① 新增 `official_asset_meta()`，用 **GitHub API 原生 `asset.digest`**（`sha256:...`，官方外部基准）替代缺失的 sha256sums；`derive_expect_sha()` 优先级 `--expect-sha` > 最新 asset digest > 按文件名查历史 asset digest > sha256sums。② `--force` **窄化为仅跳过 72h 沉淀闸**，校验段零引用；有基准但不匹配时**任何参数都不放行**，完全无基准才可用 `--allow-unverified-sha` 自担风险。③ `router_watch.sh` 无 sums 时不再静默跳过独立校验，改用 digest 兜底，两者皆无则 fail-closed。
+3. **P1 · 近期异常硬复位抬高刷机窗口风险**：刷机是往 UBI 写数据的几分钟窗口，卡死根因未明时若复发（断电/网口锁死）即半写变砖，且 T2 兜底（HTTP Recovery 由 chainloader 提供）在供电/硬件级故障时可能一起失效。修复：新增 `precheck_recent_crash()`——本次启动带 `UBIFS recovery`（上次非正常关机）且 `uptime < 48h` 时默认拒绝刷机，需显式 `--allow-recent-crash`；dry-run 仅告警。
+
+**配套一致性修复**：
+- 沉淀闸从"校验官方最新 release"改为**绑定到实际待刷 ITB**（仅当两者同一镜像时用其所属 release 的 `published_at` 校验），堵住"闸校验 A、实际刷 B"的缝隙。
+- `gh api` 加 3 次重试（实测过一次瞬时 `EOF`）。
+- ⚠️ 踩坑固化：**bash `read` 把 tab 当 IFS 空白会折叠连续分隔符** —— `sums_url` 为空时后续字段整体左移，digest 被误读成 URL 去下载。现 jq 用 `NONE` 占位、read 后归一化。
+- 新参数：`--allow-same-version` / `--allow-recent-crash` / `--allow-unverified-sha`，每个危险动作独立显式开关，不再一个 `--force` 全放开。
+
+**实测验证（全部只读）**：`bash -n` 双脚本通过；`router_watch.sh --check` 下载 1029 itb（46M）并用官方 digest 独立校验通过（`a5a22cf0…10d`）；`upgrade_router.sh --dry-run` 确认目标为 `8f57dd40`（不再是 `1a34e17c`）、沉淀闸 98h 通过、版本递增校验通过、近期异常复位预检告警、回退镜像自动匹配 1016；显式 `--itb 1016` 时同版本保护正确命中；历史 itb 也能按文件名取到官方 digest。
+
+> 当前状态：1029 已备料且校验通过，但 11-03 卡死未满 48h 观察窗，**真实执行仍会被 `precheck_recent_crash` 拦下**。要升需先过观察窗，或显式 `--allow-recent-crash` 自担风险。
+
 ## 收尾
 - 升级后改默认密码：`ssh <路由器地址> 'passwd root'`。
 

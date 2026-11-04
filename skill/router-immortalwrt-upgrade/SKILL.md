@@ -1,6 +1,6 @@
 ---
 name: router-immortalwrt-upgrade
-description: 安全地对 Gemtek XR1710G（Brightspeed）路由器做 ImmortalWrt 第三方构建（naoki66）的全清刷升级，含 uci-defaults 首启动自举 + 多层防变砖保障。当用户说"升级路由器固件""升 9/x 固件""路由器刷机"或要复用这套升级套件时使用。覆盖：预飞门控、uci-defaults 自举脚本、Mac 侧编排器、6 个已固化的 P0 陷阱（chpasswd 缺失 / tar uid 污染 dropbear / SSH host key 变更 / fw_env.config stale mtd0 / apk 时机 / OpenClash 启动开关），以及 OpenClash 日常排障（入口 IP 被封诊断、订阅三层闸门、自定义规则持久化）。
+description: 安全地对 Gemtek XR1710G（Brightspeed）路由器做 ImmortalWrt 第三方构建（naoki66）的全清刷升级，含 uci-defaults 首启动自举 + 多层防变砖保障。当用户说"升级路由器固件""升 9/x 固件""路由器刷机"或要复用这套升级套件时使用。覆盖：预飞门控、uci-defaults 自举脚本、Mac 侧编排器、全清还原范围（配置/脚本/补丁/启用态）审计法、以及 6 个已固化的 P0 陷阱（chpasswd 缺失 / tar uid 污染 dropbear / SSH host key 变更 / fw_env.config stale mtd0 / apk 时机 / busybox tar 无 --exclude）。
 agent_created: true
 ---
 
@@ -128,6 +128,36 @@ agent_created: true
 - **日志持久化 + 结构化报告（P3）**：`archive_logs()` 改为归档到 `~/router-upgrade-logs/<时间戳>/`（不再只存易失的 `/tmp`）；新增 `post_upgrade_report()` 生成 Markdown 报告——版本/外网直连 DNS/三频/OpenClash 进程+内核/DHCP 静态租约数/fw4 check/配置持久化（uci changes 空），升级结束与回退后各生成一份，一眼看清"到底恢复全了没"。
 - **发布即校验固化（P3）**：仓库提供 `publish_to_github.sh`——提交→推送后，强制用 `gh api` 拉回每个文件的 blob 与本地 `diff`，非空且一致才算发布成功，杜绝空文件/截断事故（见该脚本）。
 - **OpenClash 订阅数据还原兜底（P1 后补）**：`sysupgrade -n -f` 全清刷后，`zzz-restore` 的 `rc.local` 里 `apk add luci-app-openclash` **重装会清空 `/etc/openclash/config`**，曾导致实机升级后订阅丢失（只能从升级前快照回拷）。现 `collect_runtime()` 在刷前把活路由 OpenClash 数据（**除 57MB 内核**，避免 kit 膨胀）另存进 kit 的 `etc/zzz-oc-data/`（`apk add` 不触碰此路径）；`zzz-restore` 在 `apk add` 之后、启动 OpenClash **之前**据此原样还原，并清掉 macOS `._` 垃圾文件。与内核的 kit 烘焙+运行时下载兜底一起，构成"内核+订阅"双保险。
+
+## 🔧 残留风险修复记录（2026-11-02，代码级审计的 5 项加固）
+
+对升级/备份流程做了一轮代码级审计，堵住此前定性评估遗留的 5 处残留风险（均非"变砖级"，最差是"升级没成自动退回旧版"）：
+
+1. **配置保真度独立校验（修复 #1）**：新增 `config_fidelity_check()`。`verify_router` 此前只查连通性/节点数/信道/DHCP 条数/`uci changes`，不比对"还原前后 `/etc/config` 是否一致"。现用升级前 `sysupgrade -b` 快照对比升级后运行态 `/etc/config`（SHA256 逐文件比对），暴露"抓进 kit 但首启动未还原"的漂移。非 fail-closed，仅告警不回退，`post_upgrade_report` 自动调用。
+2. **72h 沉淀闸兜底（修复 #2）**：此前手动跑 `upgrade_router.sh`（不带 `--itb`）会经 `resolve_target_itb` 自动选官方最新 release，绕过 `router_watch.sh` 的 72h 闸。现补同一道闸——无 `--itb` 且非 `--force` 时取 release 发布时间，`<72h` 真实执行直接 fail-closed 拒绝（dry-run 仅告警）。强制二选一：`--itb` 指定已确认版本 / `--force` 跳过。
+3. **回退误报修复（修复 #3）**：新增 `verify_rollback()` 取代 `auto_rollback` 里误用的 `verify_router`。旧逻辑拿新 commit 比对刚刷回的旧固件，必然判 FAIL 误报"回退后仍失败"。现判据：已回到非目标旧版本 + 外网通 + 三频启用。
+4. **慢首启动误回退修复（修复 #4）**：`--auto` 强终验原在首次 `verify` 返回 RC=1（连上但终验失败）即 break 并触发回退；但首启动 `rc.local`（apk 装 OpenClash+还原订阅）可能未跑完 → 0 节点误判 → 不必要回退。现 RC=1 也重试（12×10s），连续失败才回退。
+5. **FALLBACK_ITB 锚定 + 快照防堆积（修复 #5）**：`FALLBACK_ITB` 由过时的 9/16 锚到当前运行版本 10/16（本地已确认该 itb 存在）；`backup_config` 失败告警强化（提示失去本机唯一配置级回退点）；新增 `prune_old_backups()` 仅保留最近 10 份 `pre-upg-*` 快照，避免 `backups/` 无限膨胀。
+
+验证：`bash -n` 语法通过；`--dry-run` 只读预演确认沉淀闸在 `<72h` 时正确告警、回退镜像自动匹配 10/16、全流程无报错退出。未做真实刷机。
+
+## 🔧 升级风险复评后新暴露的 3 项修复（2026-11-04，实证 dry-run + GitHub API）
+
+11-03 路由器发生一次原因未明的卡死 + 异常硬复位；11-04 复评升级风险时，用 `--dry-run` 与 GitHub API 实证出 3 个此前未覆盖的问题，已全部代码级修复（**仍未执行真实刷机**）：
+
+1. **P0 · 静默 fallback 会白刷成当前版本**：`resolve_target_itb()` 原先在"官方 itb 本地不存在"时退回 `ls -t` 最新 itb；本地只有 9/16、9/23、10/16，于是静默选中 **1016（正在跑的版本）**——完整全清刷一遍收益为零、风险全担，回退镜像还是同一个。修复：删除 mtime 兜底，按官方元数据精确选片；本地缺失时真实执行自动下载（带官方 digest 校验），解析不出直接 fail-closed。另加**同版本白刷保护**（比对路由器 `DISTRIB_REVISION` 与目标 itb 的 commit 前 8 位）作为独立第二道闸。
+2. **P1 · 1029 缺 `sha256sums` 导致校验路径断裂 + `--force` 危险耦合**：该 release 只有 1 个 itb 资产、无校验文件，旧代码 `EXPECT_SHA` 取不到就 `die`，很容易让人顺手加 `--force`——而旧版 `--force` 会**同时关掉 sha256 完整性校验**（防 WiFi 传坏变砖最关键一环）并绕过沉淀闸。修复：① 新增 `official_asset_meta()`，用 **GitHub API 原生 `asset.digest`**（`sha256:...`，官方外部基准）替代缺失的 sha256sums；`derive_expect_sha()` 优先级 `--expect-sha` > 最新 asset digest > 按文件名查历史 asset digest > sha256sums。② `--force` **窄化为仅跳过 72h 沉淀闸**，校验段零引用；有基准但不匹配时**任何参数都不放行**，完全无基准才可用 `--allow-unverified-sha` 自担风险。③ `router_watch.sh` 无 sums 时不再静默跳过独立校验，改用 digest 兜底，两者皆无则 fail-closed。
+3. **P1 · 近期异常硬复位抬高刷机窗口风险**：刷机是往 UBI 写数据的几分钟窗口，卡死根因未明时若复发（断电/网口锁死）即半写变砖，且 T2 兜底（HTTP Recovery 由 chainloader 提供）在供电/硬件级故障时可能一起失效。修复：新增 `precheck_recent_crash()`——本次启动带 `UBIFS recovery`（上次非正常关机）且 `uptime < 48h` 时默认拒绝刷机，需显式 `--allow-recent-crash`；dry-run 仅告警。
+
+**配套一致性修复**：
+- 沉淀闸从"校验官方最新 release"改为**绑定到实际待刷 ITB**（仅当两者同一镜像时用其所属 release 的 `published_at` 校验），堵住"闸校验 A、实际刷 B"的缝隙。
+- `gh api` 加 3 次重试（实测过一次瞬时 `EOF`）。
+- ⚠️ 踩坑固化：**bash `read` 把 tab 当 IFS 空白会折叠连续分隔符** —— `sums_url` 为空时后续字段整体左移，digest 被误读成 URL 去下载。现 jq 用 `NONE` 占位、read 后归一化。
+- 新参数：`--allow-same-version` / `--allow-recent-crash` / `--allow-unverified-sha`，每个危险动作独立显式开关，不再一个 `--force` 全放开。
+
+**实测验证（全部只读）**：`bash -n` 双脚本通过；`router_watch.sh --check` 下载 1029 itb（46M）并用官方 digest 独立校验通过（`a5a22cf0…10d`）；`upgrade_router.sh --dry-run` 确认目标为 `8f57dd40`（不再是 `1a34e17c`）、沉淀闸 98h 通过、版本递增校验通过、近期异常复位预检告警、回退镜像自动匹配 1016；显式 `--itb 1016` 时同版本保护正确命中；历史 itb 也能按文件名取到官方 digest。
+
+> 当前状态：1029 已备料且校验通过，但 11-03 卡死未满 48h 观察窗，**真实执行仍会被 `precheck_recent_crash` 拦下**。要升需先过观察窗，或显式 `--allow-recent-crash` 自担风险。
 
 ## 收尾
 - 升级后改默认密码：`ssh <路由器地址> 'passwd root'`。

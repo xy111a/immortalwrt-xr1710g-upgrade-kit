@@ -10,7 +10,7 @@
 #
 # 用法:
 #   router_watch.sh          # 自动模式: 检测+安全闸+必要时升级
-#   router_watch.sh --force  # 跳过"发布满72h"闸, 立即升级 (手动测试新版本用)
+#   router_watch.sh --force  # 仅跳过"发布满72h"闸 (2026-11-04: 不再关闭 sha256 校验)
 #   router_watch.sh --check  # 只检测报告, 绝不升级 (默认无开关文件时等价)
 #
 # 可由 launchd / WorkBuddy 定时自动化按需调用（本仓库不含 plist, 按需自行配置调度）
@@ -65,9 +65,20 @@ log "当前固件 commit: $cur_hash"
 # 上游把 XG2010G 机型 build 设为 GitHub "Latest", releases/latest 不含 XR1710G 固件;
 # 故遍历全部 releases(默认按时间倒序), 取首个含 gemtek_xr1710g itb 的 release, 单次 gh 调用取齐四字段(TSV)
 # (gojq 子集不支持 any(.name; test()), 改用 any(.assets[]; .name|test()) 存在量词写法)
-REL_TSV=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0] | [.tag_name, .published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name=="sha256sums")) | .[0].browser_download_url)] | @tsv' 2>/dev/null)
-[ -n "$REL_TSV" ] || { log "❌ 未找到含 XR1710G 固件的 release (仓库可能改名或上游未发布 XR1710G build)"; exit 1; }
-IFS=$'\t' read -r rel_tag pub itb_url sums_url <<< "$REL_TSV"
+# 2026-11-04: 增加第 5 字段 asset.digest。上游 1029 release 没附 sha256sums, 但 GitHub API
+#   自带官方 asset digest, 可作同等强度的独立校验基准, 避免"无 sums 就静默跳过校验"。
+REL_TSV=""
+for _try in 1 2 3; do
+  REL_TSV=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0] | [.tag_name, .published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name=="sha256sums")) | .[0].browser_download_url // "NONE"), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].digest // "NONE")] | @tsv' 2>/dev/null)
+  [ -n "$REL_TSV" ] && break
+  sleep 2
+done
+[ -n "$REL_TSV" ] || { log "❌ 未找到含 XR1710G 固件的 release (仓库改名/上游未发布 XR1710G build/网络异常)"; exit 1; }
+# ⚠️ bash 的 read 把 tab 视为 IFS 空白, 会折叠连续分隔符 —— 1029 release 缺 sha256sums
+#   (第 4 字段为空) 时字段会整体左移, digest 被误读进 sums_url。故 jq 用 NONE 占位再归一化。
+IFS=$'\t' read -r rel_tag pub itb_url sums_url itb_digest <<< "$REL_TSV"
+[ "$sums_url" = "NONE" ] && sums_url=""
+[ "$itb_digest" = "NONE" ] && itb_digest=""
 [ -n "$rel_tag" ] || { log "❌ 无法获取 release (gh 未登录/限流/无网络?)"; exit 1; }
 rel_hash=$(printf '%s' "$rel_tag" | grep -oE '[0-9a-f]{7,40}$')
 log "最新 release: $rel_tag (发布 $pub)"
@@ -106,19 +117,30 @@ else
 fi
 expect=""
 if [ -n "$sums_url" ]; then
-  curl -fL "$sums_url" -o "$PREP_DIR/sha256sums" || log "⚠️ sha256sums 下载失败, 跳过独立校验"
-  expect=$(grep -F "$itb_name" "$PREP_DIR/sha256sums" 2>/dev/null | awk '{print $1}')
-  if [ -n "$expect" ]; then
-    act=$(shasum -a 256 "$local_itb" | awk '{print $1}')
-    if [ "$expect" != "$act" ]; then
-      log "❌ sha256 不匹配 (期望 $expect 实得 $act) — 中止, 可能下载被篡改/损坏"
-      rm -f "$local_itb"
-      exit 1
-    fi
-    log "✅ itb 独立 sha256 校验通过 ($expect)"
+  if curl -fL "$sums_url" -o "$PREP_DIR/sha256sums" 2>/dev/null; then
+    expect=$(grep -F "$itb_name" "$PREP_DIR/sha256sums" 2>/dev/null | awk '{print $1}' | head -1)
+    [ -z "$expect" ] && log "⚠️ sha256sums 中无 $itb_name 的校验行, 转用 GitHub asset digest"
   else
-    log "⚠️ sha256sums 中未找到 $itb_name 的校验行, 跳过独立校验 (仍依赖路由器侧复核)"
+    log "⚠️ sha256sums 下载失败, 转用 GitHub 官方 asset digest"
   fi
+fi
+# 2026-11-04 修复: 旧逻辑在 sums_url 为空时整段跳过独立校验(静默降级)。现用 GitHub 官方
+#   asset.digest 兜底; 两者都拿不到则 fail-closed, 绝不在无外部基准的情况下放行刷机。
+if [ -z "$expect" ] && [ -n "${itb_digest:-}" ]; then
+  expect="${itb_digest#sha256:}"
+  log "ℹ️ 该 release 无 sha256sums, 改用 GitHub 官方 asset digest 作独立基准"
+fi
+act=$(shasum -a 256 "$local_itb" | awk '{print $1}')
+if [ -z "$expect" ]; then
+  log "❌ 拿不到任何官方 sha256 基准(无 sha256sums 且无 asset digest), 拒绝备料/升级"
+  rm -f "$local_itb"
+  exit 1
+elif [ "$expect" != "$act" ]; then
+  log "❌ sha256 不匹配 (官方基准 $expect 实得 $act) — 中止, 可能下载被篡改/损坏"
+  rm -f "$local_itb"
+  exit 1
+else
+  log "✅ itb 独立 sha256 校验通过 ($expect)"
 fi
 
 # ---------- 6. (已移除) EXPECT_SHA/FW_NEW 同步 -----
@@ -137,5 +159,6 @@ fi
 
 # ---------- 8. 触发升级 (--auto: 强终验失败自动回退) ----------
 log "🚀 触发升级 (--auto)"
+# --force 语义已窄化为"仅跳 72h 沉淀闸"; upgrade_router.sh 的 sha256 完整性校验始终生效
 "$PREP_DIR/upgrade_router.sh" --auto ${FORCE:+--force} --router "$ROUTER"
 log "=== watch 流程结束 ==="
