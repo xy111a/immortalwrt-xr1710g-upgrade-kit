@@ -70,8 +70,17 @@ else
 fi
 
 echo "=== 推送 (绕过本地出网代理, 走 gh 通道) ==="
-# 注意: 不能写 `if git push | tail; then` —— 管道会取 tail 的退出码, git push 失败也被误判成功(2026-10-28 实踩)。
-push_out=$(env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" push origin main 2>&1); push_rc=$?
+# 注意: 不能写 `if git push | tail; then` —— 管道会取 tail 的退出码(2026-10-28 实踩)。
+# 2026-11-04 实踩: GitHub 偶发 `fatal error in commit_refs` 服务端瞬时故障。单次失败就回退到
+# gh api 逐文件 PUT, 结果制造 6 条内容零变化的空提交、且部分大文件 PUT 失败 → 历史污染 + 发布不完整。
+# 现在先重试 3 次(间隔 2s); 实测该故障重试第 1 次即恢复。只有连续 3 次失败才回退 PUT。
+push_rc=1; push_out=""
+for attempt in 1 2 3; do
+  push_out=$(env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" push origin main 2>&1); push_rc=$?
+  if [ "$push_rc" -eq 0 ]; then break; fi
+  echo "⚠️ git push 第 $attempt 次失败(rc=$push_rc): $(printf '%s' "$push_out" | tail -1)"
+  [ "$attempt" -lt 3 ] && sleep 2
+done
 printf '%s\n' "$push_out" | tail -5
 if [ "$push_rc" -eq 0 ]; then
   echo "✅ git push 成功"
@@ -79,16 +88,27 @@ else
   echo "⚠️ git push 失败(rc=$push_rc), 回退到 gh api PUT 逐文件发布..."
   for f in $FILES; do
     [ -f "$SRC/$f" ] || continue
-    _b64=$(base64 < "$SRC/$f" | tr -d '\n')
     _sha=$(gh api "repos/$REPO/contents/$f?ref=main" --jq '.sha' 2>/dev/null || true)
-    _msg="chore: 同步 $f (发布即校验)"
-    if [ -n "$_sha" ] && [ "$_sha" != "null" ]; then
-      gh api -X PUT "repos/$REPO/contents/$f" -f message="$_msg" -f content="$_b64" -f sha="$_sha" >/dev/null 2>&1 \
-        && echo "  ✓ PUT(更新) $f" || echo "  ❌ PUT 失败: $f"
-    else
-      gh api -X PUT "repos/$REPO/contents/$f" -f message="$_msg" -f content="$_b64" >/dev/null 2>&1 \
-        && echo "  ✓ PUT(新建) $f" || echo "  ❌ PUT 失败: $f"
+    # 2026-11-04: 跳过内容未变化的文件。GitHub Contents API 即使内容相同也会创建一条空提交,
+    # 瞬时故障回退时会在历史里塞进一堆无意义 commit(本次 6 条即由此而来)。
+    # Contents API 的 .sha 就是 git blob sha1, 可直接与 git hash-object 比对, 不依赖 content 字段(偶发返回空)。
+    _local_blob=$(git hash-object "$SRC/$f" 2>/dev/null)
+    if [ -n "$_local_blob" ] && [ "$_local_blob" = "$_sha" ]; then
+      echo "  - 跳过(内容未变化): $f"; continue
     fi
+    _b64=$(base64 < "$SRC/$f" | tr -d '\n')
+    _msg="chore: 同步 $f (发布即校验)"
+    _put_ok=0
+    for _try in 1 2; do
+      if [ -n "$_sha" ] && [ "$_sha" != "null" ]; then
+        gh api -X PUT "repos/$REPO/contents/$f" -f message="$_msg" -f content="$_b64" -f sha="$_sha" >/dev/null 2>&1 && _put_ok=1
+      else
+        gh api -X PUT "repos/$REPO/contents/$f" -f message="$_msg" -f content="$_b64" >/dev/null 2>&1 && _put_ok=1
+      fi
+      [ "$_put_ok" = "1" ] && break
+      sleep 1
+    done
+    [ "$_put_ok" = "1" ] && echo "  ✓ PUT $f" || echo "  ❌ PUT 失败: $f"
   done
 fi
 
