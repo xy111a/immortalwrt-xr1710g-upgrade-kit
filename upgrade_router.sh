@@ -5,7 +5,7 @@
 #   T0 预防: 路由器首启动经 uci-defaults 自举, 恢复到用户配置的 LAN 地址 + 原 SSID, 刷机窗口内 Mac 无需人工接手
 #   T1 检测: 本脚本轮询重连 + 终验
 #   T2 恢复: U-Boot 常住兜底 bootcmd=run boot_ubi || http_recovery (已实测在位) -> 刷坏自动进 Recovery, 免拆机
-#   T3 回退: 刷前自动解析当前运行版本的本地 itb 作为回退镜像 (见 resolve_rollback); 无匹配时退回 FALLBACK_ITB(9/1, 仅最后兜底)
+#   T3 回退: 刷前自动解析当前运行版本的本地 itb 作为回退镜像 (见 resolve_rollback); 无匹配时退回 FALLBACK_ITB(10/16, 仅最后兜底)
 #
 # 用法:
 #   ./upgrade_router.sh            # 真正执行升级 (会触发路由器重启)
@@ -29,13 +29,20 @@ export COPYFILE_DISABLE=1
 # ---------- 参数解析 ----------
 #   --dry-run  只校验前置条件 + 打印将执行步骤, 不刷机
 #   --auto     强终验失败自动回退 (供 router_watch.sh 调用)
-#   --force    忽略 EXPECT_SHA 不匹配强制刷 (仅紧急恢复用, 慎用)
+#   --force    仅跳过"发布满 72h"沉淀闸 (2026-11-04 窄化: 不再关闭 sha256 完整性校验)
+#   --allow-same-version    允许重刷"当前正在运行的版本"(默认拒绝, 防白刷)
+#   --allow-recent-crash    允许在近期异常硬复位(UBIFS recovery)后刷机 (默认拒绝)
+#   --allow-unverified-sha  仅在"完全拿不到任何官方基准"时允许无校验刷入 (有基准但不匹配永远拒绝)
 DRY=0; AUTO=0; FORCE=0; ROUTER_OVERRIDE=""; ITB_OVERRIDE=""; EXPECT_SHA_OVERRIDE=""
+ALLOW_SAME_VERSION=0; ALLOW_RECENT_CRASH=0; ALLOW_UNVERIFIED_SHA=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1;;
     --auto)    AUTO=1;;
     --force)   FORCE=1;;
+    --allow-same-version)   ALLOW_SAME_VERSION=1;;
+    --allow-recent-crash)   ALLOW_RECENT_CRASH=1;;
+    --allow-unverified-sha) ALLOW_UNVERIFIED_SHA=1;;
     --router)  ROUTER_OVERRIDE="${2:-}"; shift;;
     --router=*) ROUTER_OVERRIDE="${1#*=}";;
     --itb)     ITB_OVERRIDE="${2:-}"; shift;;
@@ -116,6 +123,32 @@ precheck_executor_location(){
       die "非交互环境无法判定拓扑, 为安全中止"
     fi
   fi
+}
+
+# 近期异常硬复位预检(2026-11-04 新增, 对应 11-03 卡死事件):
+# 刷机 = 往 UBI 分区写数据的数分钟窗口。若设备刚发生过原因未明的卡死/异常复位, 此刻刷机
+# 一旦复发(断电/网口锁死)就是半写变砖; 且 T2 兜底(HTTP Recovery 由 chainloader 提供)在
+# 供电/硬件级故障时也可能一起失效。故本次启动若带 UBIFS recovery(上次非正常关机)且
+# uptime < 48h, 默认拒绝刷机, 需显式 --allow-recent-crash 才放行。
+precheck_recent_crash(){
+  echo "---- 近期异常复位预检 ----"
+  if [ "$ALLOW_RECENT_CRASH" = "1" ]; then
+    echo "⚠️ 已由 --allow-recent-crash 显式放行(自担风险)"; return 0
+  fi
+  local info rec up_h up_int
+  info=$(ssh -o ConnectTimeout=8 "$ROUTER" 'r=$(dmesg 2>/dev/null | grep -ci "UBIFS.*recovery needed"); u=$(cut -d" " -f1 /proc/uptime); printf "%s %s\n" "${r:-0}" "${u:-0}"' 2>/dev/null)
+  rec=$(printf '%s' "$info" | awk '{print $1}')
+  up_h=$(printf '%s' "$info" | awk '{printf "%.1f", $2/3600}')
+  up_int=$(printf '%s' "${up_h:-0}" | cut -d. -f1)
+  echo "本次启动 UBIFS recovery 标志: ${rec:-?}; uptime: ${up_h:-?}h"
+  if [ "${rec:-0}" -gt 0 ] && [ "${up_int:-999}" -lt 48 ]; then
+    if [ "$DRY" = "1" ]; then
+      echo "⚠️ [dry-run] 检测到近期异常硬复位(uptime ${up_h}h <48h), 真实执行时本脚本会拒绝刷机"
+      return 0
+    fi
+    die "🛑 设备近期发生过异常硬复位(UBIFS recovery 为证, uptime 仅 ${up_h}h), 根因未查明。为避免刷写窗口内复发导致半写变砖, 已中止。建议: 先稳定观察 48h / 补远程 syslog 抓根因, 或显式加 --allow-recent-crash 自担风险。"
+  fi
+  echo "✅ 无近期异常复位痕迹(或已超过 48h 观察窗)"
 }
 
 # 升级日志持久化(P3): 归档到固定目录而非易失的 /tmp, 升级当次及日后复盘均可追溯
@@ -223,23 +256,62 @@ post_upgrade_report(){
   echo "📄 已生成升级后结构化报告: $rep"
 }
 
-# 解析待刷 itb: 优先级 --itb > 官方最新 release tag 本地匹配 > ls -t 最新(带警告)
-# 不依赖 mtime 选 target, 避免回退 itb 比目标新时被误选为刷机目标
-resolve_target_itb(){
-  [ -n "$ITB_OVERRIDE" ] && { [ -f "$ITB_OVERRIDE" ] && { printf '%s' "$ITB_OVERRIDE"; return 0; } || { echo "❌ --itb 指定文件不存在: $ITB_OVERRIDE" >&2; return 1; }; }
-  # 直接取官方最新 release 的 itb 资源名精确匹配(与 router_watch.sh 选源一致);
-  # 注意: release tag 的哈希与 itb 文件名内的 commit 哈希不同, 不能靠 tag 哈希去 grep 文件名
-  local name itb
-  # 上游把 XG2010G 机型 build 设为 GitHub "Latest", releases/latest 不含 XR1710G 固件; 改遍历 releases 取首个含 gemtek_xr1710g itb 的 release
-  # (gojq 子集不支持 any(.name; test()), 改用 any(.assets[]; .name|test()) 存在量词写法)
-  name=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0].assets[] | select(.name|test("gemtek_xr1710g")) | .name' 2>/dev/null | head -1)
-  if [ -n "$name" ] && [ -f "$PREP_DIR/$name" ]; then
-    printf '%s' "$PREP_DIR/$name"; return 0
+# ---------- 官方 release 元数据(2026-11-04 新增) ----------
+# 一次 gh 调用取齐"首个含 XR1710G itb 的 release"中该 itb 的: 发布时间 / 文件名 / 下载地址 /
+# GitHub 官方 asset digest(sha256:...)。digest 是 GitHub 官方提供的外部基准, 可替代缺失的
+# sha256sums 文件(1029 release 就没附, 只有 1 个 itb 资产)。
+# 目标选片、沉淀闸、完整性校验三者全部绑定到同一份元数据, 杜绝"闸校验 A、实际刷 B"的缝隙。
+OFFICIAL_ITB_PUB=""; OFFICIAL_ITB_NAME=""; OFFICIAL_ITB_URL=""; OFFICIAL_ITB_SHA=""
+official_asset_meta(){
+  command -v gh >/dev/null 2>&1 || return 1
+  local tsv try
+  for try in 1 2 3; do
+    # 上游把 XG2010G 设为 GitHub "Latest", 故遍历 releases 取首个含 gemtek_xr1710g itb 的 release
+    # (gojq 子集不支持 any(.name; test()), 用 any(.assets[]; .name|test()) 存在量词写法)
+    tsv=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0] | [.published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].name), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].digest // "NONE")] | @tsv' 2>/dev/null | head -1)
+    [ -n "$tsv" ] && break
+    sleep 2
+  done
+  [ -n "$tsv" ] || return 1
+  # 同 router_watch.sh: NONE 占位防 IFS=tab 折叠空字段
+  IFS=$'\t' read -r OFFICIAL_ITB_PUB OFFICIAL_ITB_NAME OFFICIAL_ITB_URL OFFICIAL_ITB_SHA <<< "$tsv"
+  [ "$OFFICIAL_ITB_SHA" = "NONE" ] && OFFICIAL_ITB_SHA=""
+  OFFICIAL_ITB_SHA="${OFFICIAL_ITB_SHA#sha256:}"
+  [ -n "$OFFICIAL_ITB_NAME" ] || return 1
+  return 0
+}
+official_asset_meta || echo "⚠️ 无法读取官方 release 元数据(gh 未登录/限流/网络抖动); 自动选片与官方基准不可用, 仅 --itb 显式指定可用"
+
+# 官方目标 itb 本地缺失时自动下载并用官方 digest 校验(仅真实执行; dry-run 不下载)。
+download_official_itb(){
+  local dest="$PREP_DIR/$OFFICIAL_ITB_NAME" act
+  [ -f "$dest" ] && { printf '%s' "$dest"; return 0; }
+  [ -n "$OFFICIAL_ITB_URL" ] || { echo "❌ 无官方 itb 下载地址" >&2; return 1; }
+  [ -n "$OFFICIAL_ITB_SHA" ] || { echo "❌ 无官方 digest 基准, 拒绝下载无校验镜像" >&2; return 1; }
+  echo "⬇️ 官方目标 itb 本地缺失, 自动下载: $OFFICIAL_ITB_NAME"
+  if ! curl -fL --max-time 300 "$OFFICIAL_ITB_URL" -o "$dest" 2>/dev/null || [ ! -s "$dest" ]; then
+    rm -f "$dest"; echo "❌ 下载失败" >&2; return 1
   fi
-  # 兜底: 取最新 mtime 的 itb, 但可能误选回退镜像, 仅警告(本地未下载最新版时)
-  itb=$(ls -t "$PREP_DIR"/*.itb 2>/dev/null | head -1)
-  [ -n "$itb" ] && { echo "⚠️ 未能从官方 release 解析目标 itb(本地可能未下载最新版), 退回按 mtime 选最新(可能误选回退镜像): $(basename "$itb")" >&2; printf '%s' "$itb"; return 0; }
-  return 1
+  act=$(shasum -a 256 "$dest" 2>/dev/null | awk '{print $1}')
+  if [ "$act" != "$OFFICIAL_ITB_SHA" ]; then
+    rm -f "$dest"; echo "❌ 下载镜像与 GitHub 官方 digest 不符(可能被篡改/截断), 已删除" >&2; return 1
+  fi
+  echo "✅ 已下载并通过 GitHub 官方 digest 校验: $act"
+  printf '%s' "$dest"; return 0
+}
+
+# 解析待刷 itb: 优先级 --itb > 官方最新 release 的 xr1710g itb(本地缺失则真实执行自动下载)
+# 2026-11-04 P0 修复: 删除 mtime 兜底。原因: 上游 20261102 把 XG2010G 设为 Latest 后,
+#   本地未下载 1029 时旧的 ls -t 兜底会静默选中 1016(当前正在跑的版本), 导致完整全清刷
+#   一遍却毫无收益, 且回退镜像也是同一个 => 空转 + 全担风险。现改为 fail-closed / 自动下载。
+resolve_target_itb(){
+  if [ -n "$ITB_OVERRIDE" ]; then
+    [ -f "$ITB_OVERRIDE" ] && { printf '%s' "$ITB_OVERRIDE"; return 0; }
+    echo "❌ --itb 指定文件不存在: $ITB_OVERRIDE" >&2; return 1
+  fi
+  [ -n "$OFFICIAL_ITB_NAME" ] || { echo "❌ 无法解析官方目标 itb; 请显式 --itb <已下载并校验的镜像>, 或检查 gh/网络" >&2; return 1; }
+  printf '%s' "$PREP_DIR/$OFFICIAL_ITB_NAME"
+  return 0
 }
 
 # macOS 桌面通知(仅本机提示, 远程无人值守时有反馈); 非 macOS 或无 osascript 时静默
@@ -289,17 +361,27 @@ resolve_router(){
   return 1
 }
 
-ITB=$(resolve_target_itb) || die "找不到待刷 itb (期望 $PREP_DIR/*.itb, 应为最新下载的那个; 或用 --itb 显式指定)"
+ITB=$(resolve_target_itb) || die "找不到待刷 itb (官方目标镜像无法解析; 请用 --itb 显式指定已下载并校验的镜像)"
 [ -f "$KIT" ]    || die "找不到 kit.tar.gz"
+# P0: 官方目标镜像本地缺失时, 真实执行自动下载(官方 digest 校验); dry-run 仅提示。
+#     绝不再"任取一个本地 itb" —— 那会静默刷回当前正在运行的版本(白刷)。
+if [ ! -f "$ITB" ]; then
+  if [ "$DRY" = "1" ]; then
+    echo "⚠️ [dry-run] 官方目标 itb 本地缺失: $(basename "$ITB"); 真实执行将自动下载并用 GitHub 官方 digest 校验"
+  else
+    ITB=$(download_official_itb) || die "官方目标 itb 下载/校验失败, 已中止(绝不退回本地任意 itb, 避免刷回当前版本)"
+  fi
+fi
 
-# ---------- 发布沉淀闸(与 router_watch.sh 一致, 2026-11-02 加固 #2) ----------
-# 背景: 此前手动跑本脚本(不带 --itb)会经 resolve_target_itb 自动选官方最新 release 刷入,
-#   绕过 router_watch.sh 的 72h 闸, 违背"发布满 72h 再升"的纪律。现补同一道闸:
-#   未显式 --itb 且非 --force 时, 取所选 release 的发布时间, <72h 拒绝自动升最新, 强制用户二选一:
-#     (a) 显式 --itb <经过确认的版本文件>  (b) 加 --force 跳过闸(自担风险)。
+# ---------- 发布沉淀闸(2026-11-02 加固 #2; 2026-11-04 绑定实际 ITB) ----------
+# 背景: 手动跑本脚本(不带 --itb)会绕过 router_watch.sh 的 72h 闸。
+#   2026-11-04 补掉的隐蔽缝隙: 旧代码校验的是"官方最新 release 的发布时间", 而实际刷入的
+#   可能是 mtime 兜底选出的旧镜像 —— 闸和镜像根本不是同一个对象。现仅当
+#   "实际待刷 ITB == 官方目标镜像"时, 用该镜像所属 release 的 published_at 校验。
+#   --force 只跳过本闸, 不再影响 sha256 完整性校验(2026-11-04 窄化)。
 #   dry-run 下仅告警不拦截(便于预演); 真实执行则 fail-closed。
-if [ -z "$ITB_OVERRIDE" ] && [ "$FORCE" = "0" ]; then
-  _pub=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0].published_at' 2>/dev/null | head -1)
+if [ -z "$ITB_OVERRIDE" ] && [ "$FORCE" = "0" ] && [ "$(basename "$ITB")" = "$OFFICIAL_ITB_NAME" ]; then
+  _pub="$OFFICIAL_ITB_PUB"
   if [ -n "$_pub" ]; then
     _pub_utc="${_pub/Z/+0000}"
     _pub_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$_pub_utc" +%s 2>/dev/null)
@@ -308,10 +390,12 @@ if [ -z "$ITB_OVERRIDE" ] && [ "$FORCE" = "0" ]; then
       _age=$(( ( _now_epoch - _pub_epoch ) / 3600 ))
       if [ "$_age" -lt 72 ]; then
         if [ "$DRY" = "1" ]; then
-          echo "⚠️ [dry-run] 沉淀闸: 最新 release($_pub) 发布仅 ${_age}h (<72h), 真实执行时本脚本会拒绝自动升最新版, 请显式 --itb 指定已确认版本或加 --force 跳过"
+          echo "⚠️ [dry-run] 沉淀闸: 目标镜像所属 release($_pub) 发布仅 ${_age}h (<72h), 真实执行时本脚本会拒绝自动升最新版"
         else
-          die "🛑 沉淀闸: 最新 release($_pub) 发布仅 ${_age}h (<72h)。为安全, 请勿自动刷最新版。请二选一: (a) 显式 --itb <指定版本 itb 文件> 升级到已确认版本; (b) 加 --force 跳过此闸(自担风险)。"
+          die "🛑 沉淀闸: 目标镜像所属 release($_pub) 发布仅 ${_age}h (<72h)。请二选一: (a) 显式 --itb <指定版本 itb 文件> 升级到已确认版本; (b) 加 --force 跳过此闸(自担风险; 不影响 sha256 完整性校验)。"
         fi
+      else
+        echo "✅ 沉淀闸通过: 目标镜像所属 release 已发布 ${_age}h (>=72h)"
       fi
     fi
   fi
@@ -589,6 +673,29 @@ TARGET_COMMIT=$(basename "$ITB" | grep -oE '[0-9]{6,8}-[0-9a-f]{7,40}' | head -1
 ssh -o ConnectTimeout=8 "$ROUTER" 'echo "路由器可达: $(grep DISTRIB_REVISION /etc/openwrt_release)"' \
   || die "无法 SSH 到路由器 (确认本机已连路由器: WiFi 或有线均可, 且 SSH 地址解析有效; 可用 --router 显式指定或配置 router-target.conf)"
 
+# ---------- 同版本白刷保护(2026-11-04 P0) ----------
+# 路由器 DISTRIB_REVISION 的 commit 是 10 位, itb 文件名里是 8 位, 取前 8 位前缀比对。
+# 即便自动选片/下载逻辑将来再出岔子, 这一层也能独立挡住"完整全清刷一遍却刷回当前版本"。
+CURRENT_COMMIT=$(ssh -o ConnectTimeout=8 "$ROUTER" 'grep DISTRIB_REVISION /etc/openwrt_release 2>/dev/null | grep -oE "[0-9a-f]{7,40}" | tail -1' 2>/dev/null)
+if [ -n "$CURRENT_COMMIT" ] && [ -n "$TARGET_COMMIT" ]; then
+  _cur8=$(printf '%s' "$CURRENT_COMMIT" | cut -c1-8)
+  _tgt8=$(printf '%s' "$TARGET_COMMIT" | cut -c1-8)
+  if [ "$_cur8" = "$_tgt8" ]; then
+    if [ "$ALLOW_SAME_VERSION" = "1" ]; then
+      echo "⚠️ 目标版本($_tgt8) == 当前运行版本, 已由 --allow-same-version 显式放行(仅重刷配置/修复时用)"
+    elif [ "$DRY" = "1" ]; then
+      echo "🛑 [dry-run] 目标版本($_tgt8) == 当前运行版本 —— 真实执行时本脚本会拒绝(白刷: 断网+还原+重装, 收益为零, 风险全担)"
+    else
+      die "🛑 目标版本($_tgt8) 与路由器当前运行版本相同, 拒绝全清刷(收益为零却要承担断网/还原/变砖风险)。若确需重刷同版本, 显式加 --allow-same-version。"
+    fi
+  else
+    echo "✅ 版本递增校验: 当前 $_cur8 → 目标 $_tgt8 (不同, 非白刷)"
+  fi
+fi
+
+# 11-03 卡死事件的流程化缓解: 近期异常硬复位未过 48h 观察窗时拒绝刷机
+precheck_recent_crash
+
 # 解析回退镜像(当前运行版本对应的本地 itb = 自动备份点)
 ROLLBACK=$(resolve_rollback 2>/dev/null)
 if [ -z "$ROLLBACK" ]; then
@@ -631,24 +738,45 @@ scp "$ITB" "$KIT" "$ROUTER:/tmp/" || die "上传失败"
 ACT_SHA=$(ssh -o ConnectTimeout=10 "$ROUTER" "sha256sum /tmp/$(basename "$ITB")" 2>/dev/null | awk '{print $1}')
 [ -n "$ACT_SHA" ] || die "无法在路由器侧计算 itb sha256 (上传可能不完整)"
 
-# EXPECT_SHA 优先级: --expect-sha 显式 > 官方 sha256sums 运行时派生 > 退出(防刷错)
+# EXPECT_SHA 优先级: --expect-sha 显式 > 官方最新 asset digest > 按文件名查历史 asset digest > 官方 sha256sums > 空
+# 2026-11-04 P1 修复: 1029 release 未附 sha256sums 文件(实测只有 1 个 itb 资产), 但 GitHub API
+#   的 asset.digest 就是同一种官方 sha256 基准(sha256:a5a2...)。用它补齐, 不再迫使人工
+#   --expect-sha 或顺手加 --force(旧版 --force 会连带关掉完整性校验, 极危险)。
+#   显式 --itb 指定历史版本时, 按文件名遍历所有 release 找该 asset 的 digest, 保证校验路径不断裂。
 derive_expect_sha(){
-  command -v gh >/dev/null 2>&1 || { echo "  (无 gh CLI, 跳过官方校验, 需 --expect-sha 或 --force)"; return 1; }
-  local sums_url
-  # 取首个含 XR1710G 固件(与待刷 itb 同 release)的 sha256sums, 避免 releases/latest 取到 XG2010G 机型 build
+  local bn jqf d sums_url h
+  bn=$(basename "$ITB")
+  if [ -n "$OFFICIAL_ITB_NAME" ] && [ "$bn" = "$OFFICIAL_ITB_NAME" ] && [ -n "$OFFICIAL_ITB_SHA" ]; then
+    printf '%s' "$OFFICIAL_ITB_SHA"; return 0
+  fi
+  command -v gh >/dev/null 2>&1 || { echo "  (无 gh CLI, 无官方基准)" >&2; return 1; }
+  # 文件名仅含 [A-Za-z0-9._-], 可直接嵌入 jq 字符串
+  jqf=$(printf '[.[] | .assets[] | select(.name == "%s") | (.digest // "NONE")] | .[0] // "NONE"' "$bn")
+  d=$(gh api "repos/$REPO/releases?per_page=100" --jq "$jqf" 2>/dev/null | head -1)
+  if [ -n "$d" ] && [ "$d" != "NONE" ]; then
+    printf '%s' "${d#sha256:}"; return 0
+  fi
   sums_url=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0].assets[] | select(.name=="sha256sums") | .browser_download_url' 2>/dev/null | head -1)
-  [ -n "$sums_url" ] || { echo "  (未找到官方 sha256sums)"; return 1; }
-  curl -fsSL "$sums_url" 2>/dev/null | grep "$(basename "$ITB")" | awk '{print $1}'; return 0
+  [ -n "$sums_url" ] || { echo "  (未找到官方 sha256sums, 且该 ITB 无 asset digest)" >&2; return 1; }
+  h=$(curl -fsSL "$sums_url" 2>/dev/null | grep -F "$bn" | awk '{print $1}' | head -1)
+  [ -n "$h" ] && { printf '%s' "$h"; return 0; }
+  return 1
 }
 if [ -z "$EXPECT_SHA" ]; then
   EXPECT_SHA=$(derive_expect_sha)
 fi
+# 2026-11-04 P1 修复: --force 不再能关闭完整性校验。
+#   (a) 有官方基准但不匹配 => 任何参数都不放行(传坏了就是传坏了, 没有理由刷进去);
+#   (b) 完全拿不到基准     => 仅 --allow-unverified-sha 显式放行;
+#   (c) 匹配              => 通过。
 if [ -n "$EXPECT_SHA" ] && [ "$ACT_SHA" = "$EXPECT_SHA" ]; then
-  echo "✅ itb 完整性校验通过 (sha256 匹配官方, 可安全刷入)"
-elif [ "$FORCE" = "1" ]; then
-  echo "⚠️ itb sha256 未校验(期望 ${EXPECT_SHA:-未知}, 实得 $ACT_SHA), --force 已忽略, 继续刷入"
+  echo "✅ itb 完整性校验通过 (sha256 匹配官方基准: $EXPECT_SHA)"
+elif [ -n "$EXPECT_SHA" ]; then
+  die "itb sha256 校验未通过 (官方基准 $EXPECT_SHA, 实得 $ACT_SHA) — 上传/下载可能损坏或被篡改, 已中止。此错误不可被 --force 跳过, 请重新上传镜像。"
+elif [ "$ALLOW_UNVERIFIED_SHA" = "1" ]; then
+  echo "⚠️ 无任何官方 sha256 基准, 已由 --allow-unverified-sha 显式放行(自担风险); 路由器侧实得 $ACT_SHA"
 else
-  die "itb sha256 校验未通过 (期望 ${EXPECT_SHA:-未能获取官方校验值}, 实得 $ACT_SHA) — 上传可能损坏或无法获取官方校验值; 重试上传, 或用 --force / --expect-sha 跳过"
+  die "无法获取 itb 的官方 sha256 基准(该 release 无 sha256sums 且 GitHub asset digest 不可用)。请用 --expect-sha <官方哈希> 提供基准, 或 --allow-unverified-sha 显式自担风险。"
 fi
 
 # ---------- 设备名兼容性预检(防 -F 误用于异构镜像) ----------
