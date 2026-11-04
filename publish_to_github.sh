@@ -3,6 +3,7 @@
 #
 # 用法:
 #   ./publish_to_github.sh                        # 用默认缓存目录 /tmp/kit_repo
+#   ./publish_to_github.sh -m "feat: 说明本次改动"  # 显式指定提交信息(推荐)
 #   GIT_WORK_DIR=/path/to/repo ./publish_to_github.sh
 #
 # 安全: 只同步白名单内的纯文本源码(SKILL.md + 脚本), 绝不触碰 *.itb / kit.tar.gz / backups/(均不入库)
@@ -21,6 +22,19 @@ WORK="${GIT_WORK_DIR:-/tmp/kit_repo}"
 #   与根目录 SKILL.md 正文必须保持一致 —— 2026-10-30 发现它曾停留在旧版残桩(缺 OpenClash 排障章节),
 #   现同步为最新版, 避免两份文档打架导致平台加载到过期说明。
 FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md skill/router-immortalwrt-upgrade/SKILL.md"
+
+# 2026-11-04 修复: 原先 commit -m 硬编码了一段 R10 文案, 导致之后每次推送的提交信息
+# 都与实际改动不符(11-02 / 11-04 两次推送已受影响)。现在支持 -m/--msg 显式指定;
+# 缺省时按「本次实际改动文件清单 + 日期」动态生成, 杜绝张冠李戴。
+COMMIT_MSG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--msg)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then echo "❌ -m/--msg 需要非空参数"; exit 1; fi
+      COMMIT_MSG="$2"; shift 2 ;;
+    *) echo "⚠️ 忽略未知参数: $1"; shift ;;
+  esac
+done
 
 echo "=== 准备 Git 工作副本: $WORK ==="
 if [ -d "$WORK/.git" ]; then
@@ -47,8 +61,12 @@ env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" add -A
 if env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" diff --cached --quiet 2>/dev/null; then
   echo "ℹ️ 无变更, 无需提交"
 else
-  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "feat(diag): 新增入口IP被封诊断(第8节真实握手/第9节规则防丢/第10节注入校验) + provider模式节点数与延迟读取修正 + 诊断脚本改用ssh stdin传参(避裸单引号截断) + secret-scan新增订阅token规则 (R10)" \
-    && echo "✅ 已提交"
+  if [ -z "$COMMIT_MSG" ]; then
+    _changed=$(env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" diff --cached --name-only 2>/dev/null | paste -sd, - | sed 's/,/, /g')
+    COMMIT_MSG="chore(skill): 同步源码 ($(date +%Y-%m-%d)) — ${_changed:-无文件清单}"
+  fi
+  env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" commit -m "$COMMIT_MSG" \
+    && echo "✅ 已提交: $COMMIT_MSG"
 fi
 
 echo "=== 推送 (绕过本地出网代理, 走 gh 通道) ==="
