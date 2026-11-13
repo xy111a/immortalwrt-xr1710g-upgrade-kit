@@ -4,7 +4,11 @@
 # 安全模型(四层):
 #   T0 预防: 路由器首启动经 uci-defaults 自举, 恢复到用户配置的 LAN 地址 + 原 SSID, 刷机窗口内 Mac 无需人工接手
 #   T1 检测: 本脚本轮询重连 + 终验
+#            刷前另有 verify_t2_fallback() 实测核验 T2 是否在位(T2 是命门, 不能只写在文档里)
 #   T2 恢复: U-Boot 常住兜底 bootcmd=run boot_ubi || http_recovery (已实测在位) -> 刷坏自动进 Recovery, 免拆机
+#            ⚠️ 恢复页地址随 U-Boot 实现变化: 当前 chainloader(2026.07 血脉)=192.168.255.1,
+#               刷入 2026-11-11 新版 chainloader 后变为 192.168.0.1; 触发均为"上电后按 reset, LED 变色松手"。
+#               刷 U-Boot 后必须重学兜底入口, 否则真出事时连不上恢复页(见 SKILL.md「U-Boot/chainloader 评估基线」)。
 #   T3 回退: 刷前自动解析当前运行版本的本地 itb 作为回退镜像 (见 resolve_rollback); 无匹配时退回 FALLBACK_ITB(10/16, 仅最后兜底)
 #
 # 用法:
@@ -15,8 +19,9 @@
 #   - 主路径可走 WiFi: 上传 kit+itb、触发 sysupgrade 均经当前 WiFi; 路由器重启后 uci-defaults 自举恢复
 #     原 SSID 并 'wifi reload', Mac 自动重连, 全程无需插线。
 #   - 但请把一根以太网线放在手边: 万一自举失败(路由回退出厂, 原 SSID 消失), WiFi 即不可达,
-#     此时插有线是唯一入口; 插线后 Mac 有线网卡须设为 DHCP 自动获取(出厂态=192.168.1.x / 自举成功=升级前 LAN 网段)。
-#   - 恢复/诊断时若路由在出厂态, 你的路由器地址/别名连不上, 改用出厂默认: ssh root@192.168.1.1
+#     此时插有线是唯一入口; 插线后 Mac 有线网卡须设为 DHCP 自动获取(XR1710G 出厂态=192.168.50.x / 自举成功=升级前 LAN 网段)。
+#   - 恢复/诊断时若路由在出厂态, 你的路由器地址/别名连不上, 改用 XR1710G 出厂默认: ssh root@192.168.50.1
+#     ⚠️ 192.168.1.1 是 XG2010G / Nokia 机型的默认地址, 不是本机型的(2026-11-13 纠正了重连候选与自举 fallback)。
 #   - Mac 的 SSH 公钥已内置在 kit.tar.gz 的 etc/dropbear/authorized_keys (全清刷后仍可 key 登录)
 #   - 升级后 root 密码由升级前从活路由器抓取的 shadow hash 自动恢复, 与升级前一致; 如需改密: ssh <路由器地址> 'passwd root'
 #   - 在 ~/.ssh/config 配置你的路由器 SSH 地址 (如 Host <router> -> 192.168.x.1); 本工具会在刷前抓取活路由 host key 随 kit 还原, 故其他终端无需更新 known_hosts
@@ -33,8 +38,11 @@ export COPYFILE_DISABLE=1
 #   --allow-same-version    允许重刷"当前正在运行的版本"(默认拒绝, 防白刷)
 #   --allow-recent-crash    允许在近期异常硬复位(UBIFS recovery)后刷机 (默认拒绝)
 #   --allow-unverified-sha  仅在"完全拿不到任何官方基准"时允许无校验刷入 (有基准但不匹配永远拒绝)
+#   --allow-test-build      允许刷入被识别为"测试版 / wipe-config"的官方最新 release (默认拒绝)
+#   --allow-unverified-t2   允许在"刷前读不到 U-Boot/T2 兜底"时仍刷机 (默认拒绝, 自担风险)
+#   --allow-stale-kit       允许使用"自举脚本与仓库源码不一致 / 缺 manifest"的陈旧 kit (默认拒绝)
 DRY=0; AUTO=0; FORCE=0; ROUTER_OVERRIDE=""; ITB_OVERRIDE=""; EXPECT_SHA_OVERRIDE=""
-ALLOW_SAME_VERSION=0; ALLOW_RECENT_CRASH=0; ALLOW_UNVERIFIED_SHA=0
+ALLOW_SAME_VERSION=0; ALLOW_RECENT_CRASH=0; ALLOW_UNVERIFIED_SHA=0; ALLOW_TEST_BUILD=0; ALLOW_UNVERIFIED_T2=0; ALLOW_STALE_KIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1;;
@@ -43,6 +51,9 @@ while [ $# -gt 0 ]; do
     --allow-same-version)   ALLOW_SAME_VERSION=1;;
     --allow-recent-crash)   ALLOW_RECENT_CRASH=1;;
     --allow-unverified-sha) ALLOW_UNVERIFIED_SHA=1;;
+    --allow-test-build)     ALLOW_TEST_BUILD=1;;
+    --allow-unverified-t2)  ALLOW_UNVERIFIED_T2=1;;
+    --allow-stale-kit)      ALLOW_STALE_KIT=1;;
     --router)  ROUTER_OVERRIDE="${2:-}"; shift;;
     --router=*) ROUTER_OVERRIDE="${1#*=}";;
     --itb)     ITB_OVERRIDE="${2:-}"; shift;;
@@ -151,6 +162,112 @@ precheck_recent_crash(){
   echo "✅ 无近期异常复位痕迹(或已超过 48h 观察窗)"
 }
 
+# ---------- 刷前 T2 兜底核验(2026-11-13 新增, 把"执行顺序第 1 步"从文档变成代码) ----------
+# 安全模型最底层是 U-Boot 常住 bootcmd=run boot_ubi || http_recovery。此前脚本只在"终验"里
+# echo 打印一次, 刷前从不判定 —— 万一刷 U-Boot / 改 env 把兜底改没了, 脚本仍会照常刷机,
+# 真出事时才发现进不去 Recovery。现改为刷前 fail-closed 校验, 并把刷前基线存进全局,
+# 供 post_upgrade_report 输出"刷前 vs 刷后"对比(刷过 chainloader 后恢复页会变, 必须能看出来)。
+T2_PRE_BOOTCMD=""; T2_PRE_UBOOT=""; T2_PRE_RECOVERY_IP=""; T2_PRE_OK=0
+verify_t2_fallback(){
+  echo "---- T2 兜底(U-Boot) 刷前核验 ----"
+  local raw
+  raw=$(ssh -o ConnectTimeout=10 "$ROUTER" 'sh -s' 2>/dev/null <<'REMOTE'
+( cat /dev/ubi0_2 2>/dev/null; cat /dev/ubi0_1 2>/dev/null; fw_printenv 2>/dev/null ) | strings 2>/dev/null | grep -E '^bootcmd=|^recovery_mtd=|^boot_ubi=' | sort -u
+echo '---UBOOT---'
+M=$(awk -F: '/"chainloader"/{gsub(/ /,"",$1);print $1}' /proc/mtd 2>/dev/null)
+[ -z "$M" ] && M=mtd3
+grep -a -o -E 'U-Boot 20[0-9]{2}[^ ]{0,50}' /dev/$M 2>/dev/null | sort -u | head -1
+echo '---IP---'
+grep -a -o -E '192\.168\.(255|0)\.(1|2|255)' /dev/$M 2>/dev/null | sort -u | tr '\n' ' '
+echo
+REMOTE
+)
+  T2_PRE_BOOTCMD=$(printf '%s\n' "$raw" | grep '^bootcmd=' | head -1)
+  T2_PRE_UBOOT=$(printf '%s\n' "$raw" | sed -n '/^---UBOOT---$/,/^---IP---$/p' | grep '^U-Boot' | head -1)
+  T2_PRE_RECOVERY_IP=$(printf '%s\n' "$raw" | sed -n '/^---IP---$/,$p' | grep -v '^---IP---$' | head -1)
+  if printf '%s' "$T2_PRE_BOOTCMD" | grep -qE 'http_recovery|boot_ubi'; then
+    T2_PRE_OK=1
+    echo "✅ T2 兜底在位: $T2_PRE_BOOTCMD"
+  else
+    echo "🛑 刷前未读到 U-Boot 常住兜底 bootcmd(http_recovery / boot_ubi) —— T2 命门可能已失效"
+  fi
+  [ -n "$T2_PRE_UBOOT" ] && echo "   U-Boot 版本串(mtd3): $T2_PRE_UBOOT"
+  if [ -n "$T2_PRE_RECOVERY_IP" ]; then
+    echo "   恢复页(mtd3 实测): $T2_PRE_RECOVERY_IP"
+  else
+    T2_PRE_RECOVERY_IP="192.168.255.1(推定, mtd3 未读出)"
+    echo "   ⚠️ mtd3 未读出恢复页 IP, 按当前 U-Boot 血脉推定 192.168.255.1 (刷过 11-11 chainloader 则为 192.168.0.1)"
+  fi
+  if [ "$T2_PRE_OK" = "1" ]; then return 0; fi
+  if [ "$DRY" = "1" ]; then echo "⚠️ [dry-run] 真实执行时本脚本会拒绝刷机"; return 0; fi
+  if [ "$ALLOW_UNVERIFIED_T2" = "1" ]; then echo "⚠️ 已由 --allow-unverified-t2 显式放行(自担风险)"; return 0; fi
+  die "🛑 T2 兜底未验证, 拒绝刷机。请先确认 U-Boot env(/dev/ubi0_1|ubi0_2 与 fw_printenv), 或显式加 --allow-unverified-t2 自担风险。"
+}
+
+# ---------- kit 有效性核验(2026-11-13 新增, 把"kit 是否重建"从人工提醒变成代码强制) ----------
+# 2026-11-13 实证: 仓库根的 kit.tar.gz 停留在 2026-10-08, 内嵌 zzz-restore-router 仅 339 行
+# (仓库源码 445 行), 缺 zzz-disabled-services 禁用态还原等后续修复, sha256 不一致 —— 用这种
+# kit 全清刷会静默丢配置。故刷前校验: 必需文件在位 + 自举脚本与源码一致 + manifest 绑定目标固件。
+# ⚠️ 只按需 tar -xOf 提取 2 个非敏感成员, 绝不整包解包注入后的 kit(那含 root shadow/WiFi key/订阅)。
+verify_kit(){
+  local mode="${1:-pre}" tmp m_restore m_keys m_manifest kit_sha repo_sha m_commit m_khash warn=0
+  echo "---- kit 有效性核验 ($mode) ----"
+  tmp=/tmp/kit_build/verify
+  rm -rf "$tmp"; mkdir -p "$tmp" 2>/dev/null || { echo "⚠️ 无法创建临时校验目录, 跳过 kit 核验"; return 0; }
+  m_restore=$(tar -tzf "$KIT" 2>/dev/null | grep -E '(^|/)etc/uci-defaults/zzz-restore-router$' | head -1)
+  m_keys=$(tar -tzf "$KIT" 2>/dev/null | grep -E '(^|/)etc/dropbear/authorized_keys$' | head -1)
+  m_manifest=$(tar -tzf "$KIT" 2>/dev/null | grep -E '(^|/)etc/kit-manifest$' | head -1)
+  if [ -z "$m_restore" ] || [ -z "$m_keys" ]; then
+    echo "❌ kit 缺少必需文件: etc/uci-defaults/zzz-restore-router 或 etc/dropbear/authorized_keys"
+    rm -rf "$tmp"; return 1
+  fi
+  tar -xOf "$KIT" "$m_restore" > "$tmp/restore" 2>/dev/null
+  [ -s "$tmp/restore" ] || { echo "❌ 无法提取 kit 内自举脚本"; rm -rf "$tmp"; return 1; }
+  kit_sha=$(shasum -a 256 "$tmp/restore" 2>/dev/null | awk '{print $1}')
+  repo_sha=$(shasum -a 256 "$PREP_DIR/zzz-restore-router" 2>/dev/null | awk '{print $1}')
+  if [ -n "$kit_sha" ] && [ -n "$repo_sha" ] && [ "$kit_sha" != "$repo_sha" ]; then
+    echo "🛑 kit 内自举脚本不是当前仓库源码 (kit ${kit_sha:0:12}… vs repo ${repo_sha:0:12}…) —— kit 已陈旧"
+    echo "   影响: 全清刷后首启动用的是旧自举逻辑, 可能缺真实配置还原 / 订阅还原 / 禁用态还原等后续修复。"
+    echo "   修法: 见 README「真刷前必须先重建 kit」(从旧 kit 自提取 authorized_keys + clash_meta 后重建)"
+    warn=1
+  else
+    echo "✅ kit 内自举脚本与仓库源码一致 (${kit_sha:0:12}…)"
+  fi
+  if [ -n "$m_manifest" ]; then
+    tar -xOf "$KIT" "$m_manifest" > "$tmp/manifest" 2>/dev/null
+    m_commit=$(grep '^target_commit=' "$tmp/manifest" 2>/dev/null | cut -d= -f2- | head -1)
+    m_khash=$(grep '^source_kernel=' "$tmp/manifest" 2>/dev/null | cut -d= -f2- | head -1)
+    echo "   manifest: target_commit=${m_commit:-?} / source_kernel=${m_khash:-?}"
+    if [ "$mode" = "final" ] && [ -n "${TARGET_COMMIT:-}" ]; then
+      _m8=$(printf '%s' "$m_commit" | cut -c1-8)
+      _t8=$(printf '%s' "$TARGET_COMMIT" | cut -c1-8)
+      if [ "${m_commit:-unspecified}" = "unspecified" ] || [ "$_m8" != "$_t8" ]; then
+        echo "🛑 kit manifest 未绑定本次目标固件 ($TARGET_COMMIT) —— collect_runtime 应已覆写, 不一致说明流程异常"
+        warn=1
+      else
+        echo "✅ kit manifest 已绑定目标固件 commit $_t8"
+      fi
+    fi
+  else
+    if [ "$mode" = "final" ]; then
+      echo "🛑 最终 kit 缺少 etc/kit-manifest —— 无法证明它针对本次目标固件重建"
+      warn=1
+    else
+      echo "ℹ️ 源 kit 无 manifest(旧版 build_kit.sh 产物); collect_runtime 会在注入时补写并绑定目标固件"
+    fi
+  fi
+  if [ -n "$m_khash" ] && [ "$m_khash" != "unspecified" ]; then
+    echo "   ⚠️ kit 源内核 $m_khash; 目标固件若跨内核版本, 切勿恢复旧 kmod-*, 且必须按新固件重建 kit"
+  fi
+  rm -rf "$tmp"
+  if [ "$warn" = "1" ]; then
+    if [ "$ALLOW_STALE_KIT" = "1" ]; then echo "⚠️ 已由 --allow-stale-kit 显式放行(自担风险)"; return 0; fi
+    if [ "$DRY" = "1" ]; then echo "⚠️ [dry-run] 真实执行时本脚本会拒绝刷机, 直到 kit 重建"; return 0; fi
+    die "🛑 kit 有效性核验未通过。请按上面提示重建 kit, 或显式加 --allow-stale-kit 自担风险。"
+  fi
+  return 0
+}
+
 # 升级日志持久化(P3): 归档到固定目录而非易失的 /tmp, 升级当次及日后复盘均可追溯
 LOG_DIR="$HOME/router-upgrade-logs"
 archive_logs(){
@@ -207,6 +324,7 @@ post_upgrade_report(){
     echo "- 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "- 目标版本 commit: ${TARGET_COMMIT:-?}"
     echo "- 回退镜像: $(basename "${ROLLBACK:-}")"
+    echo "- 刷前 T2 基线: bootcmd=${T2_PRE_BOOTCMD:-?} / ${T2_PRE_UBOOT:-?} / 恢复页 ${T2_PRE_RECOVERY_IP:-?} / 核验通过=${T2_PRE_OK}"
     echo ""
   } > "$rep"
   if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'true' 2>/dev/null; then
@@ -253,34 +371,79 @@ post_upgrade_report(){
     if [ -z "$ch" ]; then echo "- ✅ uci changes 为空(已全部 commit)"; else echo "- ⚠️ 存在未提交改动:"; echo "$ch"; fi
   ' 2>/dev/null >> "$rep"
   config_fidelity_check >> "$rep"
+  {
+    echo ""
+    echo "## 8. U-Boot / T2 兜底 (刷前基线 vs 刷后实测)"
+    echo "- 刷前: bootcmd=\`${T2_PRE_BOOTCMD:-?}\` / ${T2_PRE_UBOOT:-?} / 恢复页 ${T2_PRE_RECOVERY_IP:-?} / 核验通过=${T2_PRE_OK}"
+    echo "- 刷后实测:"
+  } >> "$rep"
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'sh -s' 2>/dev/null <<'REMOTE' >> "$rep"
+echo '  - bootcmd / recovery_mtd:'
+( cat /dev/ubi0_2 2>/dev/null; cat /dev/ubi0_1 2>/dev/null; fw_printenv 2>/dev/null ) | strings 2>/dev/null | grep -E '^bootcmd=|^recovery_mtd=|^boot_ubi=' | sort -u | sed 's/^/    /'
+M=$(awk -F: '/"chainloader"/{gsub(/ /,"",$1);print $1}' /proc/mtd 2>/dev/null)
+[ -z "$M" ] && M=mtd3
+echo '  - U-Boot 版本串(mtd3):'
+grep -a -o -E 'U-Boot 20[0-9]{2}[^ ]{0,50}' /dev/$M 2>/dev/null | sort -u | head -3 | sed 's/^/    /'
+echo '  - 恢复页 IP(mtd3):'
+grep -a -o -E '192\.168\.(255|0)\.(1|2|255)' /dev/$M 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/^/    /'
+echo ""
+REMOTE
   echo "📄 已生成升级后结构化报告: $rep"
 }
 
-# ---------- 官方 release 元数据(2026-11-04 新增) ----------
-# 一次 gh 调用取齐"首个含 XR1710G itb 的 release"中该 itb 的: 发布时间 / 文件名 / 下载地址 /
-# GitHub 官方 asset digest(sha256:...)。digest 是 GitHub 官方提供的外部基准, 可替代缺失的
-# sha256sums 文件(1029 release 就没附, 只有 1 个 itb 资产)。
-# 目标选片、沉淀闸、完整性校验三者全部绑定到同一份元数据, 杜绝"闸校验 A、实际刷 B"的缝隙。
+# ---------- 官方 release 统一元数据(2026-11-13 合并为单次 gh 调用) ----------
+# 原 official_asset_meta() 与 official_release_flags() 各调一次 gh 取 .[0]: 两次调用之间上游
+# 一旦发版就可能指向不同 release(闸校验 A、实际刷 B), 且 /releases 默认按 created_at 排序,
+# 编辑过发布时间的 release 会排错。现合并为一次调用 + sort_by(.published_at)|reverse|.[0],
+# 目标选片 / 沉淀闸 / digest 基准 / 测试版识别全部绑定到同一份数据。
+# digest 是 GitHub 官方外部基准, 可替代缺失的 sha256sums(1029 / 1112 均无 sums)。
 OFFICIAL_ITB_PUB=""; OFFICIAL_ITB_NAME=""; OFFICIAL_ITB_URL=""; OFFICIAL_ITB_SHA=""
-official_asset_meta(){
+OFFICIAL_REL_TAG=""; OFFICIAL_REL_PRERELEASE=""; OFFICIAL_REL_BODY=""; OFFICIAL_REL_FLAGS="UNKNOWN"
+official_release_meta(){
   command -v gh >/dev/null 2>&1 || return 1
   local tsv try
   for try in 1 2 3; do
-    # 上游把 XG2010G 设为 GitHub "Latest", 故遍历 releases 取首个含 gemtek_xr1710g itb 的 release
-    # (gojq 子集不支持 any(.name; test()), 用 any(.assets[]; .name|test()) 存在量词写法)
-    tsv=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0] | [.published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].name), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].digest // "NONE")] | @tsv' 2>/dev/null | head -1)
+    tsv=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | sort_by(.published_at) | reverse | .[0] | [.published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].name), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].digest // "NONE"), (.tag_name // ""), ((.prerelease // false)|tostring), ((.body // "")|gsub("[\r\n\t]+";" "))] | @tsv' 2>/dev/null | head -1)
     [ -n "$tsv" ] && break
     sleep 2
   done
   [ -n "$tsv" ] || return 1
-  # 同 router_watch.sh: NONE 占位防 IFS=tab 折叠空字段
-  IFS=$'\t' read -r OFFICIAL_ITB_PUB OFFICIAL_ITB_NAME OFFICIAL_ITB_URL OFFICIAL_ITB_SHA <<< "$tsv"
+  # NONE 占位防 IFS=tab 折叠空字段(同 router_watch.sh)
+  IFS=$'\t' read -r OFFICIAL_ITB_PUB OFFICIAL_ITB_NAME OFFICIAL_ITB_URL OFFICIAL_ITB_SHA OFFICIAL_REL_TAG OFFICIAL_REL_PRERELEASE OFFICIAL_REL_BODY <<< "$tsv"
   [ "$OFFICIAL_ITB_SHA" = "NONE" ] && OFFICIAL_ITB_SHA=""
   OFFICIAL_ITB_SHA="${OFFICIAL_ITB_SHA#sha256:}"
   [ -n "$OFFICIAL_ITB_NAME" ] || return 1
   return 0
 }
-official_asset_meta || echo "⚠️ 无法读取官方 release 元数据(gh 未登录/限流/网络抖动); 自动选片与官方基准不可用, 仅 --itb 显式指定可用"
+
+# release 性质识别: 纯 bash 判定, 不再独立调 gh(与元数据同源)。
+# 20261112 是 OTA 测试版, 正文写"本次为测试固件""不保留配置""OTA: wipe-config", 但
+# prerelease=false, 光看元数据看不出来。关键字之外再加一条不依赖措辞的客观信号。
+official_release_flags(){
+  local flags="" tag_date img_date
+  [ -n "$OFFICIAL_REL_TAG" ] || { OFFICIAL_REL_FLAGS="UNKNOWN"; return 0; }
+  [ "$OFFICIAL_REL_PRERELEASE" = "true" ] && flags="PRERELEASE"
+  if printf '%s' "$OFFICIAL_REL_BODY" | grep -qE '本次为测试固件|测试固件|测试版|测试不保留配置|wipe-config|不保留配置'; then
+    flags="${flags:+$flags+}TEST"
+  fi
+  if printf '%s' "$OFFICIAL_REL_BODY" | grep -qE 'wipe-config|不保留配置|默认打开测试'; then
+    flags="${flags:+$flags+}WIPE-CONFIG"
+  fi
+  # 客观信号(2026-11-13): tag 日期与镜像名日期不符 —— 20261112 标签挂的是 20261111 镜像。
+  # 正式版历史上两者同日; 错配通常意味着临时打包 / 测试发布 / 产物与说明不一致。
+  # 上游若换措辞写英文 beta 而关键字漏判, 这一条仍可能兜住。
+  tag_date=$(printf '%s' "$OFFICIAL_REL_TAG" | grep -oE '20[0-9]{6}' | head -1)
+  img_date=$(printf '%s' "$OFFICIAL_ITB_NAME" | grep -oE '20[0-9]{6}' | head -1)
+  if [ -n "$tag_date" ] && [ -n "$img_date" ] && [ "$tag_date" != "$img_date" ]; then
+    flags="${flags:+$flags+}TAG-DATE-MISMATCH"
+  fi
+  OFFICIAL_REL_FLAGS="${flags:-OK}"
+}
+if official_release_meta; then
+  official_release_flags
+else
+  echo "⚠️ 无法读取官方 release 元数据(gh 未登录/限流/网络抖动); 自动选片、官方基准与测试版识别均不可用, 仅 --itb 显式指定可用"
+fi
 
 # 官方目标 itb 本地缺失时自动下载并用官方 digest 校验(仅真实执行; dry-run 不下载)。
 download_official_itb(){
@@ -349,7 +512,7 @@ resolve_router(){
   fi
   if [ -z "$ROUTER" ]; then
     if [ -t 0 ]; then
-      printf '请输入路由器的 SSH 地址 (如 root@192.168.1.1, 或 ssh config 中的主机别名): ' >&2
+      printf '请输入路由器的 SSH 地址 (如 root@192.168.50.1 [XR1710G 出厂默认], 或 ssh config 中的主机别名): ' >&2
       read -r ROUTER </dev/tty 2>/dev/null
     fi
   fi
@@ -400,6 +563,36 @@ if [ -z "$ITB_OVERRIDE" ] && [ "$FORCE" = "0" ] && [ "$(basename "$ITB")" = "$OF
     fi
   fi
 fi
+
+# ---------- 测试版 / wipe-config 发布闸(2026-11-12 新增) ----------
+# 命中"测试固件 / 测试版 / 不保留配置 / wipe-config / prerelease"的官方最新版时:
+#   dry-run 高亮告警; 真实执行 fail-closed, 需 --allow-test-build 显式放行。
+#   --itb 显式指定历史版本时不适用(目标 release 已不是"最新"那个, 风险标记不该张冠李戴)。
+release_risk_gate(){
+  [ -z "$ITB_OVERRIDE" ] || return 0
+  [ "$(basename "$ITB")" = "$OFFICIAL_ITB_NAME" ] || return 0
+  case "${OFFICIAL_REL_FLAGS:-UNKNOWN}" in
+    OK|"") return 0 ;;
+    UNKNOWN)
+      echo "⚠️ 无法读取目标 release 的发布说明(gh 限流/网络抖动), 测试版 / 不保留配置标记未知; 请人工核对 ${OFFICIAL_REL_TAG:-最新 release} 的正文后再刷"
+      return 0 ;;
+  esac
+  echo "🛑 官方目标 release [${OFFICIAL_REL_TAG:-?}] 被识别为: $OFFICIAL_REL_FLAGS"
+  echo "   发布说明摘录: ${OFFICIAL_REL_BODY:0:200}"
+  echo "   注: TAG-DATE-MISMATCH 是不依赖措辞的客观信号(tag 日期 != 镜像名日期), 提示产物/说明可能不一致"
+  echo "   影响: 测试版 / wipe-config 默认清空配置; 本工具走 sysupgrade -n -f kit.tar.gz 全清刷,"
+  echo "         但内核与预装包大变时必须重建 kit(勿恢复旧 kmod-*), 否则 OpenClash 规则/钩子/订阅可能丢失。"
+  if [ "$DRY" = "1" ]; then
+    echo "⚠️ [dry-run] 真实执行时本脚本会拒绝刷入该测试版; 需显式 --allow-test-build 自担风险, 或等正式版"
+    return 0
+  fi
+  if [ "$ALLOW_TEST_BUILD" = "1" ]; then
+    echo "⚠️ 已由 --allow-test-build 显式放行测试版(自担风险); 刷前请确认 kit 已针对该固件重建"
+    return 0
+  fi
+  die "🛑 目标为测试版 / wipe-config 固件, 默认拒绝刷入。请等正式版 / 显式 --itb 指定已确认版本, 或确认已重建 kit 后加 --allow-test-build 自担风险。"
+}
+release_risk_gate
 
 # 自动解析回退镜像: 取路由器当前运行的 commit hash, 在本地 firmware-prep 匹配同名 itb。
 # 这样每次升级都会把"刚跑的版本"作为回退目标 —— 即自动备份当前版本。
@@ -655,13 +848,30 @@ collect_runtime(){
   } > "$build/etc/router-secrets"
   chmod 600 "$build/etc/router-secrets"
   # 打包前最后一道 AppleDouble 防线: 清掉抓取/烘焙路径可能残留的 ._*(源头排除 + 本地清理双保险)
+  # 2026-11-13: 写入无敏感信息的 kit manifest, 供 verify_kit(final) 绑定目标固件、核验重建状态。
+  # 只记 commit / 内核 / 文件 sha256, 绝不写 root shadow / WiFi key / 订阅 / SSID / MAC。
+  {
+    echo "kit_schema=1"
+    echo "built_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    echo "target_commit=${TARGET_COMMIT:-unspecified}"
+    echo "source_router_commit=${CURRENT_COMMIT:-unspecified}"
+    echo "source_kernel=$(ssh -o ConnectTimeout=8 "$ROUTER" 'uname -r' 2>/dev/null | head -1)"
+    echo "restore_script_sha256=$(shasum -a 256 "$build/etc/uci-defaults/zzz-restore-router" 2>/dev/null | awk '{print $1}')"
+    if [ -f "$build/etc/openclash/core/clash_meta" ]; then
+      echo "clash_core_sha256=$(shasum -a 256 "$build/etc/openclash/core/clash_meta" 2>/dev/null | awk '{print $1}')"
+    else
+      echo "clash_core_sha256=absent"
+    fi
+    # 目标内核只能从发布说明启发式取, 不作判据, 仅用于跨内核告警
+    echo "target_kernel_hint=$(printf '%s' "${OFFICIAL_REL_BODY:-}" | grep -oE '6\.[0-9]+\.[0-9]+' | head -1)"
+  } > "$build/etc/kit-manifest"
   find "$build" -name '._*' -type f -delete 2>/dev/null
   tar -czf "$newkit" -C "$build" . || { echo "❌ 重打 kit 失败"; exit 1; }
   KIT="$newkit"
   if [ -n "$s" ]; then echo "✅ 已注入 root hash + WiFi key + 三频 SSID + LAN IP + OpenClash 配置 + 额外配置/定制路径到 kit (无明文存储)"; else echo "⚠️ 已注入 WiFi key/SSID/LAN IP/OpenClash/额外配置, 但 root shadow 抓取失败(升级后仅 key 登录)"; fi
 }
 
-resolve_router || die "未配置路由器 SSH 地址 — 请用 --router root@192.168.1.1 或 ROUTER 环境变量指定, 或在首次运行时按提示输入"
+resolve_router || die "未配置路由器 SSH 地址 — 请用 --router root@192.168.50.1 (XR1710G 出厂默认) 或 ROUTER 环境变量指定, 或在首次运行时按提示输入"
 
 precheck_executor_location
 
@@ -696,6 +906,10 @@ fi
 # 11-03 卡死事件的流程化缓解: 近期异常硬复位未过 48h 观察窗时拒绝刷机
 precheck_recent_crash
 
+# 2026-11-13 新增两道刷前闸: T2 兜底实测核验 + kit 有效性(陈旧 kit 会静默丢配置)
+verify_t2_fallback
+verify_kit pre
+
 # 解析回退镜像(当前运行版本对应的本地 itb = 自动备份点)
 ROLLBACK=$(resolve_rollback 2>/dev/null)
 if [ -z "$ROLLBACK" ]; then
@@ -720,8 +934,8 @@ if [ "$DRY" = "1" ]; then
   echo "  1b. 路由器侧复核 itb sha256 (防止 WiFi 上传损坏)"
   echo "  2. ssh $ROUTER 'sysupgrade -F -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (F=跳过设备名校验[见下], n=不保留当前配置, 严格全清)"
   echo "     (nohup 后台执行, 路由器重启, SSH 断开, 本脚本随后轮询重连)"
-  echo "  3. 轮询重连 (每 5s, 最多 80 次) 于路由器地址 / 常见出厂 IP (192.168.1.1 等)"
-  echo "  4. 终验: 版本 / flow offload / 三频 / OpenClash / DNS / U-Boot"
+  echo "  3. 轮询重连 (每 5s, 最多 80 次) 于路由器地址 / 出厂默认 192.168.50.1 等候选 IP"
+  echo "  4. 终验: 版本 / flow offload / 三频 / OpenClash / DNS / U-Boot; 报告含 T2 刷前基线 vs 刷后实测"
   echo "     (host key 将在刷前从活路由抓取并随 kit 还原, 成功则其他终端无需更新 known_hosts; 失败则降级为 accept-new)"
   echo "=== DRY-RUN 结束 ==="
   exit 0
@@ -730,6 +944,9 @@ fi
 # 升级前: 配置快照(配置级回退点) + 抓取当前运行态注入 kit (dry-run 不执行)
 backup_config
 collect_runtime
+
+# 注入后的临时 kit 才是真正要刷进去的东西 —— 再核验一次(含 manifest 是否绑定本次目标固件)
+verify_kit final || die "kit 最终核验失败"
 
 echo "=== 上传固件与 kit ==="
 scp "$ITB" "$KIT" "$ROUTER:/tmp/" || die "上传失败"
@@ -756,7 +973,7 @@ derive_expect_sha(){
   if [ -n "$d" ] && [ "$d" != "NONE" ]; then
     printf '%s' "${d#sha256:}"; return 0
   fi
-  sums_url=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | .[0].assets[] | select(.name=="sha256sums") | .browser_download_url' 2>/dev/null | head -1)
+  sums_url=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | sort_by(.published_at) | reverse | .[0].assets[] | select(.name=="sha256sums") | .browser_download_url' 2>/dev/null | head -1)
   [ -n "$sums_url" ] || { echo "  (未找到官方 sha256sums, 且该 ITB 无 asset digest)" >&2; return 1; }
   h=$(curl -fsSL "$sums_url" 2>/dev/null | grep -F "$bn" | awk '{print $1}' | head -1)
   [ -n "$h" ] && { printf '%s' "$h"; return 0; }
@@ -836,7 +1053,9 @@ for i in $(seq 1 80); do
   fi
   # 试用户配置的地址(别名或 IP), 再退到常见出厂默认 IP (首启动自举可能重置为出厂态)
   tried="$ROUTER"
-  for ip in 192.168.1.1 192.168.0.1 10.0.0.1; do tried="$tried root@$ip"; done
+  # XR1710G 出厂默认 192.168.50.1(官方 README 首次启动表); 192.168.1.1 属 XG2010G/Nokia。
+  # 192.168.0.1 同时也是 11-11 新版 chainloader 的恢复页地址, 保留作兼容候选。
+  for ip in 192.168.50.1 192.168.1.1 192.168.0.1 10.0.0.1; do tried="$tried root@$ip"; done
   for target in $tried; do
     if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$target" 'true' 2>/dev/null; then
       echo "✅ 第 $i 轮经 $target 重连成功"; ROUTER="$target"; OK=1; break 2
@@ -848,6 +1067,7 @@ if [ "$OK" != "1" ]; then
   echo "❌ 重连失败 — 可能进入 Recovery 或执行机链路仍异常"
   echo "   诊断: 执行机出口 IP=$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null || echo '?'); 路由器=$ROUTER"
   echo "   若执行机本就不经此路由上网, 请确认有线已直连路由器 LAN 口; U-Boot 兜底已就位, 可访问 HTTP Recovery 重刷"
+  echo "   HTTP Recovery 入口: 上电后按 reset、LED 变色松手; 当前 U-Boot=192.168.255.1 (刷入 11-11 chainloader 后为 192.168.0.1)"
   die "重连失败, 需人工介入"
 fi
 

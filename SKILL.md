@@ -42,12 +42,13 @@ agent_created: true
 
 ## 四层安全保障（fail-safe，非 fail-proof）
 - **T0 预防**：全清刷 + restore-kit 打成 `uci-defaults` 脚本随 `sysupgrade -f kit.tar.gz` 在首启动自举 → 路由自配自己，无需在刷机窗口在线值守。
-- **T1 检测**：Mac 侧轮询重连（路由器地址 / 常见出厂 IP 如 192.168.1.1，每 5s 最多 80 次 = 400s）+ 终验。
+- **T1 检测**：Mac 侧轮询重连（候选含 XR1710G 出厂默认 `192.168.50.1`；`192.168.1.1` 是 XG2010G/Nokia 的，别混用）+ 终验；刷前另有 `verify_t2_fallback()` 实测核验 T2、`verify_kit()` 核验 kit 是否陈旧（2026-11-13 代码化）。
 - **T2 恢复（命门）**：U-Boot 常住兜底 `bootcmd=run boot_ubi || http_recovery` + `recovery_mtd=fit`（在 UBI 卷 ubootenv/ubootenv2，**不受 sysupgrade 影响**）。刷坏自动进 HTTP Recovery，免拆机。
+  - **⚠️ 兜底入口不是恒定的**：当前 U-Boot（`2026.07-00760-gab7fd65100f1` / `YYH2913/http-uboot` 血脉）恢复页为 **`192.168.255.1`**（mtd3 实测字符串含 `.1/.2/.255`），进入方式「上电后按 reset、LED 变色松手」（窗口宽裕，**不可按住 reset 上电**）。刷入 `2026-11-11-a9a12de55890` chainloader 后恢复页变为 **`192.168.0.1`**，DHCP 改为按 MAC 的租约表。刷 U-Boot 后旧救砖流程/脚本会失效，必须重学入口并实测一次再依赖它。
 - **T3 回退**：`upgrade_router.sh` 在刷前预飞阶段**自动解析当前路由器运行版本的 commit hash，并在本地 `*.itb` 中匹配同名 itb 作为回退镜像**（见 `resolve_rollback`）。即"当前版本"会被自动选为回退点——**前提是旧 itb 文件别删掉**。无匹配时回退到手动指定的 `FALLBACK_ITB`。回退操作：`sysupgrade -F <回退 itb>`。
 
 ## 执行顺序（每次升级）
-1. **只读预飞**（不刷机）：Mac 仍连路由？路由可达且版本未漂移？U-Boot 兜底在位？itb sha256 匹配？套件齐备？
+1. **只读预飞**（不刷机）：Mac 仍连路由？路由可达且版本未漂移？U-Boot 兜底在位（**现在是代码实测，不再是人工勾选项**）？kit 是否按当前源码/目标固件重建？itb sha256 匹配？套件齐备？
 2. **WAN 核对**：自举脚本须显式写 `wan`/`wan6`（device `wan`, proto dhcp），否则全清后上不了网、apk 装不了 OpenClash。
 3. **执行**：`bash upgrade_router.sh`（Mac 可 WiFi 发起，网线放手边作安全网）。触发用 `nohup sysupgrade ... &`，SSH 立即返回不卡。
 4. **终验（硬+软）**：硬终验=固件版本匹配 + 三频启用 + 外网直连 DNS 通（不依赖 OpenClash）；软终验=仅当用户真正启用 OpenClash 时才检查 7874 代理 DNS。连不上路由器时**不触发回退**（避免误改状态）。
@@ -171,17 +172,73 @@ agent_created: true
 5. 以上都没有时，**交互询问**你输入，并持久化到 `router-target.conf` 供下次免问
 
 因此克隆本仓库的人无需改任何源码即可适配自己的网络；你的 `router-target.conf` 只存在于你自己机器上。
-- 回退镜像已自动化：`upgrade_router.sh` 刷前会自动把"当前运行版本"的本地 itb 选为回退点（见 `resolve_rollback`）。**只需保证 `*.itb` 里别删掉旧版本文件**。待刷 itb 的选择与校验均已自动化：`ITB` 按"官方最新 release 的 itb 资源名"精确匹配本地文件（`--itb` 可显式指定，避免回退镜像因 mtime 更新被误选）；`EXPECT_SHA` 运行时从官方 `sha256sums` 派生（不再硬编码旧版本 sha，杜绝"误刷回退镜像假通过"）；离线或刷旧 itb 时用 `--expect-sha` 显式给定，或 `--force` 跳过校验（紧急恢复用）。
+- 回退镜像已自动化：`upgrade_router.sh` 刷前会自动把"当前运行版本"的本地 itb 选为回退点（见 `resolve_rollback`）。**只需保证 `*.itb` 里别删掉旧版本文件**。待刷 itb 的选择与校验均已自动化：`ITB` 按"官方最新 release 的 itb 资源名"精确匹配本地文件（`--itb` 可显式指定，避免回退镜像因 mtime 更新被误选）；`EXPECT_SHA` 运行时从官方 `sha256sums` 派生（不再硬编码旧版本 sha，杜绝"误刷回退镜像假通过"）；离线或刷旧 itb 时用 `--expect-sha` 显式给定，`--force` **只跳 72h 沉淀闸，不能跳过 sha256 校验**；完全无基准时才可用 `--allow-unverified-sha`。
 
 ## 🤖 自动化无人值守（router_watch.sh）
 - **何时加这层**：用户要"平时零介入"。此时升级从"手动触发"变"按需检测+满足条件自动刷"。
-- **按需模式（推荐，非常驻）**：`router_watch.sh --now` 用户授权升级（保留 72h 发布沉淀闸）；`--check` 只检测；`--force` 跳过 72h 闸。无需 launchd 常驻。
-- **非交互安全**：未配置路由器地址时，非 tty（launchd 等）环境直接报错退出而非挂起；`--router` / `ROUTER` 环境变量 / `router-target.conf` 任一就绪即可无人值守运行。`--check` 为纯只读，不修改任何源码。
+- **按需模式（推荐，非常驻）**：`router_watch.sh --now` 用户授权升级（保留 72h 发布沉淀闸）；`--check` 检测+备料（**会下载 itb、写 sha256sums、追加日志，不是零副作用**）；`--no-download` 纯只读巡检（零下载/零文件写入）；`--force` 跳过 72h 闸。无需 launchd 常驻。
+- **非交互安全**：未配置路由器地址时，非 tty（launchd 等）环境直接报错退出而非挂起；`--router` / `ROUTER` 环境变量 / `router-target.conf` 任一就绪即可无人值守运行。`--no-download` 才是纯只读（不写任何文件）；`--check` 不修改源码但会备料落盘。watch.log 超 5000 行自动轮转保留最近 2000 行。
 - **安全闸（缺一不可）**：
   1. **发布沉淀闸**：新版本发布 < 72h 不刷（单维护者构建，避开发布当日热修炸机）。
-  2. **独立校验**：下载官方 `sha256sums`，比对 itb 真实 sha256（防篡改）；`EXPECT_SHA` 由 `upgrade_router.sh` **运行时**从官方 sha256sums 派生（watch 已不再回写脚本文件，`--check` 零副作用，见 router_watch.sh 第 6 节）。
+  2. **独立校验**：官方 `sha256sums` 优先，缺失时用 GitHub API 原生 `asset.digest` 兜底（1029 / 1112 均无 sums），两者皆无即 fail-closed；`EXPECT_SHA` 由 `upgrade_router.sh` **运行时**派生（watch 不再回写脚本文件，`--check` 零副作用）。
+  2b. **测试版 / wipe-config 闸（2026-11-12 新增，11-13 加固）**：识别 release 正文的 `本次为测试固件` / `不保留配置` / `wipe-config` 及 `prerelease=true`；**再加一条不依赖措辞的客观信号** `TAG-DATE-MISMATCH`（tag 日期 != 镜像名日期）。release 元数据统一按 `published_at` 降序取、单次 gh 调用取齐，杜绝「闸校验 A、实际刷 B」。命中则 watch 停止备料、`upgrade_router.sh` 真实执行 fail-closed（dry-run 高亮告警），需 `--allow-test-build`。
   3. **强终验+自动回退**：`--auto` 模式跑硬终验(版本/外网直连/三频) + 软终验(OpenClash代理DNS, 仅启用时)；连不上路由器不触发回退。终验失败才自动 `sysupgrade -F <回退itb>`，回退后同样做 DNS 兜底。
-  4. **U-Boot 兜底**：最终防线，刷坏自动进 Recovery。
+  4. **U-Boot 兜底**：最终防线，刷坏自动进 Recovery（恢复页 IP 见上方 T2；刷 chainloader 后会变，必须重学）。
+
+## 🔧 2026-11-12 上游复评后的 Skill 更新（本轮改动）
+
+1. **测试版 / wipe-config 识别闸（P1）**：`official_asset_meta()` 旁新增 `official_release_flags()`，单独取目标 release 的 `tag_name` / `prerelease` / `body`（jq `gsub` 归一化成单行，避免 tab 折叠），正文命中 `本次为测试固件|测试版|不保留配置|wipe-config` 或 `prerelease=true` 时：`upgrade_router.sh` 真实执行默认 `die`（dry-run 高亮告警 + 打印正文摘录），需 `--allow-test-build`；`router_watch.sh` 命中即停止备料、不触发刷机。显式 `--itb` 指定历史版本时该闸不适用（目标已不是最新 release，标记不该张冠李戴）。读不到正文时为 `UNKNOWN`，只提示不阻断，避免 gh 抖动把正常升级卡死。
+2. **`router_watch.sh` 版本比对修复（P1）**：旧代码 `rel_hash` 从 tag 尾部取 commit，纯日期 tag（`20261112`）会被误当 hash，且路由器 commit 10 位 vs 镜像文件名 8 位 →「已是最新」永不命中。改为从 itb 下载 URL 的文件名提取 8 位 commit，与运行版本前 8 位比对。
+3. **`${FORCE:+--force}` 恒真修复（P1）**：`FORCE=0` 是**非空字符串**，`${FORCE:+--force}` 会恒展开成 `--force`，导致 `--now` 常规升级也把 `upgrade_router.sh` 的 72h 闸一并跳过（watch 自己的闸仍在，但语义不一致）。改为按值判断组装参数数组，并透传 `--allow-test-build`。
+4. **T2 兜底入口补全 + 文档纠偏**：恢复页 IP / 触发时序写进 README、两份 SKILL.md、两个脚本头注释与重连失败提示；同时修掉 README 与 SKILL.md 里「`--force` 忽略 EXPECT_SHA 不匹配强制刷」「`--force` 跳过校验」「只下载 sha256sums」三处**与现行代码相反**的旧描述（现行：有基准不匹配任何参数都不放行，`--force` 仅跳 72h 闸，校验优先 asset.digest）。**72h 沉淀闸本身逻辑正确，未改**。
+
+验证：`bash -n` 双脚本通过；`upgrade_router.sh --dry-run` 应同时打印「沉淀闸 <72h」与「测试版闸」告警；`router_watch.sh --check` 应在测试版闸处停止且零下载；`scripts/secret-scan.sh` 无命中。**全程只读，未刷机、未改路由器配置。**
+
+## 🧭 U-Boot / chainloader 评估基线（2026-11-12 复核，取代早期误判）
+
+**先记住四条曾经判错、不要再重复**：
+- ❌「新 U-Boot 换了一整套实现 / 跨实现不兼容」——错。新仓库 README 那节标题是「与 **uboot-an758x**（TF-A BL2/FIP 方案）区别」，被误读成「与老仓库区别」。
+- ❌「对运行期零收益」——错。U-Boot 经 FDT fixup 传 MAC 给内核，11-11 的 `ee2bc2608053` 正是修 CPU/conduit 与 lan2 共用 base MAC；本机实测 `cpu` / `lan2` / `lan3@cpu` / `lan4@cpu` / `br-lan` 五个接口共用同一个 base MAC（具体值不入库，见本地工作日志）。
+- ❌「UBI 写入缺回读校验 → 刷 U-Boot 易变砖」——错。那是优化文档 §3.3 / §11 的**待办改进**，不是现存缺陷；刷 slot 走 raw MTD（逐块校验）+ SSH 文档要求回读 SHA256 + 保留回滚，根本不经过 UBI 写路径。
+- ❌「所有 C 改动未编译验证 → 项目不成熟」——过度推断。作者本机无 aarch64 工具链，但 CI 有全量构建、clean-tree 守卫、1MiB 体积闸门、bot 发布；真正缺的是 §12 **真机判据清单**（WAN PCS / flood map）的逐项实测。
+
+**正确事实**：
+- 本机 U-Boot `U-Boot 2026.07-00760-gab7fd65100f1` 的 commit `ab7fd65100f1` 精确对应上游 `YYH2913/http-uboot` 2026-07-12 提交；`naoki66/Gemtek-brightspeed-chainloader` 是 10-15 另起的干净仓库（非 fork，历史压成 2 个提交），**同一条 chainloader 血脉**。
+- 槽位格式实测一致：mtd3 `0x0 = 27 05 19 56`、`0x2100 = d0 0d fe ed`（双入口 magic）；`fw_printenv` 的 `bootcmd=run boot_ubi || http_recovery`、`recovery_dev_uboot=spi-nand0`、`uboot_ofs=0x600000`、`recovery_size_uboot=0x100000` 与新仓库 §5.3 几乎逐行一致。刷写目标相同（mtd3 / 0x600000 / 1MiB），**路径兼容**，风险等级是中等可控而非「易变砖」。
+- fastmap、DHCP 租约表、WAN PCS、备份 API 都是 **10-16~10-19 那批**就有的；11-11 的 5 个提交里**唯一行为变更是 MAC offset**（另 4 个：SSH 刷写文档、裁 FAT/ext4/SPI-NOR 死代码使体积 1002314→937538、CI 固定 ubuntu-24.04、GCC14 编译修复）。别把「新仓库相对老仓库的全部改进」当成 11-11 的更新内容。
+- 恢复页：`192.168.255.1`（当前 / YYH2913 上游）→ `192.168.0.1`（11-11 chainloader，提交 `d59b7f54cb94`）；进入方式两边都是「上电后按 reset、LED 变色松手」，只是措辞与 LED 判据不同，**不要写成「触发时序变了」**。
+- `saveenv` 陷阱：README §5.1 留了一句危险旧话「用 `setenv bootdelay 1; saveenv` 覆盖」，与优化文档 §2.2 / §10 坑 6「连 bootdelay 这种小事也别为它去 save」冲突（作者其实已在优化文档里明确）。本机 `bootdelay=2` 正是坑 8 说的「被 saveenv 持久化过」。**二级 chainloader 里绝不执行 `saveenv` / `env default -a`**（uenv 是原厂共享分区）。
+- 待验证兼容点：本机 mtd4 名为 `ubi`、`recovery_ubi_part=ubi`，新仓库板级代码只认 `system`。env 在 mtd1 会被沿用、启动大概率不受影响；但恢复模式刷 firmware 时是否识别，既不能断言会变砖也不能当无风险。
+- 11-11 release 只挂 1 个 asset（xr1710g 937538 B），发布说明却列了 2 个文件并给出 xg2010g 的 SHA256 —— 产物与说明不符，XG2010G 镜像缺失。
+- 两条并行线：上游 `YYH2913/http-uboot` 11-02 仍在更新（分区备份下载、RTL8261 延迟初始化），恢复页仍 `192.168.255.1`。评估「新版本 U-Boot」时别只看 naoki66 新仓库。
+
+**结论（截至 2026-11-12）**：不单独刷 U-Boot；与「把 NPU 根因修复编进去的下一版正式固件」配套做（1112 发布说明已把 MAC 修复绑成固件+U-Boot 配套件，推翻了早期「先固件、U-Boot 后置」的顺序）。刷前备份 mtd3 + mtd1/uenv、确认新恢复页 `192.168.0.1`、验证 `ubi`/`system` 恢复路径、备好 TTL。
+
+## 📌 当前固件状态（2026-11-13，会过期）
+
+- `20261112`（镜像 `20261111-a6d84923`，97MB，digest `05b0a652…9fa80e`）仍是唯一含 XR1710G 镜像的最新版，OTA 测试版、`OTA: wipe-config`，下载 **874 次**；72h 闸按 `published_at`（北京 11-11 13:06）到 **11-14 13:06** 才过。`20261111` 标签里**没有 XR1710G 镜像**。
+- **11-13 新增 issue #95**（11-12 15:51 北京，0 评论）：1112 上 AP 模式 mt7996 对 Qualcomm 客户端下行单播重试风暴（`failed==retries`，~200/s），频段/PHY/信道/BF/TWT/驱动全排除，Intel BE200 对照干净；报告者写明 **1016 与 1112 都复现**，属跨版本 mt76 问题 —— **升级不解决它**。本机是网关模式而非「一键 AP」，不能推断必现。11-12 记的「零故障 issue」作废。
+- 11-11 晚间那批 NPU 根因修复之后，**11-13 复核仍无新 release、无新提交**，所以「等下一版把 NPU 修复编进去」的触发条件**还没到**。
+- 1108：#94（5G/6G VIF 不在 fw4 硬件 flowtable、手动加入后掉速）、#90（5GHz 13 分钟后 MT7996/PCIe AER/full-reset 失败）；1029：#81 bridger 断流仍靠停 bridger 规避。
+- Issue #82（1016 NPU Oops）是**报告者自行关闭**，作者从未确认根因、未声明修复；本机 dmesg 近 10 天无 Oops/panic。「官方已确认缺陷并已修」不成立。
+- U-Boot 两条线 11-13 仍静止：chainloader 11-11 版下载 17→81 次、0 open issue、仍缺 XG2010G asset；YYH2913 上游停在 11-02。
+- **触发条件**：等「把 11-11 晚间那批 NPU 根因修复编进去」的下一版正式固件 → 过 72h → 看新 issue → **先重建 kit**（当前 kit 是 10-08 旧版，`verify_kit` 会拦）→ 全清刷（不走 LuCI OTA）。
+
+## 🔧 2026-11-13 二次审计后的修复（本轮改动，7 项 + 1 项实测新发现）
+
+**先说最要紧的实证发现**：仓库根的 `kit.tar.gz` 是 2026-10-08 的，内嵌 `zzz-restore-router` 仅 **339 行**（仓库源码 445 行），缺 `zzz-disabled-services` 禁用态还原等后续修复，sha256 与源码不一致。`collect_runtime()` 只往这份旧 kit 注入配置、**不更新自举脚本**，所以上一轮记的「kit 重建未自动化」不只是人工环节，而是**真刷就会静默丢配置的现存缺陷**。已做成代码闸。
+
+| # | 级别 | 修复 |
+|---|---|---|
+| 1 | 🔴 P1 | **出厂默认 IP 用错机型**：官方 README 首次启动表写明 XR1710G=`192.168.50.1`，`192.168.1.1` 属 XG2010G/Nokia。重连候选、`zzz-restore-router` 的 `LAN_IP` fallback、各处提示全部纠正；`192.168.0.1` 保留作兼容候选（它同时是 11-11 chainloader 的恢复页）。此前自举失败时 T1 会轮询 400s 试不到正确地址然后 `die`。 |
+| 2 | 🔴 P1 | **T2 兜底预飞核验**：新增 `verify_t2_fallback()`，刷前读活跃 UBI 卷 `bootcmd`、mtd3 的 U-Boot 版本串与恢复页 IP，兜底不在位即 fail-closed（`--allow-unverified-t2` 放行）。此前 `bootcmd` 只出现在终验的 `echo` 里，刷前从不判定。刷前基线写进 `report.md` 第 8 节与刷后实测对比。 |
+| 3 | 🟠 P2 | **kit 有效性闸**：新增 `verify_kit(pre/final)` + `build_kit.sh` 写无敏感信息 `etc/kit-manifest`（schema/commit/内核/文件 sha256）。只 `tar -xOf` 提取 2 个非敏感成员，**绝不整包解包注入后的 kit**（那含 root shadow/WiFi key/订阅）。核验自举脚本 sha == 仓库源码、必需文件齐全、final 阶段 manifest 绑定本次 `TARGET_COMMIT`；跨内核打印「勿恢复旧 `kmod-*`」强提示。陈旧 kit 默认拒绝（`--allow-stale-kit` 放行）。 |
+| 4 | 🟠 P2 | **测试版闸补客观信号**：`official_asset_meta()` 与 `official_release_flags()` 合并为**单次 gh 调用** `official_release_meta()`，并 `sort_by(.published_at) \| reverse \| .[0]`（原来两次独立调用可能指向不同 release，且 `/releases` 默认按 `created_at` 排序）。新增 `TAG-DATE-MISMATCH`：tag 日期 != 镜像名日期（`20261112` 挂 `20261111` 镜像），不依赖发布说明措辞，上游改写英文 beta 也仍有机会兜住。`router_watch.sh` 同步。 |
+| 5 | 🟠 P2 | **恢复页 / U-Boot 状态进报告**：`report.md` 新增第 8 节，刷前基线 vs 刷后实测（bootcmd、版本串、恢复页 IP）。刷过 chainloader 后恢复页从 `192.168.255.1` 变 `192.168.0.1`，报告里能直接看出来。 |
+| 6 | 🟡 P3 | **watch.log 轮转**：超 5000 行就地截断保留最近 2000 行，不产生新文件（无需改 .gitignore）。 |
+| 7 | 🟡 P3 | **`--check` 语义纠正 + `--no-download`**：`--check` 其实会下载 itb / 写 sha256sums / 追加日志，文档原写「纯只读」是错的。新增 `--no-download` 为真正零副作用模式（只报告、不下载、不写日志），定时巡检推荐用它。 |
+
+验证：`bash -n` 四个脚本全过；`--dry-run` 应同时命中沉淀闸、测试版闸、T2 核验、kit 陈旧告警；`router_watch.sh --no-download` 零文件写入；`secret-scan` 无命中。**全程只读：未刷机、未改路由器配置、未推 GitHub。**
 
 ## ⚠️ 免责声明
 本工具针对**非官方第三方固件**（naoki66 社区构建）。使用即自担风险：全清刷有变砖可能（虽有 U-Boot 兜底），请确认你的设备型号与固件来源匹配，并备份好当前配置与回退镜像。作者不对任何刷机后果负责。

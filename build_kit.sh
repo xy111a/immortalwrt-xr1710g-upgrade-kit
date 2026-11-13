@@ -5,7 +5,7 @@
 #        kit.tar.gz 由本脚本在本地生成, 并已在 .gitignore 中排除, 因此永远不会进 Git。
 #
 # 用法:
-#   ./build_kit.sh --keys ~/.ssh/router_authorized_keys [--openclash /path/to/openclash-dir] [--openclash-core /path/to/clash_meta] [--out <path>] [--force]
+#   ./build_kit.sh --keys ~/.ssh/id_ed25519.pub [--openclash /path/to/openclash-dir] [--openclash-core /path/to/clash_meta] [--out <path>] [--force]
 #
 #   --keys           (必填) 你的 Mac SSH 公钥文件 (一行一把, 可多把), 刷机后仍可 key 免密登录
 #   --openclash      (可选) 一个含 OpenClash 配置的目录 (会被复制到 etc/openclash 作为离线兜底)
@@ -15,7 +15,9 @@
 #                    烘焙进 kit 的 etc/openclash/core/clash_meta, 由 sysupgrade -f 还原 ——
 #                    彻底摆脱"大文件经 SSH tar 管道"的脆弱链路, 全清刷后内核不再丢失。
 #                    不提供时, kit 不含内核, 依赖 zzz-restore 运行时从 CDN 兜底下載。
-#   --out          产物路径 (默认 dist/kit.tar.gz, 已 gitignore)。⚠️ 默认绝不覆盖仓库根的 kit.tar.gz
+#   --target-commit (可选) 该 kit 面向的目标固件 commit(写入 manifest; 升级时 collect_runtime 会覆写为实际目标)
+#   --target-kernel  (可选) 目标固件内核版本(写入 manifest, 仅用于跨内核告警)
+#   --out          产物路径
 #   --force        仅当 --out 指向已存在的 kit.tar.gz 时才需要, 显式允许覆盖
 #
 # 设计要点 (安全): 默认产物写到 dist/ 而非仓库根的 kit.tar.gz —— 仓库根的 kit.tar.gz 是你正在
@@ -28,7 +30,7 @@ set -eu
 export COPYFILE_DISABLE=1
 
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
-KEYS=""; OC=""; CORE=""; OUT="$PREP_DIR/dist/kit.tar.gz"; FORCE=0
+KEYS=""; OC=""; CORE=""; OUT="$PREP_DIR/dist/kit.tar.gz"; FORCE=0; TC=""; TK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --keys)           KEYS="$2"; shift 2;;
@@ -36,6 +38,8 @@ while [ $# -gt 0 ]; do
     --openclash-core) CORE="$2"; shift 2;;
     --out)            OUT="$2";  shift 2;;
     --force)          FORCE=1;   shift 1;;
+    --target-commit)  TC="$2";   shift 2;;
+    --target-kernel)  TK="$2";   shift 2;;
     *) echo "未知参数: $1"; exit 1;;
   esac
 done
@@ -89,12 +93,30 @@ else
   echo "ℹ️  未提供 --openclash-core: kit 不含内核二进制 (升级时依赖 zzz-restore 运行时兜底下载)"
 fi
 
+# 2026-11-13: 写入无敏感信息的 kit manifest, 供 upgrade_router.sh 的 verify_kit() 核验
+# "这份 kit 是不是按仓库当前源码 / 目标固件重建的"。只记 commit / 内核 / 文件 sha256,
+# 绝不写 SSID / WiFi key / root hash / 订阅 / MAC —— manifest 会随 kit 一起进路由器。
+{
+  echo "kit_schema=1"
+  echo "built_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  echo "target_commit=${TC:-unspecified}"
+  echo "target_kernel=${TK:-unspecified}"
+  echo "source_router_commit=unspecified"
+  echo "source_kernel=unspecified"
+  echo "restore_script_sha256=$(shasum -a 256 "$BUILD/etc/uci-defaults/zzz-restore-router" 2>/dev/null | awk '{print $1}')"
+  if [ -f "$BUILD/etc/openclash/core/clash_meta" ]; then
+    echo "clash_core_sha256=$(shasum -a 256 "$BUILD/etc/openclash/core/clash_meta" 2>/dev/null | awk '{print $1}')"
+  else
+    echo "clash_core_sha256=absent"
+  fi
+} > "$BUILD/etc/kit-manifest"
+
 mkdir -p "$(dirname "$OUT")"
 # --no-mac-files 双保险(不支持该旗标的 tar 会报错, 此时退回普通打包, COPYFILE_DISABLE 仍生效)
 tar --no-mac-files -czf "$OUT" -C "$BUILD" . 2>/dev/null || tar -czf "$OUT" -C "$BUILD" .
 rm -rf "$BUILD"
 
-echo "✅ 已生成 kit -> $OUT"
+echo "✅ 已生成 kit -> $OUT (含 etc/kit-manifest: 无敏感信息, 供刷前核验)"
 echo "   升级时 upgrade_router.sh 会从活路由器抓取 root shadow / WiFi key / 三频 SSID / OpenClash 配置(core 除外)"
 echo "   以及审计确认的额外配置(dhcp rpcd luci cpufreq watchcat dawn system)与定制路径(crontabs/rc.d/lan_report/token/apk源/http.lua补丁)"
 echo "   注入临时 kit (仅存于 /tmp, 脚本退出即清理), 源码与仓库均无任何明文敏感信息。"
