@@ -28,6 +28,49 @@ find /etc -name '._*' -type f -exec rm -f {} \; 2>/dev/null
 find /etc/config -name '*.apk-new' -type f -exec rm -f {} \; 2>/dev/null
 echo "已清理 /etc 下 AppleDouble 垃圾(._*) 与 apk 残留(*.apk-new)" >>$LOG
 
+# ---------- 0.3 离线恢复第三方程序文件 (2026-11-15, wipe-config 决定性) ----------
+# 实证: 1115 出厂 1710.config 明写 "# CONFIG_PACKAGE_luci-app-openclash is not set",
+#   出厂 init.d/config 全无; 且 downloads.immortalwrt.org 与 mirrors.vsean.net 的
+#   luci/packages.adb(422120B) / packages.adb(802074B) 中 openclash 命中均为 0
+#   -> 首启动联网 apk add 必然失败, 配置导入了而程序不在 = 代理网关断。
+# 解法: Mac 侧 collect_runtime 把活路由的程序文件(apk 包全量 + /usr/share/openclash
+#   运行时脚本)打成 etc/zzz-oc-app.tar.gz 注入 kit; 此处在 uci-defaults 阶段
+#   (不依赖网络)直接解到 /, 让 /etc/init.d/openclash 在后续服务态处理时就位。
+OC_APP=/etc/zzz-oc-app.tar.gz
+if [ -f "$OC_APP" ]; then
+  if tar -xzf "$OC_APP" -C / 2>/dev/null; then
+    chmod 755 /etc/init.d/openclash 2>/dev/null || true
+    echo "✅ 已从 kit 离线恢复 OpenClash 程序文件(零联网, 无需 apk add)" >>$LOG
+  else
+    echo "❌ 离线 OpenClash 程序包解包失败(OpenClash 将无法启动)" >>$LOG
+  fi
+  rm -f "$OC_APP" 2>/dev/null
+else
+  echo "ℹ️ kit 未携带离线程序包(旧 kit), rc.local 保留联网 apk add 兜底" >>$LOG
+fi
+
+# ---------- 0.4 离线恢复其余第三方程序 (2026-11-15 二) ----------
+# 1115 出厂 init.d 与升级前差 8 个服务; airoha-npu / cpufreq 是新版明确移除的(不恢复),
+# 余下 dawn / pushbot / tailscale(+derp-home) / wifihistory 由 kit 的
+# etc/zzz-extra-app.tar.gz 离线还原(含 tailscaled.state 节点身份, 保持同一节点)。
+# 同样在 uci-defaults 阶段解到 /, 不依赖网络; 不导入旧 /etc/rc.d 链接(编号会漂移),
+# 启用态由下面 3.6 段按服务名重建。
+EXTRA_APP=/etc/zzz-extra-app.tar.gz
+if [ -f "$EXTRA_APP" ]; then
+  if tar -xzf "$EXTRA_APP" -C / 2>/dev/null; then
+    for _svc in dawn pushbot tailscale tailscale-derp-home wifihistory; do
+      [ -f "/etc/init.d/$_svc" ] && chmod 755 "/etc/init.d/$_svc" 2>/dev/null
+    done
+    chmod 755 /usr/sbin/tailscale /usr/sbin/tailscaled /usr/sbin/dawn /usr/sbin/wifihistory 2>/dev/null
+    echo "✅ 已从 kit 离线恢复 dawn/pushbot/tailscale/wifihistory 程序文件(零联网)" >>$LOG
+  else
+    echo "❌ 离线第三方程序包解包失败(这些服务刷后可能缺失)" >>$LOG
+  fi
+  rm -f "$EXTRA_APP" 2>/dev/null
+else
+  echo "ℹ️ kit 未携带离线第三方程序包(旧 kit)" >>$LOG
+fi
+
 # 升级后 root 密码(全清刷后 root 无密码, 必须设置, 否则:
 #   a) 内网任何设备可空密码 LAN SSH 进 root; b) 非交互脚本 ssh 连不上无法终验)
 # root 密码 / WiFi key / 三频 SSID / LAN IP / DHCP 静态租约 均不再硬编码: 升级前由 Mac 侧
@@ -59,19 +102,184 @@ if [ "$POLICY" = "selective" ]; then
   # wipe-config 版本: 新版出厂 network/wireless 由 board.d + 03_wireless +
   # 22_airoha-network-migrate-v4 生成, 本脚本绝不整文件覆写, 只补丁恢复纯身份数据。
   # 本脚本名 zzz-* 排在全部 uci-defaults 之后执行, 此时新版配置已生成, 补丁顺序正确。
+  # ⚠️ 2026-11-15 沙盒实证: 03_wireless 要等 phy0 最多 20s 才 wifi config;
+  #   驱动晚于 uci-defaults 时 wireless.@wifi-iface[*] 根本不存在, 真实 uci 会报
+  #   "Invalid argument"。旧代码用 2>/dev/null || true 全部吞掉, 却照样打印"已恢复"
+  #   -> 静默留下出厂 SSID/密码, 且强终验查不出。此处改为逐项判存在并显式记账。
+  _wifi_pending=0
   [ -n "$LAN_IP" ] && uci set network.lan.ipaddr="$LAN_IP" 2>/dev/null || true
   _i=0
   for _ss in "$SSID0" "$SSID1" "$SSID2"; do
-    [ -n "$_ss" ] && uci set "wireless.@wifi-iface[$_i].ssid=$_ss" 2>/dev/null || true
-    [ -n "$WIFI_KEY" ] && uci set "wireless.@wifi-iface[$_i].key=$WIFI_KEY" 2>/dev/null || true
+    if [ -n "$_ss" ]; then
+      if uci -q get "wireless.@wifi-iface[$_i]" >/dev/null 2>&1; then
+        uci set "wireless.@wifi-iface[$_i].ssid=$_ss" 2>/dev/null || _wifi_pending=1
+        if [ -n "$WIFI_KEY" ]; then
+          uci set "wireless.@wifi-iface[$_i].key=$WIFI_KEY" 2>/dev/null || _wifi_pending=1
+        fi
+      else
+        _wifi_pending=1
+      fi
+    fi
     _i=$((_i+1))
   done
   # 6G 按当前决策保持关闭(与 full 策略 heredoc 一致); 其余射频参数一律沿用新版出厂
-  uci set wireless.radio2.disabled='1' 2>/dev/null || true
-  uci set wireless.@wifi-iface[2].disabled='1' 2>/dev/null || true
+  uci set wireless.radio2.disabled='1' 2>/dev/null || _wifi_pending=1
+  uci set wireless.@wifi-iface[2].disabled='1' 2>/dev/null || _wifi_pending=1
   uci commit network 2>/dev/null || true
   uci commit wireless 2>/dev/null || true
-  echo "已按补丁方式恢复 LAN IP / 三频 SSID+key / 6G 关闭; network/wireless 主体沿用新版生成结果" >>$LOG
+  if [ "$_wifi_pending" = "1" ]; then
+    : > /etc/zzz-wifi-pending
+    echo "⚠️ 首启动时 wireless 节未全部生成(驱动未就绪), SSID/key 补丁延后到 rc.local 二次执行; 此刻绝不宣称已恢复" >>$LOG
+  else
+    rm -f /etc/zzz-wifi-pending 2>/dev/null
+    echo "✅ 已按补丁方式恢复 LAN IP / 三频 SSID+key / 6G 关闭; network/wireless 主体沿用新版生成结果" >>$LOG
+  fi
+
+  # ---------- 0.5 语义级配置迁移表 (2026-11-15 二, wipe-config 版本的「配置不丢」闭环) ----------
+  # 解包 1115 出厂镜像实证: 9 个 /etc/config 被新版主动改写(DIFF), 整文件导入会破坏出厂默认:
+  #   firewall 出厂已自带 fullcone=1 且规则更全(4159B vs 本机 3261B);
+  #   uhttpd 出厂 4569B vs 本机 742B; openssl 本机是空文件;
+  #   luci 出厂**没有 glass 主题**(只有 argon/bootstrap), 导入 mediaurlbase=/luci-static/glass 会白屏;
+  #   rpcd 出厂**没有 homepage 系统用户**, 只导入 login 段仍认证失败(Homepage 仪表盘读不到数据)。
+  # 故以 1115 出厂配置为基底, 按下面硬编码**键白名单**从 kit 的参考快照逐键取值回写。
+  # 值(含 zerotier secret / shadow hash)只在运行时 kit 里, 源码与 GitHub 零明文。
+  REF=/etc/zzz-config-ref.tar.gz
+  REFDIR=/tmp/zzz-config-ref
+  if [ -f "$REF" ]; then
+    rm -rf "$REFDIR"; mkdir -p "$REFDIR"
+    if tar -xzf "$REF" -C "$REFDIR" 2>/dev/null && [ -d "$REFDIR/etc/config" ]; then
+      _mig=0
+      _rget(){ uci -c "$REFDIR/etc/config" -q get "$1" 2>/dev/null; }
+      _rset(){ # <target-key> [ref-key]: 单值 option, 参考里没有就跳过(保留出厂默认)
+        local _k="$1" _rk="${2:-$1}" _v
+        _v=$(_rget "$_rk") || return 0
+        [ -n "$_v" ] || return 0
+        uci -q set "$_k=$_v" 2>/dev/null || { echo "  ⚠️ 键迁移失败: $_k" >>$LOG; return 0; }
+        _mig=$((_mig+1))
+      }
+      _rlist(){ # <target-key> [ref-key]: list, 先清再加(保真, 不去重)
+        local _k="$1" _rk="${2:-$1}" _v _x
+        _v=$(_rget "$_rk") || return 0
+        [ -n "$_v" ] || return 0
+        uci -q delete "$_k" 2>/dev/null
+        printf '%s\n' "$_v" | while IFS= read -r _x; do
+          [ -n "$_x" ] && uci -q add_list "$_k=$_x" 2>/dev/null
+        done
+        _mig=$((_mig+1))
+      }
+      _addlist(){ local _k="$1" _v="$2" _x
+        uci -q delete "$_k" 2>/dev/null
+        printf '%s\n' "$_v" | while IFS= read -r _x; do
+          [ -n "$_x" ] && uci -q add_list "$_k=$_x" 2>/dev/null
+        done; }
+
+      # --- dhcp: dnsmasq 定制(OpenClash DNS 链路) + odhcpd 段 + lan 的 RA 定制 ---
+      for _o in cachesize noresolv localuse logdhcp logqueries min_cache_ttl use_stale_cache ednspacket_max; do
+        _rset "dhcp.@dnsmasq[0].$_o"
+      done
+      _rlist "dhcp.@dnsmasq[0].server"
+      # 出厂有 resolvfile 而升级前没有(noresolv=1 时它无意义), 删掉以完全对齐
+      [ "$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)" = "1" ] && uci -q delete dhcp.@dnsmasq[0].resolvfile 2>/dev/null
+      for _o in ra ra_slaac ndp ra_dns dns_service ra_flags max_preferred_lifetime max_valid_lifetime; do
+        _rset "dhcp.lan.$_o"
+      done
+      if [ -n "$(_rget dhcp.odhcpd)" ]; then
+        uci -q set dhcp.odhcpd=odhcpd 2>/dev/null
+        for _o in maindhcp leasefile leasetrigger loglevel piodir hostsdir; do
+          _rset "dhcp.odhcpd.$_o"
+        done
+        _mig=$((_mig+1))
+      fi
+      uci -q commit dhcp 2>/dev/null
+
+      # --- firewall: 只补本机独有的 include 段与 lan zone 定制, 绝不整体覆写 ---
+      for _n in zerotier_input zerotier_srcnat zerotier_forward openclash; do
+        [ -n "$(_rget "firewall.$_n")" ] || continue
+        uci -q set "firewall.$_n=include" 2>/dev/null || continue
+        for _o in type path position chain; do _rset "firewall.$_n.$_o"; done
+        _mig=$((_mig+1))
+      done
+      _rset firewall.@zone[0].mtu_fix
+      _tv=$(_rget firewall.@zone[0].device) || _tv=""
+      [ -n "$_tv" ] && _addlist "firewall.@zone[0].device" "$_tv"
+      uci -q commit firewall 2>/dev/null
+
+      # --- luci: 只恢复语言/诊断项; 主题绝不导入(1115 无 glass, 会白屏) ---
+      # ⚠️ UCI 键第 2 段是 section **名**(config core 'main' -> main), 不是类型(core)。
+      #   早期写成 luci.core.main.lang 这种 4 段键, 真实 uci 报 Invalid argument 被 || 吞掉,
+      #   语言/诊断项静默不恢复。沙盒实证后改为下面 3 段形式。
+      _rset luci.main.lang
+      _rset luci.languages.zh_cn
+      for _o in dns ping route; do _rset "luci.diag.$_o"; done
+      uci -q commit luci 2>/dev/null
+      echo "  ℹ️ luci 主题沿用 1115 出厂默认(glass 主题在新版不存在, 需另行安装)" >>$LOG
+
+      # --- rpcd: 补 homepage 只读登录段 + 同步创建系统用户(1115 出厂无此用户) ---
+      if [ -s "$REFDIR/etc/passwd.homepage" ]; then
+        _idx=""
+        for _i in 0 1 2 3 4 5 6 7 8 9; do
+          if [ "$(_rget "rpcd.@login[$_i].username")" = "homepage" ]; then _idx="$_i"; break; fi
+        done
+        if [ -n "$_idx" ]; then
+          _new=$(uci -q add rpcd login 2>/dev/null)
+          if [ -n "$_new" ]; then
+            for _o in username password; do
+              _v=$(_rget "rpcd.@login[$_idx].$_o")
+              [ -n "$_v" ] && uci -q set "rpcd.$_new.$_o=$_v" 2>/dev/null
+            done
+            _v=$(_rget "rpcd.@login[$_idx].read")
+            [ -n "$_v" ] && _addlist "rpcd.$_new.read" "$_v"
+            uci -q commit rpcd 2>/dev/null
+            _mig=$((_mig+1))
+          fi
+        fi
+        grep -q '^homepage:' /etc/passwd 2>/dev/null || cat "$REFDIR/etc/passwd.homepage" >> /etc/passwd
+        if ! grep -q '^homepage:' /etc/shadow 2>/dev/null && [ -s "$REFDIR/etc/shadow.homepage" ]; then
+          cat "$REFDIR/etc/shadow.homepage" >> /etc/shadow
+          chmod 600 /etc/shadow 2>/dev/null
+        fi
+        chmod 644 /etc/passwd 2>/dev/null
+        echo "  ✅ 已恢复 homepage 只读用户(系统用户 + rpcd login), Homepage 仪表盘可继续读取" >>$LOG
+      fi
+
+      # --- watchcat / zerotier / uhttpd / smartdns: 只迁用户实际改过的键 ---
+      _rset watchcat.@watchcat[0].pinghosts
+      uci -q commit watchcat 2>/dev/null
+      for _o in secret enabled fw_allow_input; do _rset "zerotier.global.$_o"; done
+      for _o in enabled id allow_managed allow_global allow_default allow_dns fw_allow_input fw_allow_forward fw_allow_masq; do
+        _rset "zerotier.earth.$_o"
+      done
+      uci -q commit zerotier 2>/dev/null
+      for _o in max_requests script_timeout ubus_prefix; do _rset "uhttpd.main.$_o"; done
+      uci -q commit uhttpd 2>/dev/null
+      _rset smartdns.@smartdns[0].enabled
+      uci -q commit smartdns 2>/dev/null
+      # openssl: 升级前是空文件(用户主动禁用 devcrypto), 保留 1115 出厂默认, 不回写空配置
+      echo "  ℹ️ openssl 保留出厂默认(升级前为空文件); 如需禁用 devcrypto 请手动清空" >>$LOG
+
+      # 归档含真实 secret(zerotier / homepage hash), 移出 /etc 并限权, 供刷后人工核对
+      mkdir -p /root/router-upgrade-logs
+      _refout="/root/router-upgrade-logs/config-reference-$(date +%Y%m%d-%H%M%S).tar.gz"
+      if mv -f "$REF" "$_refout" 2>/dev/null; then
+        chmod 600 "$_refout" 2>/dev/null
+        echo "  📦 配置原文快照: $_refout (权限 600)" >>$LOG
+      else
+        rm -f "$REF" 2>/dev/null
+      fi
+      echo "✅ 语义级迁移完成: $_mig 组键已从升级前配置回写, 9 个 DIFF 文件的出厂默认保持不变" >>$LOG
+    else
+      echo "⚠️ 配置参考快照解包失败: 9 个 DIFF 文件的用户定制未迁移" >>$LOG
+    fi
+    rm -rf "$REFDIR" 2>/dev/null
+  else
+    echo "⚠️ kit 未携带配置参考快照(旧 kit): 9 个 DIFF 文件的用户定制不会自动恢复" >>$LOG
+  fi
+
+  # --- 离线恢复的第三方服务: 按服务名重建启用态(不导入旧 rc.d, 编号已漂移) ---
+  for _svc in dawn pushbot tailscale tailscale-derp-home wifihistory; do
+    [ -x "/etc/init.d/$_svc" ] && /etc/init.d/$_svc enable >>$LOG 2>&1
+  done
+  echo "✅ 已按服务名重建离线第三方程序启用态: dawn pushbot tailscale tailscale-derp-home wifihistory" >>$LOG
 else
 # ---------- 1. network: 还原 LAN IP / 桥接 / WAN ----------
 # 优先使用 kit 携带的真实配置(由 Mac 侧 collect_runtime 从活路由抓取, 含用户自定义信道/功率/桥接);
@@ -341,6 +549,34 @@ cat > /etc/rc.local <<'RCEOF'
 # zzz-restore-router 注入: 首启动后网络就绪再装 OpenClash 并启动
 # 仅执行一次(sentinel: /etc/zzz-postinstall-done)
 if [ ! -f /etc/zzz-postinstall-done ]; then
+  # ---------- 0.1 无线身份二次补丁 (2026-11-15, 沙盒实证 B/C 场景) ----------
+  # uci-defaults 阶段 wifi-iface 可能尚未生成; 到 rc.local(S95done 之后)驱动早已就绪。
+  # 从 kit 的 router-secrets 重读 SSID/key 补写, 完成后立即删除敏感文件。
+  if [ -f /etc/zzz-wifi-pending ]; then
+    _wok=1
+    _wk=$(grep '^WIFI_KEY=' /etc/router-secrets 2>/dev/null | cut -d= -f2-)
+    for _v in SSID0 SSID1 SSID2; do
+      _ws=$(grep "^${_v}=" /etc/router-secrets 2>/dev/null | cut -d= -f2-)
+      [ -n "$_ws" ] || continue
+      _wi=$(printf '%s' "$_v" | sed 's/SSID//')
+      if uci -q get "wireless.@wifi-iface[$_wi]" >/dev/null 2>&1; then
+        uci set "wireless.@wifi-iface[$_wi].ssid=$_ws" 2>/dev/null || _wok=0
+        [ -n "$_wk" ] && uci set "wireless.@wifi-iface[$_wi].key=$_wk" 2>/dev/null || _wok=0
+      else
+        _wok=0
+      fi
+    done
+    uci -q set wireless.radio2.disabled='1' 2>/dev/null || _wok=0
+    uci -q set wireless.@wifi-iface[2].disabled='1' 2>/dev/null || _wok=0
+    uci commit wireless 2>/dev/null || true
+    /sbin/wifi reload >/dev/null 2>&1 || true
+    if [ "$_wok" = "1" ]; then
+      echo "✅ rc.local 二次补丁完成: SSID/key 已恢复" >>/tmp/zzz-postinstall.log
+    else
+      echo "❌ rc.local 二次补丁仍有失败项(驱动异常?), 请人工核对 SSID" >>/tmp/zzz-postinstall.log
+    fi
+    rm -f /etc/zzz-wifi-pending /etc/router-secrets 2>/dev/null
+  fi
   # ---------- 0. 恢复"用户禁用"的服务(末段强制, 覆盖包 postinst 重建 rc.d 链接) ----------
   # zzz-restore 早期已删过一次链接, 但 watchcat 等包的 postinst 会在其后重建, 致禁用态失效
   # (实测 2026-10-28 升级后 watchcat 被重新启用, 且首启动禁用逻辑未可靠生效)。
@@ -371,6 +607,11 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
   # 首启动早期仓库可能瞬断(实测 2026-10-28: 仅主机可达但 .adb 文件 unexpected end of file,
   # 旧逻辑只 ping 主机误判连通, 6 次 apk add 全失败, 最终靠手动补救)。改为: 以 apk update 成功
   # 为连通判据, 上限 ~5 分钟; 成功后再重试 apk add(最多 8 次, 间隔 15s)。
+  # 离线优先: 若 kit 已在 uci-defaults 阶段解出 /etc/init.d/openclash, 完全跳过联网装机。
+  # 1115 出厂不含此包且全部 feed 无此包, 联网路径在此版本上必然失败 —— 仅作旧 kit 兜底。
+  if [ -x /etc/init.d/openclash ]; then
+    echo "✅ OpenClash 程序已由 kit 离线恢复, 跳过 apk add (零联网依赖)" >>/tmp/zzz-postinstall.log
+  else
   _repo_host=$(grep -rhoE 'https?://[^/ ]+' /etc/apk/repositories.d/ 2>/dev/null | sed -E 's#https?://##; s#/.*##' | head -1)
   _repo_host=${_repo_host:-mirrors.vsean.net}
   _apk_ok=0
@@ -401,6 +642,7 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
       touch /etc/zzz-postinstall-done
     fi
     exit 0
+  fi
   fi
   rm -f /etc/zzz-oc-retry 2>/dev/null
   # ---------- OpenClash 内核(clash_meta 二进制)恢复: P1 根治"全清刷后内核丢失" ----------
@@ -482,6 +724,12 @@ fi
 
 echo "=== zzz-restore-router 结束 $(date) ===" >>$LOG
 # 清理: 升级前注入的敏感文件用后删除, 减少明文 hash 在运行系统驻留
-rm -f "$SECRETS" /etc/dhcp-hosts.uci 2>/dev/null
+# 无线身份补丁若延后到 rc.local, 需保留 router-secrets 供二次补丁读取;
+# rc.local 完成(或尽力尝试)后立即删除, 敏感文件不长期驻留运行系统。
+if [ ! -f /etc/zzz-wifi-pending ]; then
+  rm -f "$SECRETS" /etc/dhcp-hosts.uci 2>/dev/null
+else
+  rm -f /etc/dhcp-hosts.uci 2>/dev/null
+fi
 touch /etc/zzz-restore-done
 exit 0

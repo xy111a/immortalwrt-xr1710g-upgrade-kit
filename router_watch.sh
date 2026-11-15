@@ -159,7 +159,7 @@ case "${rel_flags:-OK}" in
     if [ "$ACK_CONFIG_RESET" = "0" ]; then
       log "⏸ 最新 release [$rel_tag] 是正式版但要求 wipe-config (标记 ${rel_flags})"
       log "   ⚠️ 这不是测试版, 无需再等; 但旧配置与新版不兼容, 本工具会自动切 selective 策略,"
-      log "      只恢复身份数据 + OpenClash, 其余 /etc/config 需人工重配。"
+      log "      自动恢复: 身份数据 + 10 个 ONLY-LIVE 第三方配置(整文件) + 9 个 DIFF 文件(键级迁移表) + OpenClash/4 个第三方程序(离线注入); 少数项(glass 主题/openssl)仍需人工核对。"
       log "   处置: 人工核对发布说明与重配清单后, 用 --now --ack-config-reset 显式确认(默认不擅自丢配置)"
       exit 0
     fi

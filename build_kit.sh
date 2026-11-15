@@ -100,9 +100,12 @@ fi
 # "这份 kit 是不是按仓库当前源码 / 目标固件重建的"。只记 commit / 内核 / 文件 sha256,
 # 绝不写 SSID / WiFi key / root hash / 订阅 / MAC —— manifest 会随 kit 一起进路由器。
 {
-  echo "kit_schema=2"
+  echo "kit_schema=3"
+  echo "offline_app_mode=collect_runtime"
   echo "built_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
   echo "config_policy=$CP"
+  echo "offline_services=dawn pushbot tailscale wifihistory"
+  echo "config_ref=generated_at_runtime_by_collect_runtime"
   echo "target_commit=${TC:-unspecified}"
   echo "target_kernel=${TK:-unspecified}"
   echo "source_router_commit=unspecified"
@@ -126,3 +129,5 @@ echo "   full 策略: 额外配置 + 定制路径(crontabs/rc.d/lan_report/token
 echo "   selective 策略(wipe-config 版本): 仅身份数据 + OpenClash + crontab/脚本/customfeeds.list, 不导入旧 /etc/config"
 echo "   注入临时 kit (仅存于 /tmp, 脚本退出即清理), 源码与仓库均无任何明文敏感信息。"
 echo "   若提供了 --openclash-core, 内核已烘焙进 kit, 全清刷后内核不丢; 否则 zzz-restore 运行时兜底下载。"
+echo "   selective(wipe-config): collect_runtime 额外从活路由抓取 OpenClash 程序文件打进"
+echo "   etc/zzz-oc-app.tar.gz, 首启动离线解包 —— 1115 出厂及全部 feed 均无该包, 联网 apk add 必失败。"

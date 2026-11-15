@@ -202,9 +202,55 @@ router_watch.sh --now --ack-config-reset           # 守护默认停在配置确
 
 ### 升级后要人工做什么
 
-`selective` 模式下 `collect_runtime()` 会生成 `~/router-upgrade-logs/config-restore-todo-<时间戳>.md`，列出本机全部 `/etc/config` 及「自动恢复 / 人工重配」标记（**只记文件名与大小，不含密钥/订阅**）。典型需人工重配：`dhcp` 的 dnsmasq 定制（`noresolv` / `127.0.0.1#7874` / `cachesize` / 日志开关）、`rpcd` 的 homepage 只读用户、`luci` 主题（glass）、`zerotier` 网络与 secret、`watchcat`、`smartdns`、`uhttpd`、以及 `dawn`/`usteer`/`msd_lite`/`socat`/`udpxy`/`rtp2httpd`/`glass`/`pushbot`/`meshconf` 等新版未预装包的配置。
+`selective` 模式下 `collect_runtime()` 会生成 `~/router-upgrade-logs/config-restore-todo-<时间戳>.md`，列出本机全部 `/etc/config` 及处理标记（**只记文件名与大小，不含密钥/订阅**）。2026-11-15（二）之后，下表绝大多数项已自动恢复：10 个 ONLY-LIVE 第三方配置整文件导入、9 个 DIFF 文件按键级迁移表回写、OpenClash 与 4 个第三方程序离线注入；仍需人工核对的主要是 `glass` 主题（1115 出厂无，需另装）、`openssl` 空文件语义，以及未离线化的 `usteer`/`socat`/`udpxy` 等程序本体（配置已保真，程序需另行装回）。
 
-> 明确**不用改**、跨版本安全：OpenClash 全链路（`/etc/config/openclash` + `zzz-oc-data` + `clash_meta` + rc.local 装机）、root shadow / WiFi key / SSID / LAN IP / DHCP host / dropbear host key / `authorized_keys`、`/etc/crontabs` 用户项、`auto_rollback()` 的 `sysupgrade -F -f rb-config.tar.gz`（回退目标是旧固件，旧配置匹配）。
+> 明确**不用改**、跨版本安全：OpenClash 全链路（`/etc/config/openclash` + `zzz-oc-data` + `clash_meta` + **kit 离线程序注入**）、root shadow / WiFi key / SSID / LAN IP / DHCP host / dropbear host key / `authorized_keys`、`/etc/crontabs` 用户项、`auto_rollback()` 的 `sysupgrade -F -f rb-config.tar.gz`（回退目标是旧固件，旧配置匹配）。
 
-> ⚠️ **真刷前仍必须重建 `kit.tar.gz`**：当前仓库根 kit 停留在 2026-10-08，内嵌自举脚本不含本次 selective 分支，`verify_kit pre` 会拦下。重建时针对 wipe-config 版本加 `--config-policy selective`。
+> ✅ **`kit.tar.gz` 已重建为 selective 版**（2026-11-15 二），内嵌自举脚本 sha 与仓库源码逐字节一致、manifest `kit_schema=3` / `config_policy=selective`，`verify_kit pre` 通过。旧 10-08 kit 已备份到 `dist/kit-legacy-20261008.tar.gz`。注意：`zzz-oc-app` / `zzz-extra-app` / `zzz-config-ref` 是 `collect_runtime()` 在真实刷机时从活路由动态注入的，静态 kit 不含它们，这是设计而非缺陷。
+
+### 2026-11-15 深度审计后的加固（源码级 + 沙盒实证）
+
+**① 第三方程序离线化（决定性）**
+解包 1115 官方镜像并比对 tag `20261115` 源码（9/9 逐字节一致）后发现：`1710.config` 明写 `# CONFIG_PACKAGE_luci-app-openclash is not set`，出厂 `init.d` / `config` 全无；`downloads.immortalwrt.org` 与 `mirrors.vsean.net` 的 `luci/packages.adb`(422120B)、`packages.adb`(802074B) 中 openclash 命中均为 **0** —— 旧 `rc.local` 的 `apk add luci-app-openclash` 重试 8 次必然失败，配置导入了而程序不在，代理网关断、强终验 FAIL、自动回退。
+
+改为：`collect_runtime()` 在 `selective` 下从活路由导出 `apk info -L luci-app-openclash` 的 222 个包内文件 + `/usr/share/openclash`（9.1M 运行时脚本）+ luci cbi/view，打成 `etc/zzz-oc-app.tar.gz` 注入 kit；`zzz-restore-router` 在 uci-defaults 阶段（零联网）解到 `/`。OpenClash 的 13 个依赖（bash/ruby/dnsmasq-full/kmod-tun/kmod-nft-tproxy/…）在 1115 出厂 **全部齐备**，故无需装包。`verify_kit final` 强制校验包内 `etc/init.d/openclash` 与 `usr/share/openclash/`；强终验增加「配置在但程序不在 → FAIL」。
+
+> ✅ **本条已于 2026-11-15（二）闭环**：`dawn` / `pushbot` / `tailscale` / `wifihistory` 已纳入 `etc/zzz-extra-app.tar.gz` 离线注入（详见下方 ④）；1115 出厂**自带** `smartdns` / `zerotier` / `watchcat`，其用户定制由 ③ 的键级迁移表恢复，不再是人工重配项。
+
+**② 无线身份补丁不再谎报成功（离线 UCI 沙盒实证）**
+在 `/tmp` 用 Python UCI 兼容层 + 命令 mock 真跑 1115 的 `03_wireless` / `11_network-migrate-bridges` / `18-firewall-defaults` / `22-migrate` 与 zzz 的 selective 补丁段，三场景结果：
+
+| 场景 | 结果 |
+|---|---|
+| phy 就绪、3 个 wifi-iface | ✅ SSID/key/LAN IP/radio2 全部正确 |
+| phy 未就绪、无 wireless | ❌ 补丁全静默失败，**旧代码仍打印「已按补丁方式恢复」并成功退出** |
+| 只生成 2 个 wifi-iface | ❌ 6G SSID 丢失，同样谎报成功 |
+
+根因：`03_wireless` 等 `phy0` 最多 20s 才 `wifi config`；驱动晚于 uci-defaults 时 `@wifi-iface[*]` 不存在，真实 `uci set` 报 `Invalid argument`，被 `2>/dev/null || true` 吞掉。现改为逐项 `uci -q get` 判存在、失败写 `/etc/zzz-wifi-pending` 且明确告警，`rc.local`（S95done 之后，驱动已就绪）二次补丁并 `wifi reload`，完成后删除 `router-secrets`；强终验发现残留标记即判 FAIL。
+
+
+### 2026-11-15（二）剩余问题闭环：配置还原 / 第三方程序 / 闸语义
+
+**③ 语义级配置迁移表 ——「配置不丢」闭环**
+
+逐文件比对本机 50 个 `/etc/config` 与 1115 出厂 40 个：**22 逐字节相同**（出厂自带，无需导入）、**9 被新版改写（DIFF）**、**19 仅本机有（ONLY-LIVE）**。DIFF 的 9 个绝不能整文件导入：出厂 `firewall` 已自带 `fullcone=1` 且规则更全、`uhttpd` 4569B vs 本机 742B、`luci` 出厂**无 glass 主题**（只有 argon/bootstrap，导入 `mediaurlbase=/luci-static/glass` 会白屏）、`rpcd` 出厂**无 homepage 系统用户**（只导 login 段仍认证失败）。
+
+- `collect_runtime()` 把活路由全量 `/etc/config` + `homepage` 的 passwd/shadow 行打成**不生效**的嵌套归档 `etc/zzz-config-ref.tar.gz` 注入 kit；值只在运行时 kit，源码与 GitHub 零明文。
+- `zzz-restore-router` 在新版出厂配置之上，按硬编码**键白名单**用 `uci -c <参考目录>` 逐键取值回写：dhcp 的 dnsmasq 定制（`noresolv` / `127.0.0.1#7874` / `cachesize` / 日志项）、`odhcpd` 段、lan 的 RA 定制、firewall 的 4 个 include 段与 `tailscale0`、luci 仅语言（主题保留出厂默认，防白屏）、rpcd 的 homepage login **并同步创建系统用户**、watchcat `223.5.5.5`、zerotier secret+network、uhttpd 性能项；openssl 升级前是空文件，保留出厂默认。
+- 归档用后移到 `~/router-upgrade-logs/config-reference-*.tar.gz`（chmod 600）供人工核对，临时解包目录即删。
+- ONLY-LIVE 里 10 个第三方配置（`openclash dawn pushbot glass meshconf msd_lite rtp2httpd socat udpxy usteer`）在 1115 出厂**根本不存在**，整文件导入不覆盖任何出厂默认，加入 `SAFE_CONFIGS` 白名单自动恢复；其余 9 个（network/wireless/system/airoha_npu/npu-monitor/cpufreq/fstab/ubootenv/ubihealthd）明确不导入。
+
+沙盒实证：以 1115 出厂配置为基底、脱敏升级前配置为参考，真跑迁移段 **23/23 断言通过**（含 `fullcone` 出厂默认未被破坏、主题未指向 glass、secret 动态恢复、系统用户创建、firewall include 段生成）。过程中抓到并修正一处真实缺陷：UCI 键第 2 段是 **section 名**（`config core 'main'` → `main`），早期写成 `luci.core.main.lang` 四段键会被真实 uci 判为 `Invalid argument` 并静默吞掉。
+
+**④ 其余第三方程序离线化 + 刷前空间预检**
+
+1115 出厂 `init.d` 与本机差 8 个服务：`airoha-npu` / `cpufreq` 是新版明确移除的（绝不恢复），`openclash` 已处理，余下 `dawn` / `luci-app-pushbot`（apk 包）与 `tailscale` / `wifihistory`（手工部署，不属任何 apk 包）由 `etc/zzz-extra-app.tar.gz` 离线注入。实测 **36MB / 48 条目**，含 `tailscale`(30MB) + `tailscaled`(39MB)、5 个 init.d 与 `tailscaled.state` 节点身份；首启动解到 `/` 并按服务名重建启用态，零联网。
+
+踩坑实录：BusyBox `sort -u -o FILE FILE` **不写目标文件、把排序结果吐到 stdout**，污染 SSH 返回的 tar 流，造成「文件 36MB 但 `tar -tzf` 读出 0 条目」；改为 `sort -u FILE > tmp && mv` 后通过。`apk info -L` 输出不带前导 `/`，须按路径前缀白名单匹配。
+
+因 kit 从 20MB 增至约 56MB，新增**刷前 `/overlay` 空间预检**（实测该机可用 256MB，`sysupgrade -f` 解压约需 130MB+；空间不足会在写 UBI 中途失败 = 半写变砖，故 fail-closed）。`verify_kit final` 新增强制校验：`zzz-extra-app` 含 `usr/sbin/tailscaled` 与 `etc/init.d/dawn`、`zzz-config-ref` 含 `etc/config/dhcp`，缺一即拒 —— 只列文件名，不读归档内容，避免触碰 zerotier secret / shadow hash / 节点私钥。单元测试 **8/8**。
+
+**⑤ 复位闸语义：`--ack-manual-reboot`**
+
+`precheck_recent_crash()` 是纯机械判据（`UBIFS recovery>0 && uptime<48h`），区分不了人工硬重启与故障。新增 `--ack-manual-reboot`：默认闸不变，只是给「已确认是本人主动重启」一条可审计的显式放行路径，且**仍实测并打印** recovery/uptime 留痕，不把人工操作误记为故障。`--allow-recent-crash` 保留兼容；72h 沉淀闸不动。
 

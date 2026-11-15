@@ -36,7 +36,9 @@ export COPYFILE_DISABLE=1
 #   --auto     强终验失败自动回退 (供 router_watch.sh 调用)
 #   --force    仅跳过"发布满 72h"沉淀闸 (2026-11-04 窄化: 不再关闭 sha256 完整性校验)
 #   --allow-same-version    允许重刷"当前正在运行的版本"(默认拒绝, 防白刷)
-#   --allow-recent-crash    允许在近期异常硬复位(UBIFS recovery)后刷机 (默认拒绝)
+#   --allow-recent-crash    允许在近期异常硬复位(UBIFS recovery)后刷机 (默认拒绝, 语义模糊)
+#   --ack-manual-reboot     显式确认"近期硬复位是本人主动重启"(默认拒绝); 与上一个等价放行,
+#                           但会强制打印实测 recovery/uptime 并留审计痕, 不把人工操作误记为故障
 #   --allow-unverified-sha  仅在"完全拿不到任何官方基准"时允许无校验刷入 (有基准但不匹配永远拒绝)
 #   --allow-test-build      允许刷入被识别为"测试版 / 预发布"的官方最新 release (默认拒绝)
 #   --allow-unverified-t2   允许在"刷前读不到 U-Boot/T2 兜底"时仍刷机 (默认拒绝, 自担风险)
@@ -45,7 +47,7 @@ export COPYFILE_DISABLE=1
 #   --config-policy        覆盖配置策略: full(全量保真) | selective(版本感知选择性重建)
 DRY=0; AUTO=0; FORCE=0; ROUTER_OVERRIDE=""; ITB_OVERRIDE=""; EXPECT_SHA_OVERRIDE=""
 ALLOW_SAME_VERSION=0; ALLOW_RECENT_CRASH=0; ALLOW_UNVERIFIED_SHA=0; ALLOW_TEST_BUILD=0; ALLOW_UNVERIFIED_T2=0; ALLOW_STALE_KIT=0
-ACK_CONFIG_RESET=0; CONFIG_POLICY_OVERRIDE=""
+ACK_CONFIG_RESET=0; CONFIG_POLICY_OVERRIDE=""; ACK_MANUAL_REBOOT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1;;
@@ -53,6 +55,7 @@ while [ $# -gt 0 ]; do
     --force)   FORCE=1;;
     --allow-same-version)   ALLOW_SAME_VERSION=1;;
     --allow-recent-crash)   ALLOW_RECENT_CRASH=1;;
+    --ack-manual-reboot)    ACK_MANUAL_REBOOT=1;;
     --allow-unverified-sha) ALLOW_UNVERIFIED_SHA=1;;
     --allow-test-build)     ALLOW_TEST_BUILD=1;;
     --allow-unverified-t2)  ALLOW_UNVERIFIED_T2=1;;
@@ -91,8 +94,19 @@ EXTRA_CONFIGS="dhcp rpcd luci watchcat dawn system"
 #   SAME 但新版重写控制程序: fan(配置逐字节相同, 排除仅为让新版出厂默认值生效)
 # 命中此表即拒绝随 kit 注入(verify_kit final)。
 INCOMPATIBLE_CONFIGS="airoha_npu fan npu-monitor cpufreq network wireless firewall system fstab ubootenv ubihealthd dhcp luci rpcd smartdns uhttpd watchcat zerotier openssl"
-# selective 策略下唯一允许整文件导入的 /etc/config(第三方包格式未变, 且有专通道抓取)
-SAFE_CONFIGS="openclash"
+# selective 策略下允许整文件导入的 /etc/config (2026-11-15 二, 逐文件实证):
+#   解包 1115 出厂镜像: 本机 50 个 /etc/config, 出厂仅 40 个; 下列 10 项在出厂里
+#   **根本不存在**, 整文件导入不会覆盖任何新版出厂配置, 也不阻断 board.d / uci-defaults
+#   生成。程序侧由 etc/zzz-oc-app.tar.gz + etc/zzz-extra-app.tar.gz 离线恢复
+#   (openclash / dawn / pushbot / wifihistory / tailscale); 其余若程序未装回则是无害的
+#   悬空配置 —— 配置原文得以保真, 且刷后可从 ~/router-upgrade-logs/ 取回。
+#   另 9 个 DIFF 文件(dhcp/firewall/luci/rpcd/uhttpd/smartdns/watchcat/zerotier/openssl)
+#   绝不能整文件导入(新版出厂已主动改写), 走「参考快照 + 键级迁移表」。
+SAFE_CONFIGS="openclash dawn pushbot glass meshconf msd_lite rtp2httpd socat udpxy usteer"
+# selective 下需离线恢复程序的第三方服务: 1115 出厂 init.d 全无, 且官方源 / vsean
+# 镜像的 packages.adb 均无这些包(tailscale / wifihistory 更是手工部署, 不属任何 apk 包)。
+# ⚠️ airoha-npu / cpufreq 是 1115 明确移除的, 绝不在本清单内。
+OFFLINE_SERVICES="dawn pushbot tailscale wifihistory"
 # 出厂之上新增/改写的非 /etc/config 路径(定制脚本/补丁/令牌/启用态, 全清刷即丢):
 #   etc/crontabs             root 计划任务(lan_report.sh 上报 + 关灯计划模板)
 #   etc/lan_report.token     lan_report.sh 的上报令牌(无它 crontab 静默失败)
@@ -166,16 +180,28 @@ precheck_executor_location(){
 # uptime < 48h, 默认拒绝刷机, 需显式 --allow-recent-crash 才放行。
 precheck_recent_crash(){
   echo "---- 近期异常复位预检 ----"
-  if [ "$ALLOW_RECENT_CRASH" = "1" ]; then
-    echo "⚠️ 已由 --allow-recent-crash 显式放行(自担风险)"; return 0
+  # 2026-11-15 二: 机械判据(UBIFS recovery + uptime<48h)区分不了"人工硬重启"与"故障复位"。
+  # 用户已明确说明 11-15 那次重启是自己做的, 日志亦无 Oops/panic(3 条匹配全是 procd watchdog
+  # 正常启动信息)。故新增语义明确的 --ack-manual-reboot: 默认闸不变, 只是给人工操作一条
+  # 可审计的显式放行路径, 且**仍然实测并打印** recovery/uptime, 不掩盖事实。
+  local info rec up_h up_int bypass=0
+  if [ "$ACK_MANUAL_REBOOT" = "1" ]; then
+    echo "✅ 已由 --ack-manual-reboot 显式确认: 本次近期硬复位为人工操作(非故障)"
+    bypass=1
+  elif [ "$ALLOW_RECENT_CRASH" = "1" ]; then
+    echo "⚠️ 已由 --allow-recent-crash 显式放行(自担风险)"
+    bypass=1
   fi
-  local info rec up_h up_int
   info=$(ssh -o ConnectTimeout=8 "$ROUTER" 'r=$(dmesg 2>/dev/null | grep -ci "UBIFS.*recovery needed"); u=$(cut -d" " -f1 /proc/uptime); printf "%s %s\n" "${r:-0}" "${u:-0}"' 2>/dev/null)
   rec=$(printf '%s' "$info" | awk '{print $1}')
   up_h=$(printf '%s' "$info" | awk '{printf "%.1f", $2/3600}')
   up_int=$(printf '%s' "${up_h:-0}" | cut -d. -f1)
   echo "本次启动 UBIFS recovery 标志: ${rec:-?}; uptime: ${up_h:-?}h"
   if [ "${rec:-0}" -gt 0 ] && [ "${up_int:-999}" -lt 48 ]; then
+    if [ "$bypass" = "1" ]; then
+      echo "⚠️ 实测 UBIFS recovery=${rec} / uptime=${up_h}h —— 按上述显式确认放行, 不视为故障(审计留痕)"
+      return 0
+    fi
     if [ "$DRY" = "1" ]; then
       echo "⚠️ [dry-run] 检测到近期异常硬复位(uptime ${up_h}h <48h), 真实执行时本脚本会拒绝刷机"
       return 0
@@ -315,6 +341,53 @@ verify_kit(){
         warn=1
       else
         echo "✅ kit manifest 配置策略一致: ${m_pol:-${CONFIG_POLICY:-full}}"
+      fi
+    fi
+    # ---------- 2026-11-15: selective 必须携带离线 OpenClash 程序包 ----------
+    if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+      local _ocapp _ocinner
+      _ocapp=$(tar -tzf "$KIT" 2>/dev/null | grep -E '(^|/)etc/zzz-oc-app\.tar\.gz$' | head -1)
+      if [ -z "$_ocapp" ]; then
+        echo "🛑 selective kit 缺少离线 OpenClash 程序包 etc/zzz-oc-app.tar.gz"
+        echo "   1115 出厂不含 luci-app-openclash, 官方/vsean feed 均无此包, 联网 apk add 必失败"
+        warn=1
+      else
+        _ocinner=$(tar -xOf "$KIT" "$_ocapp" 2>/dev/null | tar -tzf - 2>/dev/null)
+        if ! printf '%s\n' "$_ocinner" | grep -qE '(^|/)etc/init\.d/openclash$'; then
+          echo "🛑 离线程序包内缺 etc/init.d/openclash"; warn=1
+        elif ! printf '%s\n' "$_ocinner" | grep -q 'usr/share/openclash/'; then
+          echo "🛑 离线程序包内缺 usr/share/openclash 运行时脚本"; warn=1
+        else
+          echo "✅ 离线 OpenClash 程序包就位 (init.d + 运行时脚本), 首启动零联网"
+        fi
+      fi
+      # ---------- 2026-11-15 (二): 其余第三方程序 + 语义级迁移表数据源 ----------
+      # 只列文件名(tar -tzf), 绝不读取归档内容 —— 内含 zerotier secret / shadow hash /
+      # tailscaled.state 节点私钥。
+      local _ea _eain _cr _crin
+      _ea=$(tar -tzf "$KIT" 2>/dev/null | grep -E '(^|/)etc/zzz-extra-app\.tar\.gz$' | head -1)
+      if [ -z "$_ea" ]; then
+        echo "🛑 selective kit 缺少离线第三方程序包 etc/zzz-extra-app.tar.gz ($OFFLINE_SERVICES)"; warn=1
+      else
+        _eain=$(tar -xOf "$KIT" "$_ea" 2>/dev/null | tar -tzf - 2>/dev/null)
+        if ! printf '%s\n' "$_eain" | grep -qE '(^|/)usr/sbin/tailscaled$'; then
+          echo "🛑 离线第三方程序包内缺 usr/sbin/tailscaled"; warn=1
+        elif ! printf '%s\n' "$_eain" | grep -qE '(^|/)etc/init\.d/dawn$'; then
+          echo "🛑 离线第三方程序包内缺 etc/init.d/dawn"; warn=1
+        else
+          echo "✅ 离线第三方程序包就位: $OFFLINE_SERVICES (tailscaled + dawn + pushbot + wifihistory)"
+        fi
+      fi
+      _cr=$(tar -tzf "$KIT" 2>/dev/null | grep -E '(^|/)etc/zzz-config-ref\.tar\.gz$' | head -1)
+      if [ -z "$_cr" ]; then
+        echo "🛑 selective kit 缺少配置参考快照 etc/zzz-config-ref.tar.gz (键级迁移表数据源)"; warn=1
+      else
+        _crin=$(tar -xOf "$KIT" "$_cr" 2>/dev/null | tar -tzf - 2>/dev/null)
+        if ! printf '%s\n' "$_crin" | grep -qE '(^|/)etc/config/dhcp$'; then
+          echo "🛑 配置参考快照内缺 etc/config/dhcp"; warn=1
+        else
+          echo "✅ 配置参考快照就位(9 个 DIFF 文件的用户定制按键迁移, 出厂默认不被覆盖)"
+        fi
       fi
     fi
   fi
@@ -711,9 +784,9 @@ release_risk_gate(){
       echo "⚠️ 该 release 明确要求「不保留配置 / wipe-config」。注意: 这**不代表它是测试版** ——"
       echo "   20261115 就是 prerelease=false 的正式版, 只是后端大改动导致旧配置不兼容。"
       echo "   本工具已自动切换配置策略: $CONFIG_POLICY"
-      echo "   仅恢复: root 密码 / SSH 公钥+host key / WiFi SSID+key / LAN IP / DHCP 静态租约 / OpenClash 全套 / crontab+脚本"
-      echo "   不恢复: 旧 /etc/config 全量(NPU/风扇/网络/无线/防火墙/APK 源等), 由新版出厂默认 + uci-defaults 重建"
-      echo "   ⚠️ 升级后需按 $LOG_DIR/config-restore-todo-*.md 清单人工核对/重配"
+      echo "   自动恢复: 身份数据 + 10 个 ONLY-LIVE 第三方配置(整文件) + 9 个 DIFF 文件(键级迁移表) + OpenClash/4 个第三方程序(离线注入, 零联网)"
+      echo "   不导入: 旧 network/wireless/system 及新版移除的 NPU/风扇等; 这些由出厂默认 + uci-defaults 重建(见 README「语义级配置迁移表」)"
+      echo "   ⚠️ 升级后仍建议按 $LOG_DIR/config-restore-todo-*.md 核对 glass 主题 / openssl 等少数人工项"
       if [ "$DRY" = "1" ]; then echo "⚠️ [dry-run] 真实执行还需 --ack-config-reset 显式确认配置重建"; return 0; fi
       if [ "$ALLOW_TEST_BUILD" != "1" ] && [ "$ACK_CONFIG_RESET" != "1" ]; then
         die "🛑 wipe-config 版本会丢弃大量自定义配置, 请加 --ack-config-reset 显式确认后再刷。"
@@ -841,6 +914,116 @@ collect_runtime(){
     echo "✅ 已另存 OpenClash 订阅数据(除内核)到 kit 的 etc/zzz-oc-data/ (防 apk 重装清空)"
   else
     echo "⚠️ OpenClash 订阅数据另存失败(依赖上方 sysupgrade -f 还原路径)"
+  fi
+  # ---------- 2026-11-15: 离线注入 OpenClash 程序文件(wipe-config 决定性) ----------
+  # 1115 出厂不含 luci-app-openclash, 且官方源 / vsean 镜像的 packages.adb 均无此包,
+  # 首启动联网 apk add 必失败。这里从活路由导出"程序文件"(apk 包全量 + 运行时脚本),
+  # 打成 etc/zzz-oc-app.tar.gz 注入 kit; 首启动 uci-defaults 阶段解到 /, 零联网。
+  # 排除 core(57MB 内核已由 kit 烘焙)与 etc/config/openclash(上面已单独抓取覆盖)。
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+    _ocapp="$build/etc/zzz-oc-app.tar.gz"
+    ssh -o ConnectTimeout=25 "$ROUTER" '
+      # ⚠️ apk info -L 输出的是不带前导 / 的相对路径(第 2 行起), 早期版本用 grep "^/"
+      #   过滤会把 221 行全部清空, 实测打出 16B 空 tar —— 必须按路径前缀白名单匹配。
+      apk info -L luci-app-openclash 2>/dev/null | tail -n +2 \
+        | grep -E "^(etc|usr|lib|www|sbin|bin)/" \
+        | grep -vE "(^|/)\._|/etc/openclash/core|^etc/config/openclash$|^etc/openclash/" > /tmp/oc_app.list
+      # 运行时脚本目录不在 apk 文件清单里(运行时生成/第三方), 单独补; find 必须走绝对路径
+      find /usr/share/openclash /usr/lib/lua/luci/model/cbi/openclash \
+           /usr/lib/lua/luci/view/openclash -type f 2>/dev/null \
+        | sed "s|^/||" | grep -v "/\._" >> /tmp/oc_app.list
+      cd / && tar -czf - -T /tmp/oc_app.list 2>/dev/null
+      rm -f /tmp/oc_app.list
+    ' > "$_ocapp" 2>/dev/null
+    _oclist=$(tar -tzf "$_ocapp" 2>/dev/null)
+    if [ -s "$_ocapp" ] \
+       && printf '%s\n' "$_oclist" | grep -qE '(^|/)etc/init\.d/openclash$' \
+       && printf '%s\n' "$_oclist" | grep -q 'usr/share/openclash/'; then
+      echo "✅ 已抓取活路由 OpenClash 程序文件 ($(printf '%s\n' "$_oclist" | grep -c . ) 项) -> kit 的 etc/zzz-oc-app.tar.gz (离线, 无需 apk add)"
+    else
+      rm -f "$_ocapp"
+      die "🛑 离线 OpenClash 程序包抓取/校验失败。1115 出厂不含该包且所有 feed 均无, 继续刷机必然导致代理网关断; 请检查活路由 apk info -L luci-app-openclash 是否可用。"
+    fi
+  fi
+  # ---------- 2026-11-15 (二): selective 整文件导入白名单内的第三方配置 ----------
+  # 实证: 这些文件在 1115 出厂 /etc/config 里根本不存在(ONLY-LIVE), 导入不覆盖任何出厂默认。
+  # openclash 已由上方专通道抓取覆盖; 这里抓其余白名单项。
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+    local _nsc=0
+    for cfg in $SAFE_CONFIGS; do
+      [ "$cfg" = "openclash" ] && continue
+      if ssh -o ConnectTimeout=8 "$ROUTER" "cat /etc/config/$cfg" 2>/dev/null > "$build/etc/config/$cfg" \
+         && [ -s "$build/etc/config/$cfg" ] && grep -q '^config' "$build/etc/config/$cfg"; then
+        _nsc=$((_nsc+1))
+      else
+        rm -f "$build/etc/config/$cfg"
+      fi
+    done
+    echo "✅ 已注入白名单第三方配置 $_nsc 个(1115 出厂无同名文件, 不覆盖出厂默认): $SAFE_CONFIGS"
+  fi
+  # ---------- 2026-11-15 (二): 配置参考快照(语义级迁移表的数据源) ----------
+  # 9 个 DIFF 文件不能整文件导入, 但用户定制必须保真: dhcp 的 noresolv/127.0.0.1#7874/
+  # cachesize、rpcd 的 homepage 只读用户(含系统用户)、watchcat 223.5.5.5、zerotier
+  # secret+network、uhttpd 性能项、firewall 的 include 段…
+  # 这里把活路由全量 /etc/config + homepage 系统用户行打成**不生效**的嵌套归档注入 kit;
+  # zzz-restore 首启动按硬编码键表逐键读取回写(值只在运行时 kit, 绝不进源码 / GitHub)。
+  # 归档同时也是刷后可人工取回的原文备份(zzz 会移到 ~/router-upgrade-logs/ 并 chmod 600)。
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+    _ref="$build/etc/zzz-config-ref.tar.gz"
+    ssh -o ConnectTimeout=30 "$ROUTER" '
+      rm -rf /tmp/zzzref; mkdir -p /tmp/zzzref/etc
+      printf "%s\n" "._*" "*/._*" "*.bak*" "*.apk-new" > /tmp/zzzref.ex
+      cd / && tar -cX /tmp/zzzref.ex -f - etc/config 2>/dev/null | tar -xf - -C /tmp/zzzref
+      grep -E "^homepage:" /etc/passwd > /tmp/zzzref/etc/passwd.homepage 2>/dev/null || :
+      grep -E "^homepage:" /etc/shadow > /tmp/zzzref/etc/shadow.homepage 2>/dev/null || :
+      cd /tmp/zzzref && tar -czf - etc
+      rm -rf /tmp/zzzref /tmp/zzzref.ex
+    ' > "$_ref" 2>/dev/null
+    if [ -s "$_ref" ] && tar -tzf "$_ref" 2>/dev/null | grep -qE '(^|/)etc/config/dhcp$'; then
+      echo "✅ 已抓取配置参考快照 -> kit 的 etc/zzz-config-ref.tar.gz (键级迁移 + 刷后人工取回)"
+    else
+      rm -f "$_ref"
+      die "🛑 配置参考快照抓取/校验失败。9 个 DIFF 文件的用户定制无法迁移, 继续刷机会静默丢配置。"
+    fi
+  fi
+  # ---------- 2026-11-15 (二): 离线恢复其余 4 个第三方服务 ----------
+  # 1115 出厂 init.d 与本机差 8 个服务: airoha-npu / cpufreq(新版移除, 绝不恢复)、
+  # openclash(上面已处理)、dawn / luci-app-pushbot(apk 包)、tailscale / wifihistory
+  # (手工部署, 不属任何 apk 包, 含 30MB tailscale + 39MB tailscaled 二进制)。
+  # 打成 etc/zzz-extra-app.tar.gz 注入 kit; 首启动直接解到 /, 零联网。
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+    _extraapp="$build/etc/zzz-extra-app.tar.gz"
+    ssh -o ConnectTimeout=60 "$ROUTER" '
+      : > /tmp/extra_app.list
+      for p in dawn luci-app-pushbot; do
+        apk info -L "$p" 2>/dev/null | tail -n +2 \
+          | grep -E "^(etc|usr|lib|www|sbin|bin)/" \
+          | grep -vE "(^|/)\._|^etc/config/|^etc/uci-defaults/|^lib/apk/" >> /tmp/extra_app.list
+      done
+      for f in /usr/sbin/tailscale /usr/sbin/tailscaled \
+               /etc/init.d/tailscale /etc/init.d/tailscale-derp-home \
+               /etc/init.d/wifihistory /usr/sbin/wifihistory \
+               /usr/lib/lua/luci/controller/tailscale.lua \
+               /usr/lib/lua/luci/i18n/wifihistory.zh-cn.lmo; do
+        [ -f "$f" ] && printf "%s\n" "${f#/}" >> /tmp/extra_app.list
+      done
+      find /usr/lib/lua/luci/view/tailscale /etc/tailscale -type f 2>/dev/null \
+        | sed "s|^/||" | grep -v "/\._" >> /tmp/extra_app.list
+      # ⚠️ BusyBox sort 的 -o 不写目标文件, 反而把排序结果输出到 stdout(实测), 会污染
+      #   SSH 返回的 tar 流, 造成"文件 36MB 但 tar -tzf 读出 0 条目"。必须用重定向+mv。
+      sort -u /tmp/extra_app.list > /tmp/extra_app.sorted && mv -f /tmp/extra_app.sorted /tmp/extra_app.list
+      cd / && tar -czf - -T /tmp/extra_app.list 2>/dev/null
+      rm -f /tmp/extra_app.list
+    ' > "$_extraapp" 2>/dev/null
+    _ealist=$(tar -tzf "$_extraapp" 2>/dev/null)
+    if [ -s "$_extraapp" ] \
+       && printf '%s\n' "$_ealist" | grep -qE '(^|/)usr/sbin/tailscaled$' \
+       && printf '%s\n' "$_ealist" | grep -qE '(^|/)etc/init\.d/dawn$'; then
+      echo "✅ 已抓取离线第三方程序 ($(printf '%s\n' "$_ealist" | grep -c .) 项, $(du -h "$_extraapp" | awk '{print $1}')) -> kit 的 etc/zzz-extra-app.tar.gz"
+    else
+      rm -f "$_extraapp"
+      die "🛑 离线第三方程序包抓取/校验失败($OFFLINE_SERVICES)。若活路由本就不含这些服务, 请从 OFFLINE_SERVICES 中移除后再刷。"
+    fi
   fi
   # 抓取活路由当前 DHCP 静态租约(host 段) -> 写入 kit 的 etc/dhcp-hosts.uci
   # 格式: 每行 "host <name> <mac> <ip> <leasetime>"; 首启动自举据此重建, 不写死 MAC
@@ -1033,8 +1216,11 @@ collect_runtime(){
       echo "- 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
       echo "- 目标固件: ${TARGET_COMMIT:-unspecified}"
       echo "- 配置策略: selective (版本感知选择性重建)"
-      echo "- 自动恢复: root 密码 / SSH 公钥+host key / WiFi SSID+key / LAN IP / DHCP 静态租约 / OpenClash 全套 / crontab+自定义脚本 / customfeeds.list"
-      echo "- 不恢复: 旧 /etc/config 全量。下表除「自动恢复」外均需人工核对或重配, 新版出厂默认已就位。"
+      echo "- 自动恢复(整文件白名单): $SAFE_CONFIGS —— 1115 出厂无同名文件, 不覆盖出厂默认"
+      echo "- 自动恢复(键级迁移表): dhcp(dnsmasq/odhcpd/静态租约) / firewall(include 段) / luci(仅语言, 主题降级) / rpcd(homepage 只读用户+系统用户) / watchcat / zerotier / uhttpd / smartdns"
+      echo "- 自动恢复(程序离线, 零联网): OpenClash + $OFFLINE_SERVICES"
+      echo "- 自动恢复(身份): root 密码 / SSH 公钥+host key / WiFi SSID+key / LAN IP / DHCP 静态租约 / crontab+自定义脚本 / customfeeds.list"
+      echo "- 人工核对: 下表标「人工重配/核对」的项; 升级前配置原文快照在刷后 ~/router-upgrade-logs/config-reference-*.tar.gz(权限 600)"
       echo ""
       echo "| /etc/config 文件 | 升级前大小(B) | 处理 |"
       echo "|---|---|---|"
@@ -1053,11 +1239,13 @@ collect_runtime(){
   # 2026-11-13: 写入无敏感信息的 kit manifest, 供 verify_kit(final) 绑定目标固件、核验重建状态。
   # 只记 commit / 内核 / 文件 sha256, 绝不写 root shadow / WiFi key / 订阅 / SSID / MAC。
   {
-    echo "kit_schema=2"
+    echo "kit_schema=3"
     echo "built_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
     echo "config_policy=${CONFIG_POLICY:-full}"
-    echo "config_scope=${CONFIG_POLICY:+$(if [ "${CONFIG_POLICY:-full}" = selective ]; then printf '%s' "identity+openclash+crontab+customfeeds"; else printf '%s' "full-/etc/config"; fi)}"
+    echo "config_scope=${CONFIG_POLICY:+$(if [ "${CONFIG_POLICY:-full}" = selective ]; then printf '%s' "identity+openclash+offline-apps+key-migration+crontab+customfeeds"; else printf '%s' "full-/etc/config"; fi)}"
     echo "safe_configs=$SAFE_CONFIGS"
+    echo "offline_services=$OFFLINE_SERVICES"
+    echo "config_ref=required_for_selective"
     echo "incompatible_configs=$INCOMPATIBLE_CONFIGS"
     echo "target_commit=${TARGET_COMMIT:-unspecified}"
     echo "source_router_commit=${CURRENT_COMMIT:-unspecified}"
@@ -1136,7 +1324,7 @@ if [ "$DRY" = "1" ]; then
   echo "=== DRY-RUN: 不执行升级 ==="
   echo "将执行的步骤:"
   echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 配置策略=${CONFIG_POLICY:-full}"
-  echo "     full: 全量 /etc/config 保真 + 额外配置 + 定制路径; selective: 仅身份数据/OpenClash/crontab+脚本/customfeeds.list, 不导入旧 /etc/config"
+  echo "     full: 全量 /etc/config 保真 + 额外配置 + 定制路径; selective: 身份数据 + 10 个白名单第三方配置 + 9 个 DIFF 键级迁移 + 离线程序包(OpenClash/dawn/pushbot/tailscale/wifihistory) + crontab/脚本/customfeeds.list"
   echo "  1. scp $(basename "$ITB") $(basename "$KIT") -> $ROUTER:/tmp/"
   echo "  1b. 路由器侧复核 itb sha256 (防止 WiFi 上传损坏)"
   echo "  2. ssh $ROUTER 'sysupgrade -F -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (F=跳过设备名校验[见下], n=不保留当前配置, 严格全清)"
@@ -1156,6 +1344,18 @@ collect_runtime
 verify_kit final || die "kit 最终核验失败"
 
 echo "=== 上传固件与 kit ==="
+# ---------- 2026-11-15 (二): 刷前 overlay 可用空间预检 ----------
+# 离线注入 tailscale(30MB)+tailscaled(39MB)+clash_meta(55MB) 后, sysupgrade -f 的
+# CONF_IMAGE 归档解压到 /overlay 约需 130MB+; 该设备 overlay 仅 335MB(实测可用 256MB)。
+# 空间不足会在写 UBI 中途失败 = 半写变砖, 必须在上传前 fail-closed 拦住。
+_avail_kb=$(ssh -o ConnectTimeout=10 "$ROUTER" 'df -k /overlay 2>/dev/null | tail -1 | awk "{print \$4}"' 2>/dev/null | tr -d ' \n')
+_kit_kb=$(( $(stat -f%z "$KIT" 2>/dev/null || echo 0) / 1024 ))
+_est_kb=$(( _kit_kb * 3 + 20480 ))
+echo "刷前空间预检: /overlay 可用 ${_avail_kb:-?}KB, kit ${_kit_kb}KB, 估算解压需求 ${_est_kb}KB"
+if [ -n "$_avail_kb" ] && [ "$_avail_kb" -lt "$_est_kb" ]; then
+  die "🛑 /overlay 可用空间不足(需约 ${_est_kb}KB, 实得 ${_avail_kb}KB)。离线程序包无法完整还原, 请清理 overlay 或改用不含离线 tailscale 的精简 kit。"
+fi
+echo "✅ /overlay 空间充足"
 scp "$ITB" "$KIT" "$ROUTER:/tmp/" || die "上传失败"
 
 # 刷机前在路由器侧复核 itb 完整性: WiFi 上传若抖动传坏会直接刷入损坏镜像(变砖), 先拦截
@@ -1321,6 +1521,15 @@ verify_router(){
     for r in radio0 radio1; do
       [ "$(uci get wireless.$r.disabled 2>/dev/null)" = "1" ] && { echo "FAIL: $r 被禁用"; exit 1; }
     done
+    # 2026-11-15: wipe-config 版本专属硬终验 —— 防"配置在/程序不在"与"补丁谎报成功"
+    if [ -f /etc/config/openclash ] && [ ! -x /etc/init.d/openclash ]; then
+      echo "FAIL: OpenClash 配置已恢复但程序文件缺失(离线程序包未生效)"
+      exit 1
+    fi
+    if [ -f /etc/zzz-wifi-pending ]; then
+      echo "FAIL: 无线身份补丁(SSID/key)未在首启动或 rc.local 完成"
+      exit 1
+    fi
     # 软终验(可选): 仅当用户真正启用 OpenClash 时才查(P1). 注意: 本路由 OpenClash 实为上网网关(fake-ip+TCP重定向+DNS 7874),
     # 一旦"启用但 0 真实节点"用户会静默断网(进程在/7874在/DNS通, 但出不去) —— 必须暴露, 不能误判成功.
     if pgrep -f clash >/dev/null 2>&1 || [ "$(uci get openclash.config.enabled 2>/dev/null)" = "1" ]; then
