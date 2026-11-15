@@ -17,6 +17,14 @@
 #   router_watch.sh --no-download  # 纯只读: 只检测报告, 零下载/零文件写入 (定时巡检推荐)
 #   router_watch.sh --allow-test-build  # 显式放行测试版/预发布 release (默认拒绝, 自担风险)
 #   router_watch.sh --now --ack-config-reset  # 正式版 wipe-config: 显式确认配置重建(默认停止)
+#   router_watch.sh --now --ack-config-reset --ack-manual-reboot
+#        # 无人值守完整放行: 一次性确认 wipe-config + 近期硬复位为本人主动重启
+#   router_watch.sh --now --force --ack-config-reset --ack-manual-reboot  # 再跳过 72h 沉淀(自担风险)
+#
+# 2026-11-16 修复: --ack-manual-reboot / --allow-recent-crash 原先只在 upgrade_router.sh 存在,
+#   守护路径既不解析也不透传, 导致 48h 复位闸在无人值守链路上「闸在、钥匙递不到」:
+#   即使人工已确认是自己重启, --now 启动的升级仍会在 upgrade_router.sh 深处 die。
+#   注意 --auto 只控制「强终验 + 失败自动回退」, 不是无人值守总开关(总开关是 --now / ENABLE_FILE)。
 #
 # 可由 launchd / WorkBuddy 定时自动化按需调用（本仓库不含 plist, 按需自行配置调度）
 
@@ -26,6 +34,7 @@ PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$PREP_DIR/watch.log"
 ENABLE_FILE="$HOME/.router_autoupgrade_enabled"
 FORCE=0; CHECK_ONLY=0; NOW=0; ROUTER_OVERRIDE=""; ALLOW_TEST_BUILD=0; NO_DOWNLOAD=0; LOG_TO_FILE=1; ACK_CONFIG_RESET=0
+ACK_MANUAL_REBOOT=0; ALLOW_RECENT_CRASH=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1;;
@@ -33,6 +42,8 @@ while [ $# -gt 0 ]; do
     --now)   NOW=1;;
     --allow-test-build) ALLOW_TEST_BUILD=1;;
     --ack-config-reset) ACK_CONFIG_RESET=1;;
+    --ack-manual-reboot) ACK_MANUAL_REBOOT=1;;
+    --allow-recent-crash) ALLOW_RECENT_CRASH=1;;
     --no-download) NO_DOWNLOAD=1; CHECK_ONLY=1; LOG_TO_FILE=0;;
     --router) ROUTER_OVERRIDE="${2:-}"; shift;;
     --router=*) ROUTER_OVERRIDE="${1#*=}";;
@@ -246,6 +257,13 @@ if [ "$FORCE" = "0" ] && [ "$NOW" = "0" ] && [ ! -f "$ENABLE_FILE" ]; then
 fi
 
 # ---------- 8. 触发升级 (--auto: 强终验失败自动回退) ----------
+log "闸状态汇总: 72h沉淀=$([ "$FORCE" = "1" ] && echo 跳过 || echo 生效) / wipe-config确认=$ACK_CONFIG_RESET / 48h复位确认=$ACK_MANUAL_REBOOT"
+if [ "$ACK_MANUAL_REBOOT" = "1" ]; then
+  log "🔓 已显式确认近期硬复位为人工重启(--ack-manual-reboot), 将透传至 upgrade_router.sh 的 48h 闸"
+fi
+if [ "$ALLOW_RECENT_CRASH" = "1" ]; then
+  log "⚠️ 已由 --allow-recent-crash 放行 48h 闸(语义模糊, 建议改用 --ack-manual-reboot 留审计痕)"
+fi
 log "🚀 触发升级 (--auto)"
 # --force 语义已窄化为"仅跳 72h 沉淀闸"; upgrade_router.sh 的 sha256 完整性校验始终生效。
 # 2026-11-12 修复: 旧写法 ${FORCE:+--force} 中 FORCE=0 是"非空字符串", 会恒展开成 --force,
@@ -254,5 +272,9 @@ UPG_ARGS=(--auto --router "$ROUTER")
 if [ "$FORCE" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--force"; fi
 if [ "$ALLOW_TEST_BUILD" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--allow-test-build"; fi
 if [ "$ACK_CONFIG_RESET" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--ack-config-reset"; fi
+# 2026-11-16: 补齐 48h 复位闸的两把钥匙。按值组装, 不用 ${VAR:+--flag}(FORCE=0 也是非空串,
+#   会恒展开成 --flag —— 2026-11-12 已在 --force 上踩过一次)。
+if [ "$ACK_MANUAL_REBOOT" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--ack-manual-reboot"; fi
+if [ "$ALLOW_RECENT_CRASH" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--allow-recent-crash"; fi
 "$PREP_DIR/upgrade_router.sh" "${UPG_ARGS[@]}"
 log "=== watch 流程结束 ==="

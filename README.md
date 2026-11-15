@@ -254,3 +254,28 @@ router_watch.sh --now --ack-config-reset           # 守护默认停在配置确
 
 `precheck_recent_crash()` 是纯机械判据（`UBIFS recovery>0 && uptime<48h`），区分不了人工硬重启与故障。新增 `--ack-manual-reboot`：默认闸不变，只是给「已确认是本人主动重启」一条可审计的显式放行路径，且**仍实测并打印** recovery/uptime 留痕，不把人工操作误记为故障。`--allow-recent-crash` 保留兼容；72h 沉淀闸不动。
 
+
+**⑥ 无人值守链路：四道闸 + 48h 钥匙透传修复（2026-11-16）**
+
+`--auto` 只负责「强终验 + 失败自动回退」，**不是无人值守总开关**；无人值守由 `router_watch.sh --now`（或 `~/.router_autoupgrade_enabled`）启动，它再调 `upgrade_router.sh --auto`。一次完整无人值守需同时满足：
+
+| 闸 | 所在层 | 默认 | 放行方式 | 性质 |
+|---|---|---|---|---|
+| 授权总闸 | watch | 停止 | `--now` 或创建 `ENABLE_FILE` | 每次显式/常驻 |
+| WIPE-CONFIG 确认 | watch + upgrade | 停止 | `--ack-config-reset` | 每个 wipe-config 版本一次性 |
+| 72h 发布沉淀 | watch + upgrade | 停止 | 等发布满 72h，或 `--force` | 时间窗，自然过期 |
+| 48h 复位观察窗 | upgrade | 拒绝 | `--ack-manual-reboot`（推荐）/ `--allow-recent-crash` | 人工重启时一次性 |
+
+2026-11-16 修复：`--ack-manual-reboot` / `--allow-recent-crash` 原先只在 `upgrade_router.sh` 里存在，`router_watch.sh` 既不解析也不透传 —— **闸在、钥匙递不到**：即使人工已确认是自己重启，`--now` 启动的升级仍会在 `precheck_recent_crash()` 里 `die`。现已按值组装透传，并打印「闸状态汇总」便于无人值守排障；不用 `${VAR:+--flag}`（`FORCE=0` 也是非空串，会恒展开成 `--flag`，2026-11-12 已踩过）。完整一次配置示例（可写进 launchd）：
+
+```bash
+router_watch.sh --now --ack-config-reset --ack-manual-reboot         # 等 72h 自然过闸
+router_watch.sh --now --force --ack-config-reset --ack-manual-reboot   # 立即刷, 自担沉淀风险
+```
+
+**固件级回退兼容性静态实证（L2 新增证据）**：1016 与 1115 的 ITB metadata 三项完全一致 —— `compat_version=1.0`、`supported_devices=["gemtek,xr1710g"]`、`board=gemtek_xr1710g`；1115 DTB 分区标签仍是旧 6-mtd 布局（bootloader/uenv/dsd/chainloader/ubi/reserved_bmt，无 `bl2`/`fip`），与本机实测 `/sys/class/mtd` 一致，故 `06_gemtek-ubi-compat`（只认 `*-ubi` board）不会改写 `compat_version`。从两版镜像分别解出升级链 7 个关键文件逐字节对比：`platform.sh` / `fit.sh` / `gemtek-ubi.sh` / `nand.sh` / `common.sh` / `sysupgrade.conf` **6/6 完全一致**，仅 `/sbin/sysupgrade` 差 138B（`SAVE_PARTITIONS` 改为 `export` + 帮助文本补充；`-F` / `-n` / `-f CONF_IMAGE` 核心逻辑未变）。两版 `platform_do_upgrade` 对 `gemtek,xr1710g` 都走 `fit_do_upgrade → nand_do_upgrade` 写 UBI volume `fit`，`auto_rollback` 的 `sysupgrade -F` 与升级写入目标一致 —— 「旧固件 + 旧配置」自动回退在固件格式层可行；仍不等于运行期零风险（首启动驱动、断电、坏块属 L3）。
+
+**当前实测（2026-11-16 00:02，只读）**：固件 `20261016-1a34e17ca0`，`uptime=3.4h`，`UBIFS recovery=1`，`Oops/panic=0` → 48h 闸机械判据成立且确认为人工重启；1115 发布于 11-15 14:51，72h 闸到 **11-18 14:51** 才过。故此刻 `router_watch.sh --now --ack-config-reset --ack-manual-reboot`（不带 `--force`）仍会在 72h 闸处等待，属预期行为。
+
+**剩余已知缺口**：1115 完整 rootfs 3,101 节点中 10 个第三方包关键词 0 命中，出厂确不含；kit 已离线注入 `openclash`/`dawn`/`pushbot`/`tailscale`/`wifihistory` 程序本体，但 `glass`/`usteer`/`socat`/`udpxy`/`msd_lite`/`rtp2httpd` 仍是「配置已保真、程序未装回」的悬空配置（无害但不生效），需刷后按需装回。
+
