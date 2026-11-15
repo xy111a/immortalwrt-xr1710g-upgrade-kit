@@ -38,11 +38,14 @@ export COPYFILE_DISABLE=1
 #   --allow-same-version    允许重刷"当前正在运行的版本"(默认拒绝, 防白刷)
 #   --allow-recent-crash    允许在近期异常硬复位(UBIFS recovery)后刷机 (默认拒绝)
 #   --allow-unverified-sha  仅在"完全拿不到任何官方基准"时允许无校验刷入 (有基准但不匹配永远拒绝)
-#   --allow-test-build      允许刷入被识别为"测试版 / wipe-config"的官方最新 release (默认拒绝)
+#   --allow-test-build      允许刷入被识别为"测试版 / 预发布"的官方最新 release (默认拒绝)
 #   --allow-unverified-t2   允许在"刷前读不到 U-Boot/T2 兜底"时仍刷机 (默认拒绝, 自担风险)
 #   --allow-stale-kit       允许使用"自举脚本与仓库源码不一致 / 缺 manifest"的陈旧 kit (默认拒绝)
+#   --ack-config-reset      确认"wipe-config 版本不恢复旧 /etc/config, 需人工重配"(默认拒绝)
+#   --config-policy        覆盖配置策略: full(全量保真) | selective(版本感知选择性重建)
 DRY=0; AUTO=0; FORCE=0; ROUTER_OVERRIDE=""; ITB_OVERRIDE=""; EXPECT_SHA_OVERRIDE=""
 ALLOW_SAME_VERSION=0; ALLOW_RECENT_CRASH=0; ALLOW_UNVERIFIED_SHA=0; ALLOW_TEST_BUILD=0; ALLOW_UNVERIFIED_T2=0; ALLOW_STALE_KIT=0
+ACK_CONFIG_RESET=0; CONFIG_POLICY_OVERRIDE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1;;
@@ -54,6 +57,9 @@ while [ $# -gt 0 ]; do
     --allow-test-build)     ALLOW_TEST_BUILD=1;;
     --allow-unverified-t2)  ALLOW_UNVERIFIED_T2=1;;
     --allow-stale-kit)      ALLOW_STALE_KIT=1;;
+    --ack-config-reset)     ACK_CONFIG_RESET=1;;
+    --config-policy)        CONFIG_POLICY_OVERRIDE="${2:-}"; shift;;
+    --config-policy=*)      CONFIG_POLICY_OVERRIDE="${1#*=}";;
     --router)  ROUTER_OVERRIDE="${2:-}"; shift;;
     --router=*) ROUTER_OVERRIDE="${1#*=}";;
     --itb)     ITB_OVERRIDE="${2:-}"; shift;;
@@ -75,7 +81,18 @@ KIT="$PREP_DIR/kit.tar.gz"
 # 出厂之上有实质差异、须随 kit 全清还原的 /etc/config 文件。
 # 不含 network/wireless(已有专门的真实配置通道) 与 firewall(openclash/zerotier 的 include 段
 # 由各自 init 自动增删, 见 zzz-restore 3.5 说明) 与 openclash(已有专门抓取通道)。
-EXTRA_CONFIGS="dhcp rpcd luci cpufreq watchcat dawn system"
+EXTRA_CONFIGS="dhcp rpcd luci watchcat dawn system"
+# ---------- 跨版本不兼容配置(2026-11-15 解包 1115 出厂镜像真实 diff 校准) ----------
+# 依据 /tmp 中的 1115 rootfs: 出厂 /etc/config 仅 40 个, 本机 50 个;
+#   ONLY-LIVE(新版已移除): airoha_npu / npu-monitor / cpufreq / network / wireless / system
+#                          / fstab / ubootenv / ubihealthd  -> 导入即悬空或阻断首启动生成
+#   DIFF(新版主动改写):    firewall 3261B->4159B / uhttpd 742B->4569B / dhcp 2280B->1325B
+#                          / zerotier 617B->1918B / luci / rpcd / smartdns / watchcat / openssl
+#   SAME 但新版重写控制程序: fan(配置逐字节相同, 排除仅为让新版出厂默认值生效)
+# 命中此表即拒绝随 kit 注入(verify_kit final)。
+INCOMPATIBLE_CONFIGS="airoha_npu fan npu-monitor cpufreq network wireless firewall system fstab ubootenv ubihealthd dhcp luci rpcd smartdns uhttpd watchcat zerotier openssl"
+# selective 策略下唯一允许整文件导入的 /etc/config(第三方包格式未变, 且有专通道抓取)
+SAFE_CONFIGS="openclash"
 # 出厂之上新增/改写的非 /etc/config 路径(定制脚本/补丁/令牌/启用态, 全清刷即丢):
 #   etc/crontabs             root 计划任务(lan_report.sh 上报 + 关灯计划模板)
 #   etc/lan_report.token     lan_report.sh 的上报令牌(无它 crontab 静默失败)
@@ -85,7 +102,13 @@ EXTRA_CONFIGS="dhcp rpcd luci cpufreq watchcat dawn system"
 #   root/.ssh/known_hosts    root 侧 known_hosts
 # 均排除 macOS AppleDouble ._* 与 *.bak 垃圾。
 # 注意: etc/rc.d(服务启用态)不走整包 —— openclash 开机链须排除, 见下方专门拉取。
-EXTRA_PATHS="etc/crontabs etc/lan_report.token etc/apk/repositories.d usr/sbin/lan_report.sh usr/lib/lua/luci/http.lua usr/share/ucode/luci/http.uc root/.ssh/known_hosts"
+# 2026-11-15: apk 源只抓 customfeeds.list。整目录 repositories.d 含 distfeeds.list,
+#   该文件注释明写"auto-generated and build-specific, changes lost in sysupgrade"; 本机是
+#   mirrors.vsean.net 镜像, 1115 出厂是 downloads.immortalwrt.org 官方源(发布说明「修复默认 APK
+#   安装源」正是此事)。导入旧源会覆盖修复, 且 rc.local 靠 apk add 装回 OpenClash, 源错则全清刷后代理起不来。
+EXTRA_PATHS="etc/crontabs etc/lan_report.token etc/apk/repositories.d/customfeeds.list usr/sbin/lan_report.sh usr/lib/lua/luci/http.lua usr/share/ucode/luci/http.uc root/.ssh/known_hosts"
+# selective 策略进一步排除 LuCI 补丁(http.lua/http.uc 是 1016 版文件, 覆盖新版 LuCI 会破坏界面)
+SAFE_EXTRA_PATHS="etc/crontabs etc/lan_report.token etc/apk/repositories.d/customfeeds.list usr/sbin/lan_report.sh root/.ssh/known_hosts"
 ROUTER="${ROUTER_OVERRIDE:-}"
 EXPECT_SHA="${EXPECT_SHA_OVERRIDE:-}"
 # host key 是否已在升级前抓取并随 kit 还原(成功=1): 决定升级后是否需清本地 known_hosts / 提示其他终端
@@ -259,6 +282,42 @@ verify_kit(){
   if [ -n "$m_khash" ] && [ "$m_khash" != "unspecified" ]; then
     echo "   ⚠️ kit 源内核 $m_khash; 目标固件若跨内核版本, 切勿恢复旧 kmod-*, 且必须按新固件重建 kit"
   fi
+  # ---------- 2026-11-15: final 阶段扫描注入 kit 的 /etc/config ----------
+  # verify_kit(pre) 只看静态 kit(本来不含任何 config), 检测不到 collect_runtime 注入的旧配置。
+  # 只列文件名(tar -tzf), 绝不读取内容 —— 注入 kit 含 root shadow / WiFi key / 订阅。
+  if [ "$mode" = "final" ]; then
+    local _present="" _c _bad="" _extra="" m_pol
+    _present=$(tar -tzf "$KIT" 2>/dev/null | grep -E '(^|/)etc/config/[^/]+$' | sed 's#.*/##' | sort -u | tr '\n' ' ')
+    for _c in $INCOMPATIBLE_CONFIGS; do
+      case " $_present " in *" $_c "*) _bad="${_bad}${_bad:+, }$_c" ;; esac
+    done
+    if [ -n "$_bad" ]; then
+      echo "🛑 注入 kit 含跨版本不兼容的 /etc/config: $_bad"
+      echo "   这些文件在本版本被移除或主动改写, 导入会覆盖出厂默认 / 留下悬空段。"
+      warn=1
+    elif [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+      for _c in $_present; do
+        case " $SAFE_CONFIGS " in *" $_c "*) ;; *) _extra="${_extra}${_extra:+, }$_c" ;; esac
+      done
+      if [ -n "$_extra" ]; then
+        echo "🛑 selective 策略下注入 kit 仍含白名单外的 /etc/config: $_extra"
+        warn=1
+      else
+        echo "✅ 注入 kit 的 /etc/config 仅含白名单项 (${_present:-无})"
+      fi
+    else
+      echo "✅ 注入 kit 的 /etc/config 未命中不兼容黑名单 (${#_present} 字符的文件清单)"
+    fi
+    if [ -n "$m_manifest" ]; then
+      m_pol=$(grep '^config_policy=' "$tmp/manifest" 2>/dev/null | cut -d= -f2- | head -1)
+      if [ -n "$m_pol" ] && [ "$m_pol" != "${CONFIG_POLICY:-full}" ]; then
+        echo "🛑 kit manifest 的 config_policy=$m_pol 与本次策略 ${CONFIG_POLICY:-full} 不一致"
+        warn=1
+      else
+        echo "✅ kit manifest 配置策略一致: ${m_pol:-${CONFIG_POLICY:-full}}"
+      fi
+    fi
+  fi
   rm -rf "$tmp"
   if [ "$warn" = "1" ]; then
     if [ "$ALLOW_STALE_KIT" = "1" ]; then echo "⚠️ 已由 --allow-stale-kit 显式放行(自担风险)"; return 0; fi
@@ -295,7 +354,29 @@ config_fidelity_check(){
   tar -xzf "$PREUPG_BACKUP" -C "$tmp" 2>/dev/null || { echo "⚠️ 升级前快照解包失败, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
   local pre_dir="$tmp/etc/config"
   [ -d "$pre_dir" ] || { echo "⚠️ 升级前快照无 /etc/config, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
-  echo "=== 配置保真度校验 (升级前快照 vs 升级后运行态) ==="
+  echo "=== 配置保真度校验 (策略: ${CONFIG_POLICY:-full}) ==="
+  # 2026-11-15: selective 策略下"逐字节一致"是错误判据 —— 新版主动改写配置, 一致反而说明
+  # 旧配置被误导入。改为分层: 白名单项必须还原, 其余期望变化(只列清单, 不计漂移)。
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+    echo "  策略 selective: 白名单项须保真; 其余配置由新版出厂 + uci-defaults 重建(变化=预期)"
+    local _ok=0 _bad=0 _c _h1 _h2 _lan _ssid
+    for _c in $SAFE_CONFIGS; do
+      [ -f "$pre_dir/$_c" ] || continue
+      _h2=$(awk -v f="$_c" '$2==f{print $1}' "$tmp/post.txt")
+      _h1=$(shasum -a 256 "$pre_dir/$_c" 2>/dev/null | awk '{print $1}')
+      if [ -z "$_h2" ]; then echo "  ❌ 白名单项升级后缺失: $_c"; _bad=$((_bad+1));
+      elif [ -n "$_h1" ] && [ "$_h1" != "$_h2" ]; then echo "  ⚠️ 白名单项升级后内容变化: $_c"; _bad=$((_bad+1));
+      else echo "  ✅ $_c 已还原"; _ok=$((_ok+1)); fi
+    done
+    # 身份项由补丁式 uci set 恢复, 独立核验(不比对整文件)
+    _lan=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'uci -q get network.lan.ipaddr' 2>/dev/null)
+    _ssid=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'uci -q get wireless.@wifi-iface[0].ssid' 2>/dev/null)
+    [ -n "$_lan" ]  && echo "  ✅ LAN IP 已由补丁恢复: $_lan"  || { echo "  ⚠️ 未能读取 LAN IP"; _bad=$((_bad+1)); }
+    [ -n "$_ssid" ] && echo "  ✅ SSID 已由补丁恢复: $_ssid"  || { echo "  ⚠️ 未能读取 SSID"; _bad=$((_bad+1)); }
+    echo "✅ 分层校验完成: 白名单 $_ok 项通过 / $_bad 项异常; 其余 $(wc -l < "$tmp/post.txt" | tr -d ' ') 个配置属新版生成, 不计漂移"
+    rm -rf "$tmp"
+    return 0
+  fi
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'cd /etc/config && for f in *; do [ -f "$f" ] || continue; printf "%s %s\n" "$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)" "$f"; done' 2>/dev/null > "$tmp/post.txt" || { echo "⚠️ 无法读取升级后 /etc/config, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
   local diffs=0 nf=0 bf pre_h post_h
   for pre in "$pre_dir"/*; do
@@ -399,8 +480,21 @@ REMOTE
 # digest 是 GitHub 官方外部基准, 可替代缺失的 sha256sums(1029 / 1112 均无 sums)。
 OFFICIAL_ITB_PUB=""; OFFICIAL_ITB_NAME=""; OFFICIAL_ITB_URL=""; OFFICIAL_ITB_SHA=""
 OFFICIAL_REL_TAG=""; OFFICIAL_REL_PRERELEASE=""; OFFICIAL_REL_BODY=""; OFFICIAL_REL_FLAGS="UNKNOWN"
+# 2026-11-15: 环境里被注入无效 GITHUB_TOKEN 时会覆盖 gh keyring 的有效凭据, 使 gh api
+#   报 401 Bad credentials -> 官方元数据/asset.digest/发布闸全线失效, 静默降级成"仅 --itb 可用"。
+#   先探活, 失败则在本进程内丢弃该变量改用 keyring; 不修改用户 shell 配置。
+gh_auth_guard(){
+  [ -n "${GITHUB_TOKEN:-}" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  if ! gh api user >/dev/null 2>&1; then
+    echo "⚠️ 环境变量 GITHUB_TOKEN 无效(gh api 401), 本进程内忽略它, 改用 gh keyring 凭据"
+    unset GITHUB_TOKEN
+  fi
+}
+
 official_release_meta(){
   command -v gh >/dev/null 2>&1 || return 1
+  gh_auth_guard
   local tsv try
   for try in 1 2 3; do
     tsv=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | sort_by(.published_at) | reverse | .[0] | [.published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].name), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].digest // "NONE"), (.tag_name // ""), ((.prerelease // false)|tostring), ((.body // "")|gsub("[\r\n\t]+";" "))] | @tsv' 2>/dev/null | head -1)
@@ -423,7 +517,10 @@ official_release_flags(){
   local flags="" tag_date img_date
   [ -n "$OFFICIAL_REL_TAG" ] || { OFFICIAL_REL_FLAGS="UNKNOWN"; return 0; }
   [ "$OFFICIAL_REL_PRERELEASE" = "true" ] && flags="PRERELEASE"
-  if printf '%s' "$OFFICIAL_REL_BODY" | grep -qE '本次为测试固件|测试固件|测试版|测试不保留配置|wipe-config|不保留配置'; then
+  # 2026-11-15 拆分: TEST(版本性质) 与 WIPE-CONFIG(配置兼容性) 是正交的两类信号。
+  #   20261112 = 测试版 + wipe-config -> 两者都命中; 20261115 = prerelease=false 正式版 + wipe-config
+  #   -> 只应命中 WIPE-CONFIG。旧逻辑把 wipe-config 也算 TEST, 导致正式版被误判"等正式版"永远等不到。
+  if [ "$OFFICIAL_REL_PRERELEASE" != "true" ] && printf '%s' "$OFFICIAL_REL_BODY" | grep -qE '本次为测试固件|测试固件|测试版|测试不保留配置'; then
     flags="${flags:+$flags+}TEST"
   fi
   if printf '%s' "$OFFICIAL_REL_BODY" | grep -qE 'wipe-config|不保留配置|默认打开测试'; then
@@ -444,6 +541,21 @@ if official_release_meta; then
 else
   echo "⚠️ 无法读取官方 release 元数据(gh 未登录/限流/网络抖动); 自动选片、官方基准与测试版识别均不可用, 仅 --itb 显式指定可用"
 fi
+
+# ---------- 配置策略(2026-11-15: 版本感知选择性重建) ----------
+#   full      = 同代小版本升级, 全量保真导入旧 /etc/config(既有行为)
+#   selective = wipe-config / 配置不兼容版本, 只恢复身份数据 + OpenClash, 其余交给新版出厂默认
+# 自动切换: release 标记含 WIPE-CONFIG -> selective; --config-policy 显式覆盖(需自担风险)
+CONFIG_POLICY="${CONFIG_POLICY_OVERRIDE:-full}"
+if [ -z "${CONFIG_POLICY_OVERRIDE:-}" ] && printf '%s' "${OFFICIAL_REL_FLAGS:-}" | grep -q 'WIPE-CONFIG'; then
+  CONFIG_POLICY=selective
+fi
+case "$CONFIG_POLICY" in
+  full)      echo "配置策略: full (全量配置保真)" ;;
+  selective) echo "配置策略: selective (版本感知选择性重建 —— 不导入旧 /etc/config)"
+             echo "  依据: 2026-11-15 解包 1115 出厂镜像真实 diff, 见 README「wipe-config 版本适配」" ;;
+  *) die "未知 --config-policy: $CONFIG_POLICY (仅支持 full|selective)" ;;
+esac
 
 # 官方目标 itb 本地缺失时自动下载并用官方 digest 校验(仅真实执行; dry-run 不下载)。
 download_official_itb(){
@@ -564,33 +676,53 @@ if [ -z "$ITB_OVERRIDE" ] && [ "$FORCE" = "0" ] && [ "$(basename "$ITB")" = "$OF
   fi
 fi
 
-# ---------- 测试版 / wipe-config 发布闸(2026-11-12 新增) ----------
-# 命中"测试固件 / 测试版 / 不保留配置 / wipe-config / prerelease"的官方最新版时:
-#   dry-run 高亮告警; 真实执行 fail-closed, 需 --allow-test-build 显式放行。
-#   --itb 显式指定历史版本时不适用(目标 release 已不是"最新"那个, 风险标记不该张冠李戴)。
+# ---------- 版本闸(2026-11-12 新增, 2026-11-15 拆分) ----------
+#   TEST / PRERELEASE : 版本性质, 默认 fail-closed, 需 --allow-test-build
+#   WIPE-CONFIG       : 配置兼容性, 不拒绝刷, 但强制 selective 策略 + --ack-config-reset 确认
+#   TAG-DATE-MISMATCH : 独立客观信号, 仅告警
+#   --itb 显式指定历史版本时全部不适用(目标 release 已不是"最新"那个, 标记不该张冠李戴)。
 release_risk_gate(){
   [ -z "$ITB_OVERRIDE" ] || return 0
   [ "$(basename "$ITB")" = "$OFFICIAL_ITB_NAME" ] || return 0
-  case "${OFFICIAL_REL_FLAGS:-UNKNOWN}" in
+  local fl="${OFFICIAL_REL_FLAGS:-UNKNOWN}"
+  case "$fl" in
     OK|"") return 0 ;;
     UNKNOWN)
       echo "⚠️ 无法读取目标 release 的发布说明(gh 限流/网络抖动), 测试版 / 不保留配置标记未知; 请人工核对 ${OFFICIAL_REL_TAG:-最新 release} 的正文后再刷"
       return 0 ;;
   esac
-  echo "🛑 官方目标 release [${OFFICIAL_REL_TAG:-?}] 被识别为: $OFFICIAL_REL_FLAGS"
-  echo "   发布说明摘录: ${OFFICIAL_REL_BODY:0:200}"
-  echo "   注: TAG-DATE-MISMATCH 是不依赖措辞的客观信号(tag 日期 != 镜像名日期), 提示产物/说明可能不一致"
-  echo "   影响: 测试版 / wipe-config 默认清空配置; 本工具走 sysupgrade -n -f kit.tar.gz 全清刷,"
-  echo "         但内核与预装包大变时必须重建 kit(勿恢复旧 kmod-*), 否则 OpenClash 规则/钩子/订阅可能丢失。"
-  if [ "$DRY" = "1" ]; then
-    echo "⚠️ [dry-run] 真实执行时本脚本会拒绝刷入该测试版; 需显式 --allow-test-build 自担风险, 或等正式版"
-    return 0
-  fi
-  if [ "$ALLOW_TEST_BUILD" = "1" ]; then
-    echo "⚠️ 已由 --allow-test-build 显式放行测试版(自担风险); 刷前请确认 kit 已针对该固件重建"
-    return 0
-  fi
-  die "🛑 目标为测试版 / wipe-config 固件, 默认拒绝刷入。请等正式版 / 显式 --itb 指定已确认版本, 或确认已重建 kit 后加 --allow-test-build 自担风险。"
+  echo "ℹ️ 官方目标 release [${OFFICIAL_REL_TAG:-?}] 标记: $fl"
+  # A) 版本性质闸: 测试版 / 预发布默认拒绝, 与配置策略无关
+  case "$fl" in
+    *TEST*|*PRERELEASE*)
+      echo "🛑 该 release 是测试版/预发布, 默认拒绝刷入"
+      echo "   发布说明摘录: ${OFFICIAL_REL_BODY:0:200}"
+      if [ "$DRY" = "1" ]; then echo "⚠️ [dry-run] 真实执行会拒绝刷入该测试版; 需 --allow-test-build, 或等正式版"; return 0; fi
+      if [ "$ALLOW_TEST_BUILD" = "1" ]; then
+        echo "⚠️ 已由 --allow-test-build 显式放行(自担风险)"
+      else
+        die "🛑 目标为测试版/预发布, 默认拒绝刷入。请等正式版 / 用 --itb 指定已确认版本, 或加 --allow-test-build 自担风险。"
+      fi
+      ;;
+  esac
+  # B) 配置兼容性闸: 不拒绝刷, 但强制 selective + 显式确认"配置不保真"
+  case "$fl" in
+    *WIPE-CONFIG*)
+      echo "⚠️ 该 release 明确要求「不保留配置 / wipe-config」。注意: 这**不代表它是测试版** ——"
+      echo "   20261115 就是 prerelease=false 的正式版, 只是后端大改动导致旧配置不兼容。"
+      echo "   本工具已自动切换配置策略: $CONFIG_POLICY"
+      echo "   仅恢复: root 密码 / SSH 公钥+host key / WiFi SSID+key / LAN IP / DHCP 静态租约 / OpenClash 全套 / crontab+脚本"
+      echo "   不恢复: 旧 /etc/config 全量(NPU/风扇/网络/无线/防火墙/APK 源等), 由新版出厂默认 + uci-defaults 重建"
+      echo "   ⚠️ 升级后需按 $LOG_DIR/config-restore-todo-*.md 清单人工核对/重配"
+      if [ "$DRY" = "1" ]; then echo "⚠️ [dry-run] 真实执行还需 --ack-config-reset 显式确认配置重建"; return 0; fi
+      if [ "$ALLOW_TEST_BUILD" != "1" ] && [ "$ACK_CONFIG_RESET" != "1" ]; then
+        die "🛑 wipe-config 版本会丢弃大量自定义配置, 请加 --ack-config-reset 显式确认后再刷。"
+      fi
+      ;;
+  esac
+  case "$fl" in
+    *TAG-DATE-MISMATCH*) echo "⚠️ TAG-DATE-MISMATCH: tag 日期 != 镜像名日期, 产物/说明可能不一致, 请人工核对" ;;
+  esac
 }
 release_risk_gate
 
@@ -679,7 +811,7 @@ collect_runtime(){
   lanip=$(ssh -o ConnectTimeout=8 "$ROUTER" "uci get network.lan.ipaddr 2>/dev/null") || lanip=""
 
   local build=/tmp/kit_build newkit=/tmp/kit_injected.tar.gz
-  rm -rf "$build"; mkdir -p "$build/etc/config"
+  rm -rf "$build"; mkdir -p "$build/etc/config" "$build/etc/apk/repositories.d"
   tar -xzf "$KIT" -C "$build" 2>/dev/null || { echo "❌ 解包 kit 失败"; exit 1; }
   # 清理从旧 kit 继承的 AppleDouble 垃圾(._*), 避免再次刷进路由器 /etc
   find "$build" -name '._*' -type f -delete 2>/dev/null
@@ -737,6 +869,10 @@ collect_runtime(){
   else
     echo "⚠️ host key 抓取失败, 升级后 host key 会变(各终端需 ssh-keygen -R)"
   fi
+  # 2026-11-15 selective: 严禁导入旧 network/wireless。解包 1115 出厂镜像实证, 新版
+  # /etc/config 里根本没有 network/wireless/system —— 由 board.d + 03_wireless +
+  # 22_airoha-network-migrate-v4 首启动生成; 导入旧文件会阻断生成并造成混合状态。
+  if [ "${CONFIG_POLICY:-full}" = "full" ]; then
   # 抓取真实 network/wireless 配置(P2): 还原用户自定义信道/功率/桥接/额外SSID, 不再写死成作者默认。
   # 仅当两者都抓取成功才写标记文件 etc/zzz-realconfig.flag, zzz-restore 据此跳过 heredoc 改用真实配置;
   # 任一失败则删除, 首启动降级回写死 heredoc。注入的是运行时临时 kit(/tmp, 不进Git), 与源码零明文泄露。
@@ -756,11 +892,16 @@ collect_runtime(){
   else
     echo "⚠️ 真实配置抓取不完整, 首启动将降级为已知良好 heredoc 默认"
   fi
+  else
+    rm -f "$build/etc/config/network" "$build/etc/config/wireless" "$build/etc/zzz-realconfig.flag"
+    echo "ℹ️ [selective] 不导入旧 network/wireless; 首启动由新版生成后仅补丁恢复 LAN IP / SSID / key"
+  fi
   # ---------- 抓取额外配置(2026-10-21 审计扩充) ----------
   # 背景: 全清刷(sysupgrade -n)只保留 kit 内文件, 此前 dhcp 的 dnsmasq 定制(7874/noresolv)、
   # rpcd 的 homepage 只读用户、luci 主题、cpufreq governor、crontab、lan_report.sh+token、
   # apk 镜像源、http.lua 上传上限补丁、rc.d 启用态均不在抓取范围, 升级后丢失。
   # 单项失败不阻断(该配置全清后回出厂默认), 仅告警。
+  if [ "${CONFIG_POLICY:-full}" = "full" ]; then
   local cfg n_ok=0 n_all=0
   for cfg in $EXTRA_CONFIGS; do
     n_all=$((n_all+1))
@@ -773,6 +914,12 @@ collect_runtime(){
     fi
   done
   [ "$n_ok" -gt 0 ] && echo "✅ 已抓取额外配置 $n_ok/$n_all 个: $EXTRA_CONFIGS"
+  else
+    echo "ℹ️ [selective] 跳过 EXTRA_CONFIGS 整文件导入(新版出厂配置由本版本自己生成)"
+  fi
+  # ⚠️ 2026-11-15: 这段"黑名单式全量兜底"等价于官方明令禁止的「导入旧版本配置」。
+  #   wipe-config 版本必须整段跳过, 改由 SAFE_CONFIGS 白名单 + 补丁式身份恢复。
+  if [ "${CONFIG_POLICY:-full}" = "full" ]; then
   # ---------- 全量 /etc/config 兜底(2026-10-27 修复 R5: 全清刷后配置漂移丢失) ----------
   # 背景: 此前仅白名单式抓取 EXTRA_CONFIGS + openclash/network/wireless, 全清刷(sysupgrade -n -f)
   #   后其余所有 /etc/config(如 firewall/ddns-go/lucky/wechatpush/zerotier/smartdns/upnpd/usteer/...)
@@ -792,19 +939,23 @@ collect_runtime(){
   else
     echo "⚠️ 全量 /etc/config 兜底抓取失败(仅 EXTRA_CONFIGS 等显式配置会被还原)"
   fi
+  else
+    echo "ℹ️ [selective] 已跳过全量 /etc/config 兜底 —— 官方明确要求不得导入旧版本配置"
+  fi
   # ---------- 抓取定制路径(目录/文件混合, tar 一次拉取; 排除 ._* 与 *.bak) ----------
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then RUN_EXTRA_PATHS="$SAFE_EXTRA_PATHS"; else RUN_EXTRA_PATHS="$EXTRA_PATHS"; fi
   # rc.d 单独拉: 排除 openclash 开机链(首启动时 init.d/openclash 尚未安装, 悬空符号链接无意义,
   # 由 zzz-restore 的 rc.local 在 apk add 后 /etc/init.d/openclash enable 重建)。
   # ⚠️ BusyBox tar 无 --exclude, 一律用 -X <模式文件>(见上方说明)。
   #    bsdtar 解 busybox 流退出码不可靠, 成功判定以落盘内容为准(crontabs/root 为探针)。
-  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak" "*.apk-new" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / '"$EXTRA_PATHS"'; rm -f /tmp/kit_tar.ex' 2>/dev/null \
+  ssh -o ConnectTimeout=15 "$ROUTER" 'printf "%s\n" "._*" "*/._*" "*.bak" "*.apk-new" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / '"$RUN_EXTRA_PATHS"'; rm -f /tmp/kit_tar.ex' 2>/dev/null \
        | tar -xzf - -C "$build" 2>/dev/null || true
   if [ -f "$build/etc/crontabs/root" ]; then
-    echo "✅ 已抓取定制路径(排除 ._*/bak): $EXTRA_PATHS"
+    echo "✅ 已抓取定制路径(排除 ._*/bak): $RUN_EXTRA_PATHS"
   else
     echo "⚠️ 定制路径整包抓取失败, 逐个降级重试"
     local p
-    for p in $EXTRA_PATHS; do
+    for p in $RUN_EXTRA_PATHS; do
       if ssh -o ConnectTimeout=10 "$ROUTER" "cat /$p" 2>/dev/null > "$build/$p" 2>/dev/null && [ -s "$build/$p" ]; then
         echo "  ✅ $p"
       else
@@ -813,12 +964,18 @@ collect_runtime(){
       fi
     done
   fi
+  # 2026-11-15: selective 下不导入旧 /etc/rc.d 启用态 —— 新版服务集合已变
+  #   (1115 新增 bridger/pbr/sing-box/naoki66-ota 等 9 个配置), 旧链会悬空。
+  if [ "${CONFIG_POLICY:-full}" = "full" ]; then
   ssh -o ConnectTimeout=10 "$ROUTER" 'printf "%s\n" "etc/rc.d/*openclash*" > /tmp/kit_tar.ex; tar -czX /tmp/kit_tar.ex -f - -C / etc/rc.d; rm -f /tmp/kit_tar.ex' 2>/dev/null \
        | tar -xzf - -C "$build" 2>/dev/null || true
   if [ -d "$build/etc/rc.d" ] && [ -n "$(ls -A "$build/etc/rc.d" 2>/dev/null)" ]; then
     echo "✅ 已抓取 /etc/rc.d 服务启用态(排除 openclash 链, 由 rc.local enable 重建)"
   else
     echo "⚠️ /etc/rc.d 抓取失败(启用态将回出厂默认)"
+  fi
+  else
+    echo "ℹ️ [selective] 不导入旧 /etc/rc.d 启用态(沿用新版出厂启用状态)"
   fi
   # ---------- 抓取"用户禁用"的服务清单(overlay 白名单不在 tar 可见文件里!) ----------
   # 背景: 禁用服务 = 删 /etc/rc.d 的开机链, 在 overlay upper 留下 whiteout(字符设备 0/0)。
@@ -827,6 +984,22 @@ collect_runtime(){
   # 修法: 刷前算出"出厂有链、现网无链、且 init.d 仍在(包未卸=用户主动禁用)"的清单, 写入 kit;
   #   zzz-restore 首启动对每个链 rm -f(重建 whiteout)恢复禁用态。
   # 区分"包被卸"($init.d 不存在): 那种链缺失是包的默认状态, 不能禁(新固件自带该包时应保持出厂启用)。
+  # 2026-11-15: 旧清单按 1016 的 /rom/etc/rc.d 链接名(S19firewall 等)生成, 新版编号会变;
+  #   selective 改抓"服务名", 首启动用 /etc/init.d/<svc> disable, 与编号解耦。
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+    if ssh -o ConnectTimeout=10 "$ROUTER" 'for l in $(ls /rom/etc/rc.d 2>/dev/null); do [ -e "/etc/rc.d/$l" ] && continue; svc=$(printf "%s" "$l" | sed "s/^[SK][0-9][0-9]//"); [ -x "/etc/init.d/$svc" ] && printf "%s\n" "$svc"; done' 2>/dev/null \
+         | sort -u > "$build/etc/zzz-disabled-services"; then
+      if [ -s "$build/etc/zzz-disabled-services" ]; then
+        echo "✅ 已抓取用户禁用服务(服务名, 跨版本安全): $(tr '\n' ' ' < "$build/etc/zzz-disabled-services")"
+      else
+        rm -f "$build/etc/zzz-disabled-services"
+        echo "ℹ️ 无用户禁用服务"
+      fi
+    else
+      rm -f "$build/etc/zzz-disabled-services"
+      echo "⚠️ 禁用服务清单抓取失败(不影响升级)"
+    fi
+  else
   if ssh -o ConnectTimeout=10 "$ROUTER" 'for l in $(ls /rom/etc/rc.d 2>/dev/null); do [ -e "/etc/rc.d/$l" ] && continue; svc=$(printf "%s" "$l" | sed "s/^[SK][0-9][0-9]//"); [ -x "/etc/init.d/$svc" ] && printf "%s\n" "$l"; done' 2>/dev/null > "$build/etc/zzz-disabled-services"; then
     if [ -s "$build/etc/zzz-disabled-services" ]; then
       echo "✅ 已抓取用户禁用服务清单: $(tr '\n' ' ' < "$build/etc/zzz-disabled-services")"
@@ -838,6 +1011,7 @@ collect_runtime(){
     rm -f "$build/etc/zzz-disabled-services"
     echo "⚠️ 禁用服务清单抓取失败(全清后禁用态可能回退)"
   fi
+  fi
   {
     [ -n "$s" ]  && echo "ROOT_SHADOW=$s"
     echo "WIFI_KEY=$w"
@@ -847,12 +1021,44 @@ collect_runtime(){
     [ -n "$lanip" ] && echo "LAN_IP=$lanip"
   } > "$build/etc/router-secrets"
   chmod 600 "$build/etc/router-secrets"
+  # ---------- 2026-11-15: 把配置策略写进 kit, 供首启动自举读取 ----------
+  printf '%s\n' "${CONFIG_POLICY:-full}" > "$build/etc/zzz-config-policy"
+  if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
+    # 生成"升级后需人工重配清单": 只记文件名 + 字节数, 绝不写配置内容/密钥/订阅。
+    mkdir -p "$LOG_DIR"
+    local todo="$LOG_DIR/config-restore-todo-$(date +%Y%m%d-%H%M%S).md"
+    {
+      echo "# wipe-config 升级: 配置恢复与人工重配清单"
+      echo ""
+      echo "- 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo "- 目标固件: ${TARGET_COMMIT:-unspecified}"
+      echo "- 配置策略: selective (版本感知选择性重建)"
+      echo "- 自动恢复: root 密码 / SSH 公钥+host key / WiFi SSID+key / LAN IP / DHCP 静态租约 / OpenClash 全套 / crontab+自定义脚本 / customfeeds.list"
+      echo "- 不恢复: 旧 /etc/config 全量。下表除「自动恢复」外均需人工核对或重配, 新版出厂默认已就位。"
+      echo ""
+      echo "| /etc/config 文件 | 升级前大小(B) | 处理 |"
+      echo "|---|---|---|"
+      ssh -o ConnectTimeout=10 "$ROUTER" 'cd /etc/config && for f in *; do [ -f "$f" ] || continue; printf "%s|%s\n" "$f" "$(wc -c < "$f" | tr -d " ")"; done' 2>/dev/null \
+        | while IFS='|' read -r _c _sz; do
+            case " $SAFE_CONFIGS " in *" $_c "*) _act="自动恢复(白名单)" ;; *) _act="人工重配/核对" ;; esac
+            printf '| %s | %s | %s |\n' "$_c" "$_sz" "$_act"
+          done
+      echo ""
+      echo "> 依据: 2026-11-15 解包 1115 出厂镜像, 与本机 50 个 /etc/config 逐文件比对(26 相同 / 9 改写 / 19 仅本机有 / 9 仅出厂有)。"
+      echo "> 刷前配置快照: $PREUPG_BACKUP (仅在需要查旧值时解包, 勿整包导入新系统)。"
+    } > "$todo" 2>/dev/null || true
+    echo "📋 已生成人工重配清单: $todo"
+  fi
   # 打包前最后一道 AppleDouble 防线: 清掉抓取/烘焙路径可能残留的 ._*(源头排除 + 本地清理双保险)
   # 2026-11-13: 写入无敏感信息的 kit manifest, 供 verify_kit(final) 绑定目标固件、核验重建状态。
   # 只记 commit / 内核 / 文件 sha256, 绝不写 root shadow / WiFi key / 订阅 / SSID / MAC。
   {
-    echo "kit_schema=1"
+    echo "kit_schema=2"
     echo "built_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    echo "config_policy=${CONFIG_POLICY:-full}"
+    echo "config_scope=${CONFIG_POLICY:+$(if [ "${CONFIG_POLICY:-full}" = selective ]; then printf '%s' "identity+openclash+crontab+customfeeds"; else printf '%s' "full-/etc/config"; fi)}"
+    echo "safe_configs=$SAFE_CONFIGS"
+    echo "incompatible_configs=$INCOMPATIBLE_CONFIGS"
     echo "target_commit=${TARGET_COMMIT:-unspecified}"
     echo "source_router_commit=${CURRENT_COMMIT:-unspecified}"
     echo "source_kernel=$(ssh -o ConnectTimeout=8 "$ROUTER" 'uname -r' 2>/dev/null | head -1)"
@@ -929,7 +1135,8 @@ ensure_rollback_itb
 if [ "$DRY" = "1" ]; then
   echo "=== DRY-RUN: 不执行升级 ==="
   echo "将执行的步骤:"
-  echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 并从活路由抓取 root/WiFi key/三频 SSID/OpenClash/DHCP 静态租约/额外配置(dhcp rpcd luci cpufreq watchcat dawn system)/定制路径(crontabs lan_report.sh+token apk源 http.lua补丁 rc.d启用态) 注入 kit"
+  echo "  0. 升级前配置快照 sysupgrade -b -> backups/ ; 配置策略=${CONFIG_POLICY:-full}"
+  echo "     full: 全量 /etc/config 保真 + 额外配置 + 定制路径; selective: 仅身份数据/OpenClash/crontab+脚本/customfeeds.list, 不导入旧 /etc/config"
   echo "  1. scp $(basename "$ITB") $(basename "$KIT") -> $ROUTER:/tmp/"
   echo "  1b. 路由器侧复核 itb sha256 (防止 WiFi 上传损坏)"
   echo "  2. ssh $ROUTER 'sysupgrade -F -n -f /tmp/$(basename "$KIT") /tmp/$(basename "$ITB")' (F=跳过设备名校验[见下], n=不保留当前配置, 严格全清)"

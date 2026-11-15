@@ -5,7 +5,7 @@
 #   1. 开关文件 ~/.router_autoupgrade_enabled 存在才真正刷机; 否则只检测+备料, 不刷 (默认安全)
 #   2. 新版本发布 < 72h 不刷 (等作者热修沉淀, 避开"发布当日炸机")
 #   3. 独立校验: 官方 sha256sums 优先, 缺失时用 GitHub asset.digest 兜底, 两者皆无即拒绝
-#   3b. 测试版 / wipe-config release 识别闸: 命中即停止备料与刷机 (2026-11-12 新增)
+#   3b. 版本性质(TEST/PRERELEASE)默认停; 配置兼容性(WIPE-CONFIG)停在显式确认处 (2026-11-15 拆分)
 #   4. 强终验失败 -> 自动回退到上一版本 (调用 upgrade_router.sh --auto)
 #   5. 全程写日志 watch.log; 最坏情况依赖 U-Boot http_recovery 硬件兜底
 #      (当前 U-Boot 恢复页 192.168.255.1; 刷入 11-11 chainloader 后变为 192.168.0.1)
@@ -15,7 +15,8 @@
 #   router_watch.sh --force  # 仅跳过"发布满72h"闸 (2026-11-04: 不再关闭 sha256 校验)
 #   router_watch.sh --check  # 检测+备料(会下载 itb、写 sha256sums、追加 watch.log), 绝不升级
 #   router_watch.sh --no-download  # 纯只读: 只检测报告, 零下载/零文件写入 (定时巡检推荐)
-#   router_watch.sh --allow-test-build  # 显式放行测试版/wipe-config release (默认拒绝, 自担风险)
+#   router_watch.sh --allow-test-build  # 显式放行测试版/预发布 release (默认拒绝, 自担风险)
+#   router_watch.sh --now --ack-config-reset  # 正式版 wipe-config: 显式确认配置重建(默认停止)
 #
 # 可由 launchd / WorkBuddy 定时自动化按需调用（本仓库不含 plist, 按需自行配置调度）
 
@@ -24,13 +25,14 @@ REPO="naoki66/ImmortalWrt-for-Gemtek-brightspeed"
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$PREP_DIR/watch.log"
 ENABLE_FILE="$HOME/.router_autoupgrade_enabled"
-FORCE=0; CHECK_ONLY=0; NOW=0; ROUTER_OVERRIDE=""; ALLOW_TEST_BUILD=0; NO_DOWNLOAD=0; LOG_TO_FILE=1
+FORCE=0; CHECK_ONLY=0; NOW=0; ROUTER_OVERRIDE=""; ALLOW_TEST_BUILD=0; NO_DOWNLOAD=0; LOG_TO_FILE=1; ACK_CONFIG_RESET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1;;
     --check) CHECK_ONLY=1;;
     --now)   NOW=1;;
     --allow-test-build) ALLOW_TEST_BUILD=1;;
+    --ack-config-reset) ACK_CONFIG_RESET=1;;
     --no-download) NO_DOWNLOAD=1; CHECK_ONLY=1; LOG_TO_FILE=0;;
     --router) ROUTER_OVERRIDE="${2:-}"; shift;;
     --router=*) ROUTER_OVERRIDE="${1#*=}";;
@@ -90,9 +92,22 @@ log "当前固件 commit: $cur_hash"
 # (gojq 子集不支持 any(.name; test()), 改用 any(.assets[]; .name|test()) 存在量词写法)
 # 2026-11-04: 增加第 5 字段 asset.digest。上游 1029 release 没附 sha256sums, 但 GitHub API
 #   自带官方 asset digest, 可作同等强度的独立校验基准, 避免"无 sums 就静默跳过校验"。
+# 2026-11-15: 环境里被注入无效 GITHUB_TOKEN 时会覆盖 gh keyring 的有效凭据, 使 gh api
+#   报 401 Bad credentials -> 官方元数据/asset.digest/发布闸全线失效, 静默降级成"仅 --itb 可用"。
+#   先探活, 失败则在本进程内丢弃该变量改用 keyring; 不修改用户 shell 配置。
+gh_auth_guard(){
+  [ -n "${GITHUB_TOKEN:-}" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  if ! gh api user >/dev/null 2>&1; then
+    echo "⚠️ 环境变量 GITHUB_TOKEN 无效(gh api 401), 本进程内忽略它, 改用 gh keyring 凭据"
+    unset GITHUB_TOKEN
+  fi
+}
+
+gh_auth_guard
 REL_TSV=""
 for _try in 1 2 3; do
-  REL_TSV=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | sort_by(.published_at) | reverse | .[0] | [.tag_name, .published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name=="sha256sums")) | .[0].browser_download_url // "NONE"), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].digest // "NONE"), (if .prerelease then "PRERELEASE" elif ((.body // "") | test("wipe-config|不保留配置|测试固件|测试版")) then "TEST" else "OK" end)] | @tsv' 2>/dev/null)
+  REL_TSV=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(any(.assets[]; .name|test("gemtek_xr1710g")))] | sort_by(.published_at) | reverse | .[0] | [.tag_name, .published_at, (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].browser_download_url), (.assets | map(select(.name=="sha256sums")) | .[0].browser_download_url // "NONE"), (.assets | map(select(.name|test("gemtek_xr1710g"))) | .[0].digest // "NONE"), ([ (if .prerelease then "PRERELEASE" else empty end), (if ((.body // "") | test("本次为测试固件|测试固件|测试版")) then "TEST" else empty end), (if ((.body // "") | test("wipe-config|不保留配置|默认打开测试")) then "WIPE-CONFIG" else empty end) ] | if length == 0 then "OK" else join("+") end)] | @tsv' 2>/dev/null)
   [ -n "$REL_TSV" ] && break
   sleep 2
 done
@@ -125,16 +140,32 @@ if [ -n "$rel_hash" ] && [ "$cur_hash8" = "$rel_hash" ]; then
 fi
 log "🔔 发现新版本: $rel_tag (当前 $cur_hash8 -> 目标 ${rel_hash:-未知})"
 
-# ---------- 3b. 安全闸: 测试版 / wipe-config release (2026-11-12 新增) ----------
-# 20261112 正文写"本次为测试固件""本次升级默认打开测试不保留配置建议""OTA: wipe-config",
-# 但 prerelease=false, 光看 tag/元数据看不出来。测试版会清空配置, 且 kit 必须重建,
-# 自动升级守护绝不能拿它当正式版刷。默认在此停止(不下载镜像、不触发升级)。
-if [ "${rel_flags:-OK}" != "OK" ] && [ "${rel_flags:-OK}" != "UNKNOWN" ] && [ "$ALLOW_TEST_BUILD" = "0" ]; then
-  log "🛑 最新 release [$rel_tag] 被识别为测试版/预发布/wipe-config (标记 $rel_flags), 自动升级已停止"
-  log "   原因: 该版本默认不保留配置, 会清空 OpenClash 规则与自定义钩子; 且内核/预装包大变时 kit 必须重建"
-  log "   处置: 等正式版, 或人工核对后走 upgrade_router.sh --allow-test-build / 本脚本 --allow-test-build 自担风险"
-  exit 0
-fi
+# ---------- 3b. 安全闸: 版本性质 / 配置兼容性 (2026-11-15 拆分) ----------
+# 20261112 = 测试版 + wipe-config; 20261115 = prerelease=false 正式版 + wipe-config。
+# 旧逻辑把两者混成一个 TEST 标记, 对 1115 给出"等正式版"的错误建议(它就是正式版)。
+# 现在: TEST/PRERELEASE = 版本性质, 停止备料; WIPE-CONFIG = 配置兼容性, 不停版本但
+#       自动升级守护绝不擅自确认"丢配置", 需人工 --ack-config-reset 后再走 --now。
+case "${rel_flags:-OK}" in
+  *TEST*|*PRERELEASE*)
+    if [ "$ALLOW_TEST_BUILD" = "0" ]; then
+      log "🛑 最新 release [$rel_tag] 是测试版/预发布 (标记 ${rel_flags}), 自动升级已停止"
+      log "   处置: 等正式版, 或人工核对后走 --now --allow-test-build 自担风险"
+      exit 0
+    fi
+    ;;
+esac
+case "${rel_flags:-OK}" in
+  *WIPE-CONFIG*)
+    if [ "$ACK_CONFIG_RESET" = "0" ]; then
+      log "⏸ 最新 release [$rel_tag] 是正式版但要求 wipe-config (标记 ${rel_flags})"
+      log "   ⚠️ 这不是测试版, 无需再等; 但旧配置与新版不兼容, 本工具会自动切 selective 策略,"
+      log "      只恢复身份数据 + OpenClash, 其余 /etc/config 需人工重配。"
+      log "   处置: 人工核对发布说明与重配清单后, 用 --now --ack-config-reset 显式确认(默认不擅自丢配置)"
+      exit 0
+    fi
+    log "⚠️ 已由 --ack-config-reset 显式确认 wipe-config 配置重建(自担重配成本)"
+    ;;
+esac
 if [ "${rel_flags:-OK}" = "UNKNOWN" ]; then
   log "⚠️ 无法判定 release 性质(标记 UNKNOWN), 请人工核对 $rel_tag 的发布说明"
 fi
@@ -222,5 +253,6 @@ log "🚀 触发升级 (--auto)"
 UPG_ARGS=(--auto --router "$ROUTER")
 if [ "$FORCE" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--force"; fi
 if [ "$ALLOW_TEST_BUILD" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--allow-test-build"; fi
+if [ "$ACK_CONFIG_RESET" = "1" ]; then UPG_ARGS[${#UPG_ARGS[@]}]="--ack-config-reset"; fi
 "$PREP_DIR/upgrade_router.sh" "${UPG_ARGS[@]}"
 log "=== watch 流程结束 ==="

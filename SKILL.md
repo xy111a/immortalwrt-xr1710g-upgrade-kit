@@ -31,7 +31,7 @@ agent_created: true
 | 网络 | `/etc/config/network` + `/etc/config/wireless` 整配置 | 真实配置还原通道（flag: `etc/zzz-realconfig.flag`）；**注意 kit 里没有 `etc/config/` 目录，`mkdir -p "$build/etc/config"` 不能漏**（漏了重定向失败会静默降级） |
 | 配置 | `EXTRA_CONFIGS="dhcp rpcd luci cpufreq watchcat dawn system"` + **全量 `/etc/config` 兜底**（2026-10-27 修复 R5） | EXTRA_CONFIGS 逐个 `cat` 抓取（健全性校验含 `^config`，失败不阻断）；**另加全量 `tar etc/config` 兜底**，覆盖 firewall/ddns-go/lucky/wechatpush/zerotier/smartdns/upnpd/usteer/xray/socat/udpxy 等所有未被显式抓取的包配置，未来新增包自动覆盖。firewall 的 openclash/zerotier `/var` include 段由 zzz-restore 首启动剥离（见下） |
 | 路径 | `EXTRA_PATHS`：`etc/crontabs` `etc/lan_report.token` `etc/apk/repositories.d` `usr/sbin/lan_report.sh` `usr/lib/lua/luci/http.lua` `usr/share/ucode/luci/http.uc` `root/.ssh/known_hosts` | tar 整包抓取，排除 `._*`/`*.bak`；成功判定用 `etc/crontabs/root` 作探针 |
-| 启用态 | `/etc/rc.d`（排除 openclash 链） | 保留"用户禁用 watchcat/igmpproxy"这类状态；openclash 链由 rc.local 的 `enable` 重建 |
+| 启用态 | `/etc/rc.d`（排除 openclash 链） | `full` 策略保留"用户禁用 watchcat/igmpproxy"这类状态；openclash 链由 rc.local 的 `enable` 重建。`selective` 策略不导入旧 rc.d，禁用清单改抓服务名 |
 | 禁用态 | `etc/zzz-disabled-services`（刷前生成） | **overlay 白名单（whiteout，字符设备 0/0）不是普通文件，tar 抓不到**——禁用服务=删开机链，全清刷后 `/rom` 下层出厂链会重新可见，服务被默默重启（2026-10-08 升级后实际复发过）。修法：刷前算"出厂有链、现网无链、且 init.d 仍在（包未卸=用户主动禁用）"清单写入 kit，`zzz-restore` 首启动对每个链 `rm -f` 重建白名单。注意区分"包被卸"（init.d 不在）——那种不能禁，新固件自带该包时应保持出厂启用。**2026-10-28 修正**：`zzz-restore`(uci-defaults) 早期的 `rm` 会被部分服务(如 watchcat)的**包 postinst 在首启动后续阶段重建 rc.d 链接**而失效（实测升级后 watchcat 又被启用）。故禁用清单不再在 uci-defaults 阶段删除，改由注入的 `rc.local` 末段再强制 `rm` 一次并最终消费清单，确保禁用态真正生效。 |
 
 **为什么全量抓 `/etc/config/firewall` 但要剥离 include（2026-10-27 修复 R5）**：现网 firewall 含用户大量自定义区域/转发/规则（实测 129 行），此前因"include 指向 `/var` 运行时文件、首启动尚不存在 → fw4 加载失败"而刻意不抓，导致这些自定义规则全清刷后回退包默认、需手动重建。现改为「全量抓 firewall + 首启动剥离 `/var` include 段」：剥离的是 openclash/zerotier 指向 `/var/etc/openclash.include`、`/var/run/zerotier-one/_fw4/*.nft` 的 `config include`（这些由对应服务自身启动时重新添加），保留的是用户全部自定义规则——既不丢配置、又避免启动失败。**注意**：这条是 2026-10-21 审计"覆盖率 100%"的盲区修正（当时 100% 是相对设计抓取集，未覆盖全清模型下的全部 live 配置）；R5 修复后才是真正的全量覆盖。
@@ -181,13 +181,15 @@ agent_created: true
 - **安全闸（缺一不可）**：
   1. **发布沉淀闸**：新版本发布 < 72h 不刷（单维护者构建，避开发布当日热修炸机）。
   2. **独立校验**：官方 `sha256sums` 优先，缺失时用 GitHub API 原生 `asset.digest` 兜底（1029 / 1112 均无 sums），两者皆无即 fail-closed；`EXPECT_SHA` 由 `upgrade_router.sh` **运行时**派生（watch 不再回写脚本文件，`--check` 零副作用）。
-  2b. **测试版 / wipe-config 闸（2026-11-12 新增，11-13 加固）**：识别 release 正文的 `本次为测试固件` / `不保留配置` / `wipe-config` 及 `prerelease=true`；**再加一条不依赖措辞的客观信号** `TAG-DATE-MISMATCH`（tag 日期 != 镜像名日期）。release 元数据统一按 `published_at` 降序取、单次 gh 调用取齐，杜绝「闸校验 A、实际刷 B」。命中则 watch 停止备料、`upgrade_router.sh` 真实执行 fail-closed（dry-run 高亮告警），需 `--allow-test-build`。
+  2b. **版本闸（2026-11-15 拆分）**：`TEST` / `PRERELEASE` = 版本性质（`本次为测试固件`/`测试版` + `prerelease=true`），默认拒绝、需 `--allow-test-build`；`WIPE-CONFIG` = 配置兼容性（`wipe-config`/`不保留配置`），**不是拒绝刷的理由**，而是强制切 `selective` 配置策略 + 需 `--ack-config-reset` 显式确认。`TAG-DATE-MISMATCH` 保留为独立客观信号。旧逻辑把 `wipe-config` 算进 `TEST`，对 1115 这类正式版给出「等正式版」的错误建议，已修正。release 元数据仍按 `published_at` 降序、单次 gh 调用取齐。
   3. **强终验+自动回退**：`--auto` 模式跑硬终验(版本/外网直连/三频) + 软终验(OpenClash代理DNS, 仅启用时)；连不上路由器不触发回退。终验失败才自动 `sysupgrade -F <回退itb>`，回退后同样做 DNS 兜底。
   4. **U-Boot 兜底**：最终防线，刷坏自动进 Recovery（恢复页 IP 见上方 T2；刷 chainloader 后会变，必须重学）。
 
 ## 🔧 2026-11-12 上游复评后的 Skill 更新（本轮改动）
 
 1. **测试版 / wipe-config 识别闸（P1）**：`official_asset_meta()` 旁新增 `official_release_flags()`，单独取目标 release 的 `tag_name` / `prerelease` / `body`（jq `gsub` 归一化成单行，避免 tab 折叠），正文命中 `本次为测试固件|测试版|不保留配置|wipe-config` 或 `prerelease=true` 时：`upgrade_router.sh` 真实执行默认 `die`（dry-run 高亮告警 + 打印正文摘录），需 `--allow-test-build`；`router_watch.sh` 命中即停止备料、不触发刷机。显式 `--itb` 指定历史版本时该闸不适用（目标已不是最新 release，标记不该张冠李戴）。读不到正文时为 `UNKNOWN`，只提示不阻断，避免 gh 抖动把正常升级卡死。
+
+   > ⚠️ **本条已于 2026-11-15 拆分重写**：`wipe-config` 不再计入 `TEST`，正式版带 `wipe-config` 时改为强制 `selective` 策略 + `--ack-config-reset` 确认，详见下方「wipe-config 版本适配」。
 2. **`router_watch.sh` 版本比对修复（P1）**：旧代码 `rel_hash` 从 tag 尾部取 commit，纯日期 tag（`20261112`）会被误当 hash，且路由器 commit 10 位 vs 镜像文件名 8 位 →「已是最新」永不命中。改为从 itb 下载 URL 的文件名提取 8 位 commit，与运行版本前 8 位比对。
 3. **`${FORCE:+--force}` 恒真修复（P1）**：`FORCE=0` 是**非空字符串**，`${FORCE:+--force}` 会恒展开成 `--force`，导致 `--now` 常规升级也把 `upgrade_router.sh` 的 72h 闸一并跳过（watch 自己的闸仍在，但语义不一致）。改为按值判断组装参数数组，并透传 `--allow-test-build`。
 4. **T2 兜底入口补全 + 文档纠偏**：恢复页 IP / 触发时序写进 README、两份 SKILL.md、两个脚本头注释与重连失败提示；同时修掉 README 与 SKILL.md 里「`--force` 忽略 EXPECT_SHA 不匹配强制刷」「`--force` 跳过校验」「只下载 sha256sums」三处**与现行代码相反**的旧描述（现行：有基准不匹配任何参数都不放行，`--force` 仅跳 72h 闸，校验优先 asset.digest）。**72h 沉淀闸本身逻辑正确，未改**。
@@ -214,15 +216,13 @@ agent_created: true
 
 **结论（截至 2026-11-12）**：不单独刷 U-Boot；与「把 NPU 根因修复编进去的下一版正式固件」配套做（1112 发布说明已把 MAC 修复绑成固件+U-Boot 配套件，推翻了早期「先固件、U-Boot 后置」的顺序）。刷前备份 mtd3 + mtd1/uenv、确认新恢复页 `192.168.0.1`、验证 `ubi`/`system` 恢复路径、备好 TTL。
 
-## 📌 当前固件状态（2026-11-13，会过期）
+## 📌 当前固件状态（2026-11-15，会过期）
 
-- `20261112`（镜像 `20261111-a6d84923`，97MB，digest `05b0a652…9fa80e`）仍是唯一含 XR1710G 镜像的最新版，OTA 测试版、`OTA: wipe-config`，下载 **874 次**；72h 闸按 `published_at`（北京 11-11 13:06）到 **11-14 13:06** 才过。`20261111` 标签里**没有 XR1710G 镜像**。
-- **11-13 新增 issue #95**（11-12 15:51 北京，0 评论）：1112 上 AP 模式 mt7996 对 Qualcomm 客户端下行单播重试风暴（`failed==retries`，~200/s），频段/PHY/信道/BF/TWT/驱动全排除，Intel BE200 对照干净；报告者写明 **1016 与 1112 都复现**，属跨版本 mt76 问题 —— **升级不解决它**。本机是网关模式而非「一键 AP」，不能推断必现。11-12 记的「零故障 issue」作废。
-- 11-11 晚间那批 NPU 根因修复之后，**11-13 复核仍无新 release、无新提交**，所以「等下一版把 NPU 修复编进去」的触发条件**还没到**。
-- 1108：#94（5G/6G VIF 不在 fw4 硬件 flowtable、手动加入后掉速）、#90（5GHz 13 分钟后 MT7996/PCIe AER/full-reset 失败）；1029：#81 bridger 断流仍靠停 bridger 规避。
-- Issue #82（1016 NPU Oops）是**报告者自行关闭**，作者从未确认根因、未声明修复；本机 dmesg 近 10 天无 Oops/panic。「官方已确认缺陷并已修」不成立。
-- U-Boot 两条线 11-13 仍静止：chainloader 11-11 版下载 17→81 次、0 open issue、仍缺 XG2010G asset；YYH2913 上游停在 11-02。
-- **触发条件**：等「把 11-11 晚间那批 NPU 根因修复编进去」的下一版正式固件 → 过 72h → 看新 issue → **先重建 kit**（当前 kit 是 10-08 旧版，`verify_kit` 会拦）→ 全清刷（不走 LuCI OTA）。
+- 本机 `20261016-1a34e17c` / 6.18.55。**11-15 21:36 复核 uptime 仅 57 分钟**，dmesg 有 `UBIFS recovery needed/completed`，pstore 空、无 Oops/panic/看门狗痕迹 → 48h 异常复位观察窗内拒绝刷机（闸正确生效）。
+- **最新 `20261115` 正式版**（`5e152df9`，85,561,654 B，digest `7a828e88…d0111`，北京 11-15 14:51，`prerelease=false`，走 `asset.digest`），发布后 6h / 308 次下载 / 零新建 issue。说明主打全链路 NPU 加速、重写 NPU 监控与风扇控制、修复默认 APK 源，并**明令配置不兼容、不得导入旧配置**（`OTA: wipe-config`）。72h 闸到 **11-18 14:51**。
+- 镜像内嵌 commit `5e152df9` 在公开 master 查不到；作者未确认修了 `#82`（报告者称「升级以后需要双清，就好了」，属用户经验）。`#95` 作者 11-15 让「刷入最新版测试」，未确认已修；`#96`（XG2010G NPU 通路卡死）求日志。
+- **结论：仍不刷机**。触发条件=过 72h + 复核 issue + 按新固件重建 kit（**`--config-policy selective`**）+ 人工核对重配清单 + `--ack-config-reset`。旧的「全量配置保真」链路对 1115 已不适用，见下方「wipe-config 版本适配」。
+- U-Boot 两线仍静止：chainloader 11-11 版下载 119 次、0 open issue、缺 XG2010G asset；YYH2913 停 11-02。结论不变：**不单独刷**。
 
 ## 🔧 2026-11-13 二次审计后的修复（本轮改动，7 项 + 1 项实测新发现）
 
@@ -242,3 +242,63 @@ agent_created: true
 
 ## ⚠️ 免责声明
 本工具针对**非官方第三方固件**（naoki66 社区构建）。使用即自担风险：全清刷有变砖可能（虽有 U-Boot 兜底），请确认你的设备型号与固件来源匹配，并备份好当前配置与回退镜像。作者不对任何刷机后果负责。
+
+## 🧩 wipe-config 版本适配（2026-11-15，重大行为变更）
+
+**结论先行**：`20261115` 是 `prerelease=false` 的正式版，但发布说明明令「此版本为后端大改动，和旧版本配置文件不兼容」「默认不得保留配置和导入旧版本配置」。本工具原来的核心是 `sysupgrade -F -n -f kit.tar.gz` + `collect_runtime()` **全量兜底导入活机 `/etc/config`** —— 这正是官方禁止的动作。因此 Skill 已从「全量配置保真」升级为**版本感知的选择性重建**；`TEST`（版本性质）与 `WIPE-CONFIG`（配置兼容性）也拆成两个独立信号。
+
+### 真实 diff 证据（不是推断）
+
+解包 1115 官方 itb（85,561,654 B，digest `sha256:7a828e88…d0111`）切出 rootfs.squashfs，导出出厂 `/etc/config`，与本机 `20261016` 运行态逐文件比对：
+
+| 分类 | 数量 | 代表 | 处理 |
+|---|---|---|---|
+| 逐字节相同 | 22 | `fan` / `ddns` / `upnpd` / `xray` | 出厂本来就有，无需导入 |
+| 内容被新版改写 | 9 | `firewall` 3261→4159B、`uhttpd` 742→4569B、`dhcp` 2280→1325B、`zerotier` 617→1918B、`luci`/`rpcd`/`smartdns`/`watchcat`/`openssl` | **禁止导入**（会覆盖新版默认） |
+| 仅本机有 | 19 | `airoha_npu` / `npu-monitor` / `cpufreq` / `network` / `wireless` / `system` / `fstab` / `openclash` | 除 `openclash` 外全部排除 |
+| 仅出厂有 | 9 | `bridger` / `pbr` / `sing-box` / `naoki66-ota` / `naoki66-overview` / `nlbwmon` / `easytier` / `argon` / `ac` | 保留出厂默认 |
+
+关键实证：
+- **1115 出厂 `/etc/config` 里没有 `network` / `wireless` / `system`** —— 由 `board.d` + `03_wireless` + `22_airoha-network-migrate-v4` 在首启动生成。导入旧文件会跳过生成并造成混合状态（`03_wireless` 还会覆写 radio 硬件参数）。
+- 本机 `distfeeds.list` 指向 `mirrors.vsean.net`，1115 出厂指向 `downloads.immortalwrt.org`（发布说明「修复默认 APK 安装源」即此事）。该文件注释明写 *auto-generated and build-specific, changes will be intentionally lost in sysupgrade*。导入旧源会覆盖修复，而 `zzz-restore` 的 `rc.local` 靠 `apk add luci-app-openclash` 装回代理，源错则全清刷后代理起不来 → 只抓 `customfeeds.list`。
+- 新版移除了 `airoha_npu` / `npu-monitor` / `cpufreq`（正是「重写 NPU 监控和风扇控制」的对象），导入即悬空 UCI 文件。
+
+**两处早期推断已按实测纠正**（避免误伤）：① `fan` 与出厂**逐字节相同**（重写的是控制程序，不是配置格式），排除它只为让新版出厂值生效；② 出厂 `firewall` **自带 `fullcone=1`**，`18-xr1710g-firewall-defaults` 只设两个 offload —— 因此不是删掉 `fullcone`，而是改为「仅当该 option 已存在才回写」。
+
+### 两种配置策略
+
+| | `full`（默认） | `selective`（wipe-config 自动切换） |
+|---|---|---|
+| 适用 | 同代小版本，配置格式兼容 | 官方声明配置不兼容 / `OTA: wipe-config` |
+| `/etc/config` | 全量兜底 + `EXTRA_CONFIGS` 整文件导入 | **完全不导入**，仅白名单 `openclash` |
+| 身份数据 | 全量 + 补丁 | 补丁式 `uci set`：LAN IP / 三频 SSID+key / 6G 关闭 / DHCP 静态租约 |
+| 网络与无线 | 整文件还原 | **不覆写**，沿用新版 `board.d` + uci-defaults 生成结果 |
+| 定制路径 | 全部 `EXTRA_PATHS` | 仅 `SAFE_EXTRA_PATHS`（crontab / lan_report / token / 脚本 / known_hosts / `customfeeds.list`），排除 LuCI 补丁 |
+| 服务启用态 | 导入旧 `/etc/rc.d` + 链接名禁用清单 | 不导入；禁用清单改抓**服务名**，首启动 `init.d disable`，与 S/K 编号解耦 |
+| 保真度校验 | 逐字节一致 = 成功 | 分层：白名单必须还原，其余**期望变化** |
+
+自动规则：release 标记含 `WIPE-CONFIG` → 自动切 `selective`；可用 `--config-policy full|selective` 显式覆盖（覆盖=自担风险）。`verify_kit final` 会扫注入 kit 的 `etc/config/*`：命中 `INCOMPATIBLE_CONFIGS` 黑名单、或 selective 下出现白名单外文件、或 manifest 的 `config_policy` 与本次策略不符，一律 **fail-closed 拒绝刷机**。
+
+### 新增参数与闸语义
+
+```bash
+./upgrade_router.sh --dry-run                       # 1115 现在标记 WIPE-CONFIG(不再误报 TEST), 自动切 selective
+./upgrade_router.sh --ack-config-reset             # 真实刷 wipe-config 版本需显式确认"配置不保真"
+./upgrade_router.sh --config-policy full           # 显式覆盖策略(自担风险)
+./build_kit.sh --keys <pub> --config-policy selective --out kit.tar.gz --force
+router_watch.sh --now --ack-config-reset           # 守护默认停在配置确认处, 不擅自丢配置
+```
+
+- **`TEST` / `PRERELEASE`**：版本性质，仍是默认拒绝，需 `--allow-test-build`。
+- **`WIPE-CONFIG`**：不是拒绝刷的理由，而是**强制启用 selective + 显式确认**。旧逻辑把它算进 `TEST`，会给 1115 这类正式版输出「等正式版」的错误建议（它本身就是正式版），过了 72h 还得用「自担测试版风险」的参数才能刷 —— 已修正。
+- `TAG-DATE-MISMATCH` 保留为独立客观信号，仅告警。
+- `gh` 401 兜底：环境注入无效 `GITHUB_TOKEN` 时自动丢弃改用 keyring，避免「自动选片 / 官方 digest / 发布闸」全线静默降级。
+
+### 升级后要人工做什么
+
+`selective` 模式下 `collect_runtime()` 会生成 `~/router-upgrade-logs/config-restore-todo-<时间戳>.md`，列出本机全部 `/etc/config` 及「自动恢复 / 人工重配」标记（**只记文件名与大小，不含密钥/订阅**）。典型需人工重配：`dhcp` 的 dnsmasq 定制（`noresolv` / `127.0.0.1#7874` / `cachesize` / 日志开关）、`rpcd` 的 homepage 只读用户、`luci` 主题（glass）、`zerotier` 网络与 secret、`watchcat`、`smartdns`、`uhttpd`、以及 `dawn`/`usteer`/`msd_lite`/`socat`/`udpxy`/`rtp2httpd`/`glass`/`pushbot`/`meshconf` 等新版未预装包的配置。
+
+> 明确**不用改**、跨版本安全：OpenClash 全链路（`/etc/config/openclash` + `zzz-oc-data` + `clash_meta` + rc.local 装机）、root shadow / WiFi key / SSID / LAN IP / DHCP host / dropbear host key / `authorized_keys`、`/etc/crontabs` 用户项、`auto_rollback()` 的 `sysupgrade -F -f rb-config.tar.gz`（回退目标是旧固件，旧配置匹配）。
+
+> ⚠️ **真刷前仍必须重建 `kit.tar.gz`**：当前仓库根 kit 停留在 2026-10-08，内嵌自举脚本不含本次 selective 分支，`verify_kit pre` 会拦下。重建时针对 wipe-config 版本加 `--config-policy selective`。
+

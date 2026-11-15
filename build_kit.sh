@@ -17,6 +17,7 @@
 #                    不提供时, kit 不含内核, 依赖 zzz-restore 运行时从 CDN 兜底下載。
 #   --target-commit (可选) 该 kit 面向的目标固件 commit(写入 manifest; 升级时 collect_runtime 会覆写为实际目标)
 #   --target-kernel  (可选) 目标固件内核版本(写入 manifest, 仅用于跨内核告警)
+#   --config-policy  (可选) full|selective, 写入 manifest 供 verify_kit(final) 校验策略一致性
 #   --out          产物路径
 #   --force        仅当 --out 指向已存在的 kit.tar.gz 时才需要, 显式允许覆盖
 #
@@ -30,7 +31,7 @@ set -eu
 export COPYFILE_DISABLE=1
 
 PREP_DIR="$(cd "$(dirname "$0")" && pwd)"
-KEYS=""; OC=""; CORE=""; OUT="$PREP_DIR/dist/kit.tar.gz"; FORCE=0; TC=""; TK=""
+KEYS=""; OC=""; CORE=""; OUT="$PREP_DIR/dist/kit.tar.gz"; FORCE=0; TC=""; TK=""; CP="full"
 while [ $# -gt 0 ]; do
   case "$1" in
     --keys)           KEYS="$2"; shift 2;;
@@ -40,12 +41,14 @@ while [ $# -gt 0 ]; do
     --force)          FORCE=1;   shift 1;;
     --target-commit)  TC="$2";   shift 2;;
     --target-kernel)  TK="$2";   shift 2;;
+    --config-policy)  CP="$2";   shift 2;;
     *) echo "未知参数: $1"; exit 1;;
   esac
 done
 
 [ -n "$KEYS" ] && [ -f "$KEYS" ] || { echo "❌ 需提供 --keys <authorized_keys 文件>"; exit 1; }
 [ -f "$PREP_DIR/zzz-restore-router" ] || { echo "❌ 找不到 zzz-restore-router"; exit 1; }
+case "$CP" in full|selective) ;; *) echo "❌ --config-policy 仅支持 full|selective"; exit 1;; esac
 
 # 安全闸: 默认拒绝覆盖仓库根的 kit.tar.gz (那是用中的真 kit)
 REAL_KIT="$PREP_DIR/kit.tar.gz"
@@ -97,8 +100,9 @@ fi
 # "这份 kit 是不是按仓库当前源码 / 目标固件重建的"。只记 commit / 内核 / 文件 sha256,
 # 绝不写 SSID / WiFi key / root hash / 订阅 / MAC —— manifest 会随 kit 一起进路由器。
 {
-  echo "kit_schema=1"
+  echo "kit_schema=2"
   echo "built_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  echo "config_policy=$CP"
   echo "target_commit=${TC:-unspecified}"
   echo "target_kernel=${TK:-unspecified}"
   echo "source_router_commit=unspecified"
@@ -118,6 +122,7 @@ rm -rf "$BUILD"
 
 echo "✅ 已生成 kit -> $OUT (含 etc/kit-manifest: 无敏感信息, 供刷前核验)"
 echo "   升级时 upgrade_router.sh 会从活路由器抓取 root shadow / WiFi key / 三频 SSID / OpenClash 配置(core 除外)"
-echo "   以及审计确认的额外配置(dhcp rpcd luci cpufreq watchcat dawn system)与定制路径(crontabs/rc.d/lan_report/token/apk源/http.lua补丁)"
+echo "   full 策略: 额外配置 + 定制路径(crontabs/rc.d/lan_report/token/customfeeds.list/http.lua 补丁)"
+echo "   selective 策略(wipe-config 版本): 仅身份数据 + OpenClash + crontab/脚本/customfeeds.list, 不导入旧 /etc/config"
 echo "   注入临时 kit (仅存于 /tmp, 脚本退出即清理), 源码与仓库均无任何明文敏感信息。"
 echo "   若提供了 --openclash-core, 内核已烘焙进 kit, 全清刷后内核不丢; 否则 zzz-restore 运行时兜底下载。"

@@ -36,6 +36,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# 2026-11-15: 环境里被注入无效 GITHUB_TOKEN 时会覆盖 gh keyring 的有效凭据,
+#   所有 gh api 报 401 Bad credentials, 进而让"自动选片/官方 digest/发布闸"全线失效。
+#   这里先探活, 失败就丢弃该环境变量改用 keyring(不改用户 shell, 仅本进程内生效)。
+if [ -n "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+  if ! env -u HTTP_PROXY -u HTTPS_PROXY gh api user >/dev/null 2>&1; then
+    echo "⚠️ 检测到无效 GITHUB_TOKEN(gh api 鉴权失败), 本进程内忽略它, 改用 gh keyring 凭据"
+    unset GITHUB_TOKEN
+  fi
+fi
+
 echo "=== 准备 Git 工作副本: $WORK ==="
 if [ -d "$WORK/.git" ]; then
   env -u HTTP_PROXY -u HTTPS_PROXY git -C "$WORK" fetch --quiet origin 2>/dev/null || echo "⚠️ fetch 失败(可能离线), 用本地副本继续"

@@ -48,6 +48,31 @@ if [ -f "$SECRETS" ]; then
   LAN_IP=$(grep '^LAN_IP=' "$SECRETS" 2>/dev/null | cut -d= -f2-)
 fi
 
+# ---------- 配置策略(2026-11-15) ----------
+# 由 Mac 侧 collect_runtime 写入 kit 的 etc/zzz-config-policy; 旧 kit 无该文件时默认 full(向后兼容)。
+POLICY=full
+[ -f /etc/zzz-config-policy ] && POLICY=$(cat /etc/zzz-config-policy 2>/dev/null)
+case "$POLICY" in full|selective) ;; *) POLICY=full ;; esac
+echo "配置策略: $POLICY" >>$LOG
+
+if [ "$POLICY" = "selective" ]; then
+  # wipe-config 版本: 新版出厂 network/wireless 由 board.d + 03_wireless +
+  # 22_airoha-network-migrate-v4 生成, 本脚本绝不整文件覆写, 只补丁恢复纯身份数据。
+  # 本脚本名 zzz-* 排在全部 uci-defaults 之后执行, 此时新版配置已生成, 补丁顺序正确。
+  [ -n "$LAN_IP" ] && uci set network.lan.ipaddr="$LAN_IP" 2>/dev/null || true
+  _i=0
+  for _ss in "$SSID0" "$SSID1" "$SSID2"; do
+    [ -n "$_ss" ] && uci set "wireless.@wifi-iface[$_i].ssid=$_ss" 2>/dev/null || true
+    [ -n "$WIFI_KEY" ] && uci set "wireless.@wifi-iface[$_i].key=$WIFI_KEY" 2>/dev/null || true
+    _i=$((_i+1))
+  done
+  # 6G 按当前决策保持关闭(与 full 策略 heredoc 一致); 其余射频参数一律沿用新版出厂
+  uci set wireless.radio2.disabled='1' 2>/dev/null || true
+  uci set wireless.@wifi-iface[2].disabled='1' 2>/dev/null || true
+  uci commit network 2>/dev/null || true
+  uci commit wireless 2>/dev/null || true
+  echo "已按补丁方式恢复 LAN IP / 三频 SSID+key / 6G 关闭; network/wireless 主体沿用新版生成结果" >>$LOG
+else
 # ---------- 1. network: 还原 LAN IP / 桥接 / WAN ----------
 # 优先使用 kit 携带的真实配置(由 Mac 侧 collect_runtime 从活路由抓取, 含用户自定义信道/功率/桥接);
 # 仅当标记文件不存在(例如配置级回退未携带真实配置, 或抓取失败)时, 才降级为已知良好 heredoc 写死默认。
@@ -186,10 +211,15 @@ fi
 # 清理标记文件(用后即删, 避免残留误导后续首启动)
 rm -f /etc/zzz-realconfig.flag 2>/dev/null
 
+fi
 # ---------- 3. firewall: 确保 flow offload + fullcone 开启 ----------
 uci set firewall.@defaults[0].flow_offloading='1' 2>/dev/null || true
 uci set firewall.@defaults[0].flow_offloading_hw='1' 2>/dev/null || true
-uci set firewall.@defaults[0].fullcone='1' 2>/dev/null || true
+# 2026-11-15: 1115 出厂 firewall 自带 fullcone=1(实测), 18-xr1710g-firewall-defaults
+# 只设两个 offload。改为"仅当该 option 已存在才回写", 不给不含它的新 schema 硬塞未知选项。
+if uci -q get firewall.@defaults[0].fullcone >/dev/null 2>&1; then
+  uci set firewall.@defaults[0].fullcone='1' 2>/dev/null || true
+fi
 # 剥离 firewall 中指向 /var 运行时文件的 config include(openclash + zerotier 共 4 个具名段,
 # 形如 firewall.openclash / firewall.zerotier_input/srcnat/forward, 均指向 /var/etc 或 /var/run)。
 # 背景(2026-10-27 修复 R5): 现网 firewall 含用户 129 行自定义区域/转发/规则 + 上述 /var include 段。
@@ -216,7 +246,8 @@ uci commit firewall 2>/dev/null || true
 # 已随 kit 整配置还原(EXTRA_CONFIGS), 此时跳过"清空+重建", 避免把已还原的匿名 host 段
 # 无谓churn 成具名段; 仅当 kit 未携带真实 dhcp 配置(旧 kit/抓取失败)时才走确定性重建。
 DHCP_HOSTS=/etc/dhcp-hosts.uci
-if uci -q get dhcp.@host[0].ip >/dev/null 2>&1; then
+# selective 下必须重建静态租约: 新版出厂 dhcp 无用户 host 段, 但可能有自带 host 段会误命中。
+if [ "$POLICY" != "selective" ] && uci -q get dhcp.@host[0].ip >/dev/null 2>&1; then
   echo "dhcp 静态租约已随真实配置还原($(uci show dhcp 2>/dev/null | grep -c 'dhcp.@host') 条), 跳过清空重建" >>$LOG
 else
 # 先清空可能残留的匿名 host 段, 再用具名段确定性重建(幂等)
@@ -246,7 +277,7 @@ fi
 # 必须在此显式删链(rm 在 overlay upper 重建 whiteout), 否则 watchcat/igmpproxy 等被默默启动
 # (2026-10-08 升级后实际复发过)。清单由 Mac 侧 collect_runtime 刷前生成, 用后即删。
 DISABLED_SVC=/etc/zzz-disabled-services
-if [ ! -s "$DISABLED_SVC" ]; then
+if [ "$POLICY" != "selective" ] && [ ! -s "$DISABLED_SVC" ]; then
   # 清单缺失/为空时, 直接从 rom vs live 重算(出厂有链、现网无链 = 用户禁用项), 避免清单未进 kit 时失效
   : > "$DISABLED_SVC"
   for _l in $(ls /rom/etc/rc.d 2>/dev/null); do
@@ -256,7 +287,11 @@ fi
 if [ -s "$DISABLED_SVC" ]; then
   while read -r _link; do
     [ -z "$_link" ] && continue
-    rm -f "/etc/rc.d/$_link" 2>/dev/null
+    # full 策略清单是 S/K 链接名; selective 策略是服务名(与编号解耦, 跨版本安全)
+    case "$_link" in
+      S[0-9][0-9]*|K[0-9][0-9]*) rm -f "/etc/rc.d/$_link" 2>/dev/null ;;
+      *) [ -x "/etc/init.d/$_link" ] && /etc/init.d/$_link disable >/dev/null 2>&1 ;;
+    esac
   done < "$DISABLED_SVC"
   echo "已按清单禁用服务(早期): $(tr '\n' ' ' < "$DISABLED_SVC" 2>/dev/null)" >>$LOG
   # 注意: 此处不删除清单文件。部分服务(如 watchcat)的包 postinst 会在本 uci-defaults 之后重建
@@ -311,7 +346,10 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
   # (实测 2026-10-28 升级后 watchcat 被重新启用, 且首启动禁用逻辑未可靠生效)。
   # 此处开机末段再强制一次: 优先用 kit 携带的清单, 缺失时直接从 rom vs live 重算, 确保与升级前一致。
   _ds=/etc/zzz-disabled-services
-  if [ ! -s "$_ds" ]; then
+  # rc.local 是独立进程, 拿不到 zzz-restore 的 POLICY 变量, 重新读标记文件
+  _policy=$(cat /etc/zzz-config-policy 2>/dev/null || echo full)
+  case "$_policy" in full|selective) ;; *) _policy=full ;; esac
+  if [ "$_policy" != "selective" ] && [ ! -s "$_ds" ]; then
     : > "$_ds"
     for _l in $(ls /rom/etc/rc.d 2>/dev/null); do
       [ -e "/etc/rc.d/$_l" ] || echo "$_l" >> "$_ds"
@@ -320,7 +358,11 @@ if [ ! -f /etc/zzz-postinstall-done ]; then
   if [ -s "$_ds" ]; then
     while read -r _link; do
       [ -z "$_link" ] && continue
-      rm -f "/etc/rc.d/$_link" 2>/dev/null
+      # full 策略清单是 S/K 链接名; selective 策略是服务名(与编号解耦, 跨版本安全)
+    case "$_link" in
+      S[0-9][0-9]*|K[0-9][0-9]*) rm -f "/etc/rc.d/$_link" 2>/dev/null ;;
+      *) [ -x "/etc/init.d/$_link" ] && /etc/init.d/$_link disable >/dev/null 2>&1 ;;
+    esac
     done < "$_ds"
     echo "rc.local 末段已强制禁用服务: $(tr '\n' ' ' < "$_ds" 2>/dev/null)" >>/tmp/zzz-postinstall.log
     rm -f "$_ds" 2>/dev/null
