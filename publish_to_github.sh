@@ -139,19 +139,28 @@ echo "=== 发布即校验: 拉回每个文件与本地逐字节(shasum)比对 ==
 #    (或空) → 误报「拉取失败(空)」。而这些文件其实**已成功推送**。
 #    解法: 三级回落 —— ① gh api(先清掉无效的 GITHUB_TOKEN) ② gh api(无 token)
 #          ③ 免鉴权 raw.githubusercontent.com 兜底(公开仓库完全够用)。
+# base64 内容合法性判断 (不用管道, 避免 printf 收到 SIGPIPE 报 Broken pipe)
+_is_b64() {
+  case "$1" in
+    *[!A-Za-z0-9+/=]*) return 1 ;;
+    "") return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 MISS=0
 for f in $FILES; do
   [ -f "$SRC/$f" ] || continue
   remote_sha=""
   # ① gh api (忽略无效的 GITHUB_TOKEN, 走 keyring)
   blob=$(env -u GITHUB_TOKEN gh api "repos/$REPO/contents/$f?ref=main" --jq '.content' 2>/dev/null)
-  if [ -n "$blob" ] && printf '%s' "$blob" | grep -qE '^[A-Za-z0-9+/=]+$'; then
+  if _is_b64 "$blob"; then
     remote_sha=$(printf '%s' "$blob" | tr -d '\n' | base64 -d 2>/dev/null | shasum -a 256 | awk '{print $1}')
   fi
   # ② gh api (用环境 token, 万一 keyring 失效但 env token 有效)
   if [ -z "$remote_sha" ]; then
     blob=$(gh api "repos/$REPO/contents/$f?ref=main" --jq '.content' 2>/dev/null)
-    if [ -n "$blob" ] && printf '%s' "$blob" | grep -qE '^[A-Za-z0-9+/=]+$'; then
+    if _is_b64 "$blob"; then
       remote_sha=$(printf '%s' "$blob" | tr -d '\n' | base64 -d 2>/dev/null | shasum -a 256 | awk '{print $1}')
     fi
   fi
