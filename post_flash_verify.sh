@@ -48,7 +48,9 @@ say "基线目录: ${BASELINE:-<未找到>}"
 # ---------------------------------------------------------------------------
 say ""; hr; say "---- ① U-Boot 版本串 ----"; hr
 # 串口才能看到 U-Boot banner；SSH 下用 mtd3 内容推断
-VER=$(RS "strings /dev/mtd3 2>/dev/null | grep -oE 'U-Boot [0-9]{4}\\.[0-9]{2}-[0-9]+-g[0-9a-f]+' | head -1")
+# 2026-11-17 修正: 官方镜像版本串是 "U-Boot XR1710G-2026-11-11-ga9a12de55890",
+# 在 "U-Boot " 与年份之间多了 "XR1710G-" 前缀, 原正则 [0-9]{4} 直接开头 → 永远匹配不到 → 假阴性。
+VER=$(RS "strings /dev/mtd3 2>/dev/null | grep -m1 'U-Boot XR1710G-[0-9]*'")
 if [ -n "$VER" ]; then
   if echo "$VER" | grep -q "XR1710G-2026-11-11\|a9a12de55890"; then
     ok "mtd3 内含官方 11-11 版本标识: $VER"
@@ -67,11 +69,21 @@ MACS=$(RS "for i in br-lan cpu lan1 lan2 lan3 lan4 wan; do
         done")
 if [ -n "$MACS" ]; then
   say "$MACS" | sed 's/^/    /'
-  DUP=$(say "$MACS" | cut -d= -f2 | sort | uniq -d)
-  if [ -z "$DUP" ]; then
-    ok "所有接口 MAC 互不相同 —— 重复问题已修复"
+  # 2026-11-17 修正: br-lan 是网桥, 其 MAC 按设计取自某个 LAN 成员口(本机为 lan2),
+  #   br-lan==lan2 是**正常**的, 不算重复故障。真正的 bug 是刷前 cpu/lan2/lan3/lan4
+  #   全部撞成 00:58:28:d7:63:60。判据改为: 只看物理口 cpu/lan2/lan3/lan4/wan,
+  #   并检查 cpu/lan3/lan4 是否已脱离刷前的公共地址。
+  PHYS=$(say "$MACS" | grep -E '^(cpu|lan2|lan3|lan4|wan)=')
+  DUP=$(say "$PHYS" | grep -v '^wan=' | cut -d= -f2 | sort | uniq -d)
+  PRE_DUP_MAC=$(say "$BASELINE/mac-baseline.txt" 2>/dev/null | grep -E '^(cpu|lan2|lan3|lan4)=' | cut -d= -f2 | sort | uniq -d | head -1)
+  STILL=$(say "$MACS" | grep -E '^(cpu|lan3|lan4)=' | cut -d= -f2 | grep -c "^${PRE_DUP_MAC:-__none__}$")
+  if [ -z "$DUP" ] && [ "${STILL:-0}" -eq 0 ]; then
+    ok "物理口 cpu/lan2/lan3/lan4 MAC 互不相同, 且已脱离刷前公共地址 —— 11-11 修复生效"
+    say "    (br-lan 与 lan2 同址是网桥正常行为, 不计入重复)"
+  elif [ -z "$DUP" ]; then
+    wn "物理口已互不相同, 但 cpu/lan3/lan4 仍沿用刷前公共 MAC —— fixup 可能未生效"
   else
-    no "仍有重复 MAC: $DUP —— 11-11 的 fixup_fdt_macs 未生效"
+    no "物理口仍有重复 MAC: $DUP —— 11-11 的 fixup_fdt_macs 未生效"
   fi
   if [ -n "$BASELINE" ] && [ -f "$BASELINE/mac-baseline.txt" ]; then
     say ""
@@ -97,9 +109,12 @@ UBI=$(RS "dmesg | grep -E 'ubi0: (attached|scanning)|fastmap' | head -8")
 if [ -n "$UBI" ]; then
   say "$UBI" | sed 's/^/    /'
   if echo "$UBI" | grep -qi "fastmap"; then
-    ok "UBI 已使用 fastmap（官方 11-01 才有此能力）—— 开机 attach 变快"
+    ok "UBI 已使用 fastmap（官方 11-11 才有此能力）—— 开机 attach 变快"
   else
-    wn "未见 fastmap —— 可能尚未触发（AUTOCONVERT 在首次 attach 时写入），属正常"
+    # 2026-11-17 修正: 1115 内核 cmdline 带 ubi.fm_autoconvert=1, 但内核未编
+    # CONFIG_MTD_UBI_FASTMAP 时该参数被忽略 → 不做 autoconvert, 走全盘扫描。
+    # 这不影响引导正确性, 且官方 11-11 U-Boot 已具备 fastmap 读取能力(顺序风险已消除)。
+    wn "未见 fastmap —— 内核未编 CONFIG_MTD_UBI_FASTMAP 时 cmdline 参数会被忽略, 走全盘扫描, 不影响引导"
   fi
 else
   wn "无法读取 dmesg"
@@ -119,9 +134,13 @@ say "    boot_ubi = ${BU:-<读取失败>}"
 if echo "$BU" | grep -q "ubi part system"; then
   ok "boot_ubi 指向 'system' —— 官方 chainloader 的内嵌 DTB 视图"
 elif echo "$BU" | grep -q "ubi part ubi"; then
-  wn "boot_ubi 仍指向 'ubi' —— 说明刷的还是旧 YYH2913 chainloader"
+  # 2026-11-17 修正: fw_printenv 读的是 UBI ubootenv 卷里的**持久化** env,
+  # 官方 rfb.c 只在内存里归一化(不 saveenv, 也不该 saveenv —— mtd1 是原厂共用 env)。
+  # 因此刷入官方 chainloader 后 fw_printenv 仍显示 'ubi' 是**预期行为**, 不能据此判旧 U-Boot。
+  ok "boot_ubi 仍指向 'ubi' —— 预期行为: 官方 rfb.c 只在内存归一化为 system, 不 saveenv"
+  say "    判定 U-Boot 新旧的权威判据是 ① 的版本串/mtd3 逐字节比对, 不是 fw_printenv"
 else
-  wn "boot_ubi 异常"
+  wn "boot_ubi 异常: ${BU:-<空>}"
 fi
 
 # ---------------------------------------------------------------------------
