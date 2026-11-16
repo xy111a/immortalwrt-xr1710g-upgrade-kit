@@ -134,12 +134,36 @@ else
 fi
 
 echo "=== 发布即校验: 拉回每个文件与本地逐字节(shasum)比对 ==="
+# ⚠️ 2026-11-16 修复: 环境里的 GITHUB_TOKEN 可能失效 → `gh api` 返回
+#    {"message":"Bad credentials"} 且**退出码仍为 0**, 于是 blob 变成一段错误 JSON
+#    (或空) → 误报「拉取失败(空)」。而这些文件其实**已成功推送**。
+#    解法: 三级回落 —— ① gh api(先清掉无效的 GITHUB_TOKEN) ② gh api(无 token)
+#          ③ 免鉴权 raw.githubusercontent.com 兜底(公开仓库完全够用)。
 MISS=0
 for f in $FILES; do
   [ -f "$SRC/$f" ] || continue
-  blob=$(gh api "repos/$REPO/contents/$f?ref=main" --jq '.content' 2>/dev/null)
-  if [ -z "$blob" ]; then echo "  ❌ 拉取失败(空): $f"; MISS=1; continue; fi
-  remote_sha=$(printf '%s' "$blob" | tr -d '\n' | base64 -d 2>/dev/null | shasum -a 256 | awk '{print $1}')
+  remote_sha=""
+  # ① gh api (忽略无效的 GITHUB_TOKEN, 走 keyring)
+  blob=$(env -u GITHUB_TOKEN gh api "repos/$REPO/contents/$f?ref=main" --jq '.content' 2>/dev/null)
+  if [ -n "$blob" ] && printf '%s' "$blob" | grep -qE '^[A-Za-z0-9+/=]+$'; then
+    remote_sha=$(printf '%s' "$blob" | tr -d '\n' | base64 -d 2>/dev/null | shasum -a 256 | awk '{print $1}')
+  fi
+  # ② gh api (用环境 token, 万一 keyring 失效但 env token 有效)
+  if [ -z "$remote_sha" ]; then
+    blob=$(gh api "repos/$REPO/contents/$f?ref=main" --jq '.content' 2>/dev/null)
+    if [ -n "$blob" ] && printf '%s' "$blob" | grep -qE '^[A-Za-z0-9+/=]+$'; then
+      remote_sha=$(printf '%s' "$blob" | tr -d '\n' | base64 -d 2>/dev/null | shasum -a 256 | awk '{print $1}')
+    fi
+  fi
+  # ③ 免鉴权 raw 兜底 (公开仓库; 绕开所有 token 问题)
+  if [ -z "$remote_sha" ]; then
+    tmpf=$(mktemp)
+    if curl -fsSL --max-time 30 "https://raw.githubusercontent.com/$REPO/main/$f" -o "$tmpf" 2>/dev/null && [ -s "$tmpf" ]; then
+      remote_sha=$(shasum -a 256 "$tmpf" | awk '{print $1}')
+    fi
+    rm -f "$tmpf"
+  fi
+  if [ -z "$remote_sha" ]; then echo "  ❌ 拉取失败(三种方式均未取到内容): $f"; MISS=1; continue; fi
   local_sha=$(shasum -a 256 "$SRC/$f" | awk '{print $1}')
   if [ "$local_sha" = "$remote_sha" ]; then
     echo "  ✅ 一致: $f ($local_sha)"
