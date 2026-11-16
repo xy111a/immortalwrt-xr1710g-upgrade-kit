@@ -173,7 +173,7 @@ for f in $FILES; do
   # ③b git 对象兜底: 直接读已推送的 HEAD 树里的 blob (权威, 不受 CDN 缓存影响)
   if [ -z "$remote_sha" ] || [ "$remote_sha" != "$(shasum -a 256 "$SRC/$f" | awk '{print $1}')" ]; then
     tmpf=$(mktemp)
-    if git -C "$SRC" show "HEAD:$f" > "$tmpf" 2>/dev/null && [ -s "$tmpf" ]; then
+    if git -C "$WORK" show "HEAD:$f" > "$tmpf" 2>/dev/null && [ -s "$tmpf" ]; then
       _gitsha=$(shasum -a 256 "$tmpf" | awk '{print $1}')
       _localsha=$(shasum -a 256 "$SRC/$f" | awk '{print $1}')
       # 只有当 git 对象与本地一致时, 才用它覆盖 (说明确实已推送成功, 只是 CDN 未同步)
