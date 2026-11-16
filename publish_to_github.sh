@@ -22,7 +22,7 @@ WORK="${GIT_WORK_DIR:-/tmp/kit_repo}"
 # skill/router-immortalwrt-upgrade/SKILL.md 是平台加载 skill 的入口副本(带 frontmatter),
 #   与根目录 SKILL.md 正文必须保持一致 —— 2026-10-30 发现它曾停留在旧版残桩(缺 OpenClash 排障章节),
 #   现同步为最新版, 避免两份文档打架导致平台加载到过期说明。
-FILES="SKILL.md upgrade_router.sh uboot_upgrade.sh ttl_rescue.sh post_flash_verify.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md skill/router-immortalwrt-upgrade/SKILL.md"
+FILES="SKILL.md upgrade_router.sh uboot_upgrade.sh ttl_rescue.sh post_flash_verify.sh ttl_purchase_guide.md build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md skill/router-immortalwrt-upgrade/SKILL.md"
 
 # 2026-11-04 修复: 原先 commit -m 硬编码了一段 R10 文案, 导致之后每次推送的提交信息
 # 都与实际改动不符(11-02 / 11-04 两次推送已受影响)。现在支持 -m/--msg 显式指定;
