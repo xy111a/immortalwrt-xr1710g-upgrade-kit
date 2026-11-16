@@ -15,6 +15,8 @@
 | `upgrade_router.sh` | Mac 侧编排器：上传固件+kit、路由器侧 sha 复核、触发干净刷、轮询重连、终验、强终验失败自动回退；刷前还有 T2 兜底实测核验与 kit 有效性核验 | ✅ 入库 |
 | `router_watch.sh` | 按需守护：查最新 release（按 `published_at` 排序）、72h 沉淀闸、版本性质与配置兼容性双闸、独立 sha256 校验、watch.log 轮转、触发 `upgrade_router.sh --auto`；`--no-download` 为零副作用巡检 | ✅ 入库 |
 | `check_openclash.sh` | Mac 侧 OpenClash 一键健康诊断：真实节点数 / 订阅自动更新三层闸门 / config_path 一致性 / 出口节点对关键站点可达性（识别被封节点） | ✅ 入库 |
+| `ttl_rescue.sh` | **TTL 救砖预案**：工具链体检 / 摆 TFTP 根目录 / 起 TFTP / 打印 6 条救砖路径（A: TTL 刷新 B: TTL 回滚 C: 恢复原厂 env D: SSH E: 二级提示符应急 F: HTTP Recovery） |
+| `post_flash_verify.sh` | **刷后 5 分钟验证**：版本串 / MAC 重复是否修复 / 恢复页 IP / fastmap / 引导配方归一化 |
 | `uboot_upgrade.sh` | **U-Boot(chainloader) 独立升级/回滚 + env 冗余对修复**（`--fix-env-redundancy`）：`--status` 只读探测 / `--plan` 选片校验 / `--prepare` 备份+下载校验 / `--flash` 真刷（写后整块回读比对）/ `--rollback` 回滚 / `--probe-recovery` 救砖探测。五道闸：官方选片纪律、备份 fail-closed、三层 sha256、双入口 magic、写后回读；**绝不触碰 uenv/ubootenv** | ✅ 入库 |
 | `zzz-restore-router` | 路由器首启动自举（`/etc/uci-defaults`）：写 LAN/WAN/三频/防火墙、恢复 root 密码与 WiFi key、注入 OpenClash 安装步骤 | ✅ 入库 |
 | `build_kit.sh` | 本地从源码组装 `kit.tar.gz`（默认安全写到 `dist/`，**拒绝覆盖真 kit**），写入无敏感信息的 `etc/kit-manifest` | ✅ 入库 |
@@ -183,6 +185,39 @@ br-lan = cpu = lan2 = lan3 = lan4 = 00:58:28:d7:63:60   ← 5 个接口同 MAC
   实测 1115 固件：`sysupgrade -T` EXIT=0，`fit_check_sign` 全 OK（kernel-1 6.18.60 /
   fdt-1 / rootfs-1 三项 crc32+sha1 全过）。
 
+### 🔧 救砖与刷后验证（2026-11-16 第七轮闭环）
+
+| 脚本 | 作用 | 用法 |
+|---|---|---|
+| `ttl_rescue.sh` | TTL 救砖预案：工具链体检 + 摆 TFTP 根目录 + 起 TFTP + 打印 6 条救砖路径 | `./ttl_rescue.sh --check` / `--stage` / `--tftp` / `--print-serial` / `--all` |
+| `post_flash_verify.sh` | 刷完 chainloader 后的 5 分钟验证：版本串 / MAC 重复修复 / 恢复页 IP / fastmap / 引导配方归一化 | `./post_flash_verify.sh [--router root@IP] [--baseline <备份目录>]` |
+
+**官方 TTL 教程全文已核对**（`docs/flashing-xr1710g.md`），要点：
+- 原厂 env（mtd1/uenv）布局 = `0x0000` 处 0x4000 字节 env 块（小端 CRC32）+ `0x4000-0x1FFFF` 全 0xFF + `0x20000` 后全 0x00 → **与我方实测完全吻合**，mtd1 备份可直接用于恢复
+- 原厂提示符 `ECNT>` 有 `flash` 命令；**二级 chainloader 没有 `flash`**（`strings` 实测命中 0），但有 `mtd` → 回滚 mtd3 只能走 `ECNT>` 或 SSH
+- 恢复页必须插 **10GbE 口（fport 4）**；固定 `192.168.0.1/24`，静态 `192.168.0.10/24` 更可靠
+- 恢复模式两个触发条件：`recovery_trigger=1`（一次性标志，在共享 uenv 里）或 **上电按住 reset 键**
+- 选 `uboot` 目标上传 = 写 mtd3 的 0x600000/1MiB，与 SSH `mtd write ... chainloader` 同一位置
+
+**`--probe-recovery` 已增强并实跑验证**：候选去重 + `RECOVERY_PROBE_IPS` 覆盖（可自检）+ 可达时给救援指引 + 不可达时给 4 条原因排查（没进恢复模式 / 网卡网段不对 / 网口不对 / 其实没变砖）。
+
+**残余（诚实列出）**：USB-TTL 硬件不在手边（`/dev` 下无 `tty.usb*` 节点），TTL 路径**命令单与工具已备好但未做实机演练**；`picocom/minicom` 未装（本机 `cu`/`screen` 够用）。
+
+### 🔬 A/B 顺序定案（2026-11-16 第六轮只读实证）
+
+| 步骤 | 内容 | 失败后果 | 可恢复性 |
+|---|---|---|---|
+| **B** | 刷官方 11-11 chainloader（写 mtd3，937538B） | 二级引导失效 → 设备变砖 | **仅** TTL / mtd3 备份写回（备份已双份异地，sha256 `a65bba65…`） |
+| **A** | 刷 1115 固件 wipe-config（只写 UBI `fit` 卷，不碰 mtd3） | 新固件起不来 | SSH 可达，旧 chainloader + 旧固件仍可启动 |
+
+**推荐 B → A**。新增决定性理由：**fastmap**。旧 YYH2913 chainloader 无 `ubi_attach_fastmap` 符号（strings 命中 0），官方 11-11 有全套 fastmap 支持（`CONFIG_MTD_UBI_FASTMAP=y` + `AUTOCONVERT=1`）；而 1115/1112/1016 固件内核 DTB 都带 `ubi.fm_autoconvert=1` —— 固件内核写 fastmap、U-Boot 读 fastmap，**先装读取器再写数据**比反过来更稳。
+
+**本轮推翻了上一轮的"布局不匹配"担忧**：官方 20261112 固件内核 DTB 的 partition@700000 label 是 `ubi`（不是 `system`），与 1115、1016 逐属性一致；label=`system` 的那份是**官方 chainloader 内嵌的控制 DTB**，不是固件 DTB。三份固件 UBI 卷集完全相同（`ubootenv`/`ubootenv2`/`fit`/`factory`），offset/size 完全相同 → **零 layout 风险**。
+
+官方 20261112 release note 原文绑定："修复1710 的lan cpu 的mac地址相同问题…（**需刷入** chainloader `2026-11-11-a9a12de55890` 实现）"；1115 未对 chainloader 提新要求，chainloader 仓库 11-11 后无新提交 → **1115 + 11-11 chainloader 组合合法**。
+
+**B 之前必须先落实**：① TTL 救砖预案（USB-TTL 3.3V + 官方 `docs/flashing-xr1710g.md` TFTP 流程）；② 恢复页 IP 从 `192.168.255.1` → `192.168.0.1` 的入口重学；③ mtd3 备份双份异地（已完成）；④ MAC 基线逐接口比对（现役 `br-lan/cpu/lan2/lan3/lan4` MAC 全同 `00:58:28:d7:63:60`，正是 11-11 修的那个）。
+
 ## 🔧 U-Boot(chainloader) 升级（独立窗口，与固件升级分离）
 
 固件升级刷 UBI/fit 卷，U-Boot 升级刷 mtd3(chainloader) + env 层，写入路径与失败模式完全不同 —— **两个独立窗口，先固件稳定再 U-Boot**。
@@ -204,8 +239,11 @@ bash uboot_upgrade.sh --probe-recovery             # 救砖时探测恢复页
 - 恢复页会变：当前 `192.168.255.1` → 11-11 chainloader `192.168.0.1`。状态档案在 `~/router-upgrade-logs/uboot-state.env`。
 - ✅ **env 冗余对已修复**（2026-11-16）：`ubootenv`(`ubi0_1`, dynamic) 原为全 0xFF 空卷，真实 env 只在 `ubootenv2`(`ubi0_2`, **static**)，属单点保险。已用 `uboot_upgrade.sh --fix-env-redundancy --ack-env-fix` 把 ubootenv2 的 env_t 复制成 ubootenv 的有效副本（`flags` 置 `0xFF` obsolete）→ U-Boot 仍选 ubootenv2（引导行为零变化），但 ubootenv2 损坏时可回落。ubootenv2 未被触碰。
 - ⚠️ **NAND 写入必须按擦除块对齐**（2026-11-16 实机故障，两轮实证）：官方镜像长 **937538** 字节，不是 `erasesize`(131072) 的整数倍 → NAND 字符设备拒绝非整擦除块写入，内核 **EINVAL**。**症状是 `WRITE_BEGIN` 后没有 `WRITE_DONE` 且 dd 静默失败**。解法：写前把镜像用 `0xFF` pad 到 1048576 字节，优先 `mtd write` + `mtd verify`；**绝不把写命令接管道后取 `$?`**（那是 `tail` 的退出码，会伪装成功）。详见 `SKILL.md`「NAND 写入路径踩坑」。
-- 📌 **MAC 可能变**：若 `mtd1` 的 uenv CRC 失效，二级 U-Boot 会回落官方默认 env（`xr1710g.env`），其 `ethaddr` 可能与原厂 MAC 不同。脚本已自动抓 MAC 基线到备份目录，刷后逐接口比对；变了可在二级 U-Boot 里 `setenv ethaddr '<原MAC>' + saveenv + reset` 改回。
-- 🧭 **必须连带刷一次固件**：官方 chainloader 按官方固件布局设计，只换二级引导而不换固件，可能停在 `Unknown command`（二级 U-Boot 无 `flash` 命令）。推荐顺序：先刷固件 → 修 env 冗余对 → 再刷 chainloader 并连带刷一次官方固件。
+- 📌 **MAC 说明（2026-11-16 第五轮更正）**：`mtd1` 的 env CRC **完全有效**（此前"CRC 失效"是长度用错），只是原厂 ECNT 格式（`crc(4)+data[16380]`，无 flags），与 U-Boot `env_t` 不同。二级 U-Boot 通过 `xr1710g_sync_runtime_ethaddrs()` 从 **factory 卷**同步 MAC，不依赖 `mtd1` 的 `ethaddr`（那是原厂占位符 `00:AA:BB:01:23:40`）→ **MAC 不会因 env 回落而变**。脚本已抓 MAC 基线，刷后逐接口比对即可。
+  - ⚠️ **绝对不要在 chainloader 里 `saveenv`**：`mtd1` 是原厂 env 分区，覆写会让原厂 U-Boot 找不到自己的启动配方（卡在 `ECNT>` 报 `Unknown command 'ubi'`）。脚本从不执行 `saveenv`。
+- 🧭 ~~必须连带刷一次固件~~ → **已更正（2026-11-16 第六轮实证）**：官方 env 走 `ubi read ${loadaddr} fit` + `bootm ${loadaddr}#config-1`，按 **UBI 卷名 `fit`** 定位，不依赖 `flash` 命令、不依赖分区 label；本机 fit 卷已实证含 `/configurations/config-1`。⇒ **刷 chainloader 可独立完成**。
+  - 官方 20261112 release note 的「修复 lan cpu mac 地址相同（需刷入 11-11 chainloader 实现）」正是 **U-Boot 侧** `fixup_fdt_macs` 做的 —— 刷 chainloader 即修复，**不需要为此刷固件**。
+  - env 冗余对已修（2026-11-16），固件升级与 chainloader 升级完全解耦。
 
 ## 当前上游状态与升级建议（2026-11-15 复核，会过期）
 
@@ -214,7 +252,7 @@ bash uboot_upgrade.sh --probe-recovery             # 救砖时探测恢复页
 - **NPU 修复溯源**：最新公开提交仍是 11-13 `9a70b257`（README），其前是 11-11 晚那批 NPU/MT7996 根因修复；release 基线逻辑上包含它们，但镜像内嵌 commit `5e152df9` 在公开 master **查不到**，作者从未明确声明「修了 #82」。`#82` 报告者 11-15 回复「升级以后需要双清，就好了」—— 用户经验，与「配置不兼容」呼应，非作者确认。
 - issue 动态：`#95`（1112 AP 模式 Qualcomm 重试风暴）作者 11-15 回复「刷入最新版测试」+ 复测方法，**未确认**已修；`#96`（XG2010G NPU 数据通路卡死）作者求补全日志；其余 open：`#94`（5G/6G VIF flowtable）、`#92`（B17 PCIe）、`#62`（PON 校准）。1029 的 `#81` bridger 断流仍靠停服务规避。
 - **72h 沉淀闸**：到 **11-18 14:51（北京）** 才过。叠加 48h 异常复位观察窗、镜像 commit 不可溯源、配置不兼容，**当前不刷机**。
-- **U-Boot**：当前 `2026.07-00760-gab7fd65100f1`（恢复页 `192.168.255.1`）；11-11 的 `a9a12de55890` 同源 chainloader、同 mtd3/0x600000/1MiB 槽位，风险中等可控（下载仅 119 次、0 open issue）。**`ubi` vs `system` 的兼容疑点已于 2026-11-16 闭环**（Recovery 只按 UBI 卷名 `fit` 写 + 官方文档 §7.2 明写引导按固定偏移读、不查分区表；官方 DTB 与本机 `/proc/mtd` 逐项吻合）。**成功��只刷固件 55% / 只刷 U-Boot 80% / U-Boot+连带固件 62%**，推荐三段式：先只刷固件拿运行期实证 → 修 env 冗余对 → 再做 U-Boot+固件配套升级，刷前备份 mtd3 + mtd1/uenv 并抓 MAC 基线。
+- **U-Boot**：当前 `2026.07-00760-gab7fd65100f1`（恢复页 `192.168.255.1`）；11-11 的 `a9a12de55890` 同源 chainloader、同 mtd3/0x600000/1MiB 槽位。**`ubi` vs `system` 的兼容疑点已于 2026-11-16 彻底闭环**（第六轮实证：官方 1112 固件内核 DTB 的 partition label 也是 `ubi`，与 1115/1016 逐属性一致；label=`system` 的那份是 chainloader 内嵌控制 DTB，非固件 DTB）。**成功率（第六轮上修）：只刷 U-Boot 88% / 只刷固件 70% / 两者都刷 72%**，推荐顺序：**先刷官方 11-11 chainloader**（fastmap 硬约束：固件内核写 fastmap，旧 chainloader 无 `ubi_attach_fastmap` 符号）→ 立即验证版本串/MAC/恢复页 IP `192.168.0.1` → 需要 NPU 改进再单独刷 1115 固件。刷前必备：mtd3 + mtd1/uenv 备份（已双份异地）+ MAC 基线 + TTL 串口就位。
 - **固件建议（触发条件）**：过 72h → 复核新 issue 与作者是否确认 #82 → **先按新固件重建 kit（`--config-policy selective`）** → 人工核对 `config-restore-todo-*.md` 重配清单 → `upgrade_router.sh --ack-config-reset` 全清刷（**不走 LuCI OTA**）。旧的「全量配置保真」路径对 1115 已不适用，详见下方「wipe-config 版本适配」。
 
 ### ⚠️ 真刷前必须先重建 kit（2026-11-13 实测）

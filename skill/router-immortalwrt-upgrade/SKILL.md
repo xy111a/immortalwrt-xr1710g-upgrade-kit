@@ -467,6 +467,194 @@ pad 到 erasesize 整数倍 → 上传后 sha256 校验 → `mtd write` 逐块�
 原 `--rollback` 用「先整分区 erase → `mtd write`」，与 `--flash` 不一致且**无回读比对**（失败会被当成成功）。
 已统一为：**pad 到 erasesize 整数倍 → 上传后 sha256 校验 → `mtd write` 逐块擦写（失败才整分区擦除重试一次）→ 整块回读 sha256 与备份比对，不符则明确报错**。
 
+## 🔬 第六轮实证：官方 1112 固件 layout 确认 + A/B 顺序定案（2026-11-16 14:30，只读）
+
+> 本轮全程**只读**，未对任何 MTD/UBI 分区写入。资产：`/tmp/xr1710g-analysis/`。
+
+### A. 关键更正：官方 1112 固件的 UBI 分区 label 也是 `ubi`（推翻上一轮"命名不一致"担忧）
+
+上一轮把 `off11.dtb`（label=`system`）误当作"官方 11-11 配套固件的内核 DTB"，据此推断"1115 固件（label=`ubi`）与官方 chainloader 布局不匹配"。
+**该推断有误**：`off11.dtb` 实际是**官方 chainloader 镜像内嵌的控制 DTB**（`ctrl.dtb`，从 slot.bin 偏移 920252 提取），不是固件内核 DTB。
+
+本轮下载并解析官方 20261112 release 的真实固件 itb：
+
+| 固件 | 文件 | sha256 | 内核 DTB 中 partition@700000 label |
+|---|---|---|---|
+| 官方 20261112（`20261111-a6d84923`） | `fw1112.itb` 96977206B | `05b0a65299b6603e…39fa80e` | **`ubi`** ✅ |
+| 官方 20261115（`5e152df9`） | 已缓存 85561654B | — | **`ubi`** ✅ |
+| 本机现役 1016（fit 卷内 fdt-1） | `f1016.dtb` | — | **`ubi`** ✅ |
+
+三份固件的 `partition@700000` **offset/size 完全一致**（0x700000 / 460324864），且卷集完全一致：
+`ubootenv` + `ubootenv2`（均 `u-boot,env-redundant-bool`）+ `fit` + `factory`（`mac-base` @0x5000 WAN / @0x6000 LAN），
+`fm_autoconvert=1` 三者都有。
+
+**⇒ 结论：官方 11-11 chainloader 与 1115/1112/1016 固件的 UBI 布局完全兼容，无任何命名或卷集不匹配风险。此前的"待验证兼容点"由"高危"降级为"已闭环"。**
+
+### B. 1112 vs 1115 内核 DTB 全量差异（71 项值差 + 8 项新增，均与 UBI 无关）
+
+- 仅 1115 有：`/reserved-memory/dma-pool`（NPU DMA 池）、`/soc/phy@1fae0000 airoha,pcie-analog-init`
+- 71 项差异全部是 `phandle` 数值顺延（LED/eth/mmc/nand/npu/pcie）与 `npu memory-region-names`（`binary`→`firmware`、多 `dma`）
+- UBI / partition / volume / nvmem 相关属性 **0 处差异**
+
+⇒ 从 U-Boot 与引导视角，**1115 与 1112 的内核 DTB 等价**，选 1115 无 layout 风险。
+
+### C. 官方 20261112 release note 明确绑定关系（原文）
+
+> 2.1710开放ssh刷写引导功能，后期引导uboot也可以OTA。
+> 3.修复1710 的lan cpu 的mac地址相同问题，后续不再需要手改
+> （**需刷入** `chainloader/releases/tag/2026-11-11-a9a12de55890` 实现）
+
+⇒ 官方把 **1112 固件 + 11-11 chainloader** 作为一套发布。1115 是 11-15 的后续固件（release note 只提"后端大改动，不得保留配置"），**未对 chainloader 提出新要求**；chainloader 仓库 11-11 之后无新提交（`git log` 已确认，最新仍为 `2026-11-11-a9a12de55890`）。⇒ 1115 + 11-11 chainloader 组合合法。
+
+### D. 官方 `xr1710g.env`（内置默认 env，全文）
+
+```
+loadaddr=0x81800000
+bootconf=config-1
+bootargs=console=ttyS0,115200 earlycon ubi.block=0,fit root=/dev/fit0 rootwait rdinit=/sbin/init
+boot_ubi=ubi part system && run boot_production
+boot_production=run ubi_read_production && bootm ${loadaddr}#${bootconf}
+bootcmd=run boot_ubi || http_recovery
+ubi_read_production=ubi read ${loadaddr} fit
+recovery_addr=0x81800000
+recovery_mtd=fit
+recovery_ubi_part=system
+recovery_dev_uboot=spi-nand0
+uboot_ofs=0x600000
+recovery_size_uboot=0x100000
+```
+
+关键点：
+- `bootconf=config-1` → 需 fit 卷内 FIT 有 `/configurations/config-1`。**本机 fit 卷已实证存在** ✅
+- `ubi_read_production=ubi read ${loadaddr} fit` → 读的是 **UBI 卷名 `fit`**（不是分区名）→ 与 partition label 无关 ✅
+- `bootargs` 与本机 `/proc/cmdline` 逐字节一致（仅内核自动追加 `ubi.fm_autoconvert=1`）✅
+- `ubi part system` 在二级 U-Boot 内用**自己内嵌 DTB**（label=`system`）解析 → 成立 ✅
+
+### E. 🔥 决定 A/B 顺序的关键差异：**fastmap**
+
+| | 旧 YYH2913 chainloader（mtd3 现役） | 官方 11-11 chainloader |
+|---|---|---|
+| `ubi_attach_fastmap` 等符号 | **strings 命中 0** | 全有（`ubi_attach_fastmap` / `ubi_update_fastmap` / `ubi_write_fastmap` / `fastmap-wl.c`） |
+| `CONFIG_MTD_UBI_FASTMAP` | 无 | `=y` + `AUTOCONVERT=1` |
+| 引导时 UBI attach | 全盘扫 ≈3512 PEB | 读 fastmap（秒级） |
+
+**本机当前 UBI 状态（只读实证）**：`dmesg` 显示 `ubi0: attached mtd4`，`internal volumes: 1`，**无 fastmap**；五卷 `fit`/`ubootenv`/`ubootenv2`/`factory`/`rootfs_data`，0 坏块，`available PEBs: 0`（已满）。
+
+**⇒ 由此得出顺序的硬约束**：
+- 刷完 1115/1112 固件后，**内核会因 `ubi.fm_autoconvert=1` 把 fastmap 写进 UBI**（内核侧 `CONFIG_MTD_UBI_FASTMAP_AUTOCONVERT` 生效）。
+- 若此时二级 U-Boot 还是**旧 YYH2913（无 fastmap 支持）**，它 attach UBI 时会走全盘扫描路径，遇到已被内核写下的 fastmap 卷有可能行为不一致（旧 U-Boot 忽略 fastmap，通常安全，但官方显式为 fastmap 做了适配）。
+- 反向：**先刷官方 chainloader（带 fastmap 支持）**，再刷固件 —— 官方 U-Boot 能正确处理 fastmap 卷，且官方 rfb.c 有 `xr1710g_sync_factory_part()` 主动同步 factory。
+
+### F. A/B 顺序的最终定案
+
+**推荐顺序：B（刷官方 11-11 chainloader）→ A（刷 1115 固件 wipe-config）**，理由按权重排序：
+
+1. **fastmap 归因顺序**（新增，最硬）：fastmap 由固件内核写入、由 U-Boot 读取。先固件后 U-Boot = 先写入再换读取器；先 U-Boot 后固件 = 先装好读取器再写。**后者在原理上更稳**。
+2. **B 是唯一不可 SSH 挽救的环节**：mtd3 被覆盖后若新 chainloader 不工作，只能靠 TTL 或 mtd3 备份写回。先做 B = 把最大风险提前暴露在还有完整准备的时间窗内；B 成功后立即可验证（版本串 / MAC / 恢复页 IP），失败则可立刻 `--rollback` 写回旧 mtd3（备份已双份，见下）。
+3. **A 的失败可 SSH 自愈**：sysupgrade 只写 UBI `fit` 卷，不碰 mtd3，旧 chainloader + 旧固件仍可启动，SSH 可用。
+4. **A→B 的额外成本**：1115 是"后端大改动、不得保留配置"，会重装约 49 个第三方包、恢复约 50 项配置（备份在 `~/router-upgrade-logs/pre-wipe-config/20261116-133420/`）。若在 B 之后做 A，A 失败时**新 U-Boot 仍在位**，SSH 可达性不受影响；若在 A 之后做 B，B 失败时设备已被换过固件，回退路径多一层。
+
+**若以"任何一步失败都不至于变砖"为第一优先**：仍推荐 B→A，因为 B 的回滚手段（mtd3 备份写回 + TTL）比 A 的失败后果（旧固件继续跑）更完备，且 B 前已完成双份备份。
+
+### G. 本轮只读准备完成清单
+
+| 项 | 状态 |
+|---|---|
+| 官方 1112 固件下载 + sha256 + 内核 DTB 解析 | ✅ `05b0a65299b6603eefacf5f14c07de415bbaebfa184bdc4494b598f9439fa80e` |
+| 1112 / 1115 / 1016 三方内核 DTB 逐属性比对 | ✅ UBI 相关 0 差异 |
+| 官方 1112 release note 绑定关系确认 | ✅ 明确指向 11-11 chainloader |
+| 官方 `xr1710g.env` 全文取回 + 与设备现状交叉核对 | ✅ bootconf / bootargs / fit 卷名 / uboot_ofs 全部对齐 |
+| 官方 `xr1710g_rfb.c` 的 `xr1710g_select_ubi()` 语义复核 | ✅ 二级用自己的 DTB 解析 `system` |
+| fastmap 支持差异 strings 实测 | ✅ 旧 0 命中 / 官方全有 |
+| 设备 UBI fastmap 现状、坏块、PEB 计数 | ✅ 无 fastmap / 0 坏块 / available PEBs=0 |
+| 设备 `/proc/cmdline` vs 官方 bootargs 交叉核对 | ✅ 逐字节一致 |
+| mtd3 备份双份异地副本 | ✅ `~/router-upgrade-logs/uboot-backups/MIRROR-20261116/` + `/tmp/xr1710g-mirror-20261116/`，三份 sha256 一致 `a65bba65…` |
+| fit 卷 48.5MB 备份双份异地副本 | ✅ `~/router-upgrade-logs/fit-backup/MIRROR-20261116/`，sha256 `b9a550eb…` 一致 |
+
+### H. 仍未闭环的项（进入真实写入前必须处理）
+
+- ❌ **TTL 救砖预案未落地**：需要 USB-TTL 线 + 3.3V 电平 + 一台能跑 `minicom`/`picocom` 的机器，以及官方 `docs/flashing-xr1710g.md` 的 TFTP 流程。这是 B 步骤的**唯一无 SSH 退路**，必须先落实。
+- ❌ **恢复页 IP 变更未实地演练**：刷入 11-11 后恢复页由 `192.168.255.1` → `192.168.0.1`（官方 HTTP Recovery）。刷前必须重学入口与 IP，否则"兜底在位但连不上"。
+- ❌ **MAC 基线比对未执行**：`mac-baseline.txt` 已抓，但刷后需逐接口（`br-lan`/`cpu`/`lan2`/`lan3`/`lan4`）核对。已知问题：现役 `br-lan/cpu/lan2/lan3/lan4` MAC **全为 `00:58:28:d7:63:60`**（重复），官方 11-11 的 `give the XR1710G CPU port its own MAC offset` 正是修这个；factory 卷 WAN=`00:58:28:d7:63:5f` / LAN=`00:58:28:d7:63:60`（与基线一致，可还原）。
+- ❌ **`--probe-recovery` 未演练**：需在真实故障态下验证脚本能扫到 `192.168.0.1`。
+
+---
+
+## 🔧 第七轮：三项链路闭环（2026-11-16 15:00，全部只读 + 离线演练）
+
+> 本轮把原先挂着的三项「进入真实写入前必须处理」全部闭环，产出 2 个新脚本 + 1 份机制实证。
+
+### A. 官方 TTL 文档全文已获取（`docs/flashing-xr1710g.md`，22111 B）
+
+此前只读了 `docs/ssh-flash-chainloader.md`。本轮取到 TTL 教程全文，纠正/新增以下**此前完全缺失**的关键事实：
+
+| 事实 | 内容 | 对本机的意义 |
+|---|---|---|
+| **原厂 env 布局** | `uenv` 2 MiB = `0x0000` 处 0x4000 字节 U-Boot env 块（**小端** u32 CRC32 + NUL 分隔）+ `0x4000-0x1FFFF` 全 0xFF + `0x20000` 后全 0x00 | 与我方对 mtd1 的实测**完全吻合**（非 0xFF 区间 = `[(0,16383),(131072,2097151)]`）→ 交叉验证成立，mtd1 备份可直接用于恢复 |
+| **原厂 env 关键变量** | `bootcmd=flash imgread 2048;bootm`、`loadaddr=0x81800000`、`bootdelay=4`、`fdt_high=0xac000000`、`ubi.mtd=system`、`serverip=192.168.0.205`、`ipaddr=192.168.0.1` | 本机 mtd1 的 `bootcmd` 是 `flash read 0x600000 0x100000 $loadaddr; bootm` → 说明**已被改过**（原厂是 imgread 2048），这正是官方 FAQ 描述的"TTL 教程写入的配方" |
+| **原厂 env 恢复法** | `ECNT>` 下 `flash erase 0x200000 0x200000` + `flash write`（2 MiB 写不进就分 4×0x80000）；或二级下 `mtd erase uenv` + `mtd write uenv 0x90000000 0 0x200000` | 两条路径都有了 |
+| **chainloader 提示符的 `mtd` 写能力** | 二级 U-Boot **没有** `flash` 命令（我方 `strings` 实测 `"flash write"` 命中 **0**），但**有** `mtd` 命令（官方 FAQ §8.1 就在用 `mtd write uenv`） | 二级下能写 `uenv` 但不能写 `chainloader` 自身（无 flash）→ **回滚 mtd3 必须走原厂 `ECNT>` 或 SSH** |
+| **TFTP 客户端** | 二级 U-Boot 有 `tftpboot`（`net/lwip/tftp.c` 符号在），但 `tftpd` 客户端只有 `tftpboot`、服务端未编入（`TFTP server not enabled` 字样） | 官方 TTL 教程的 TFTP 是**原厂 `ECNT>`** 的能力，二级也能用 tftpboot |
+| **恢复页网口要求** | 必须插 **10GbE 口（fport 4）**，走 GDM4/XSI；1G/2.5G 口是 fport 1，走交换机常规路径 —— 两边都试 | 官方 FAQ 明确，是"进不去恢复页"的常见原因 |
+| **DHCP 兜底** | 恢复页固定 `192.168.0.1/24`，DHCP 池 `192.168.0.2`–`192.168.0.50`；拿不到 IP 就改静态 `192.168.0.10/24` | 静态更可靠 |
+| **缩短一级读取长度** | 原厂 `bootcmd` 若为 `flash read 0x602100 0x4000000 $loadaddr; bootm`，可把长度 `0x4000000`→`0x100000`（**偏移不动**），显著缩短启动时间 | 可选优化，本机 bootcmd 已是 0x100000，无需改 |
+
+### B. 恢复模式触发机制（源码级，此前完全未知）
+
+`xr1710g_rfb.c` 的 `board_late_init()` 揭示**两个独立触发条件**：
+
+1. **`recovery_trigger=1` 一次性标志**（`xr1710g_uenv_consume_recovery_trigger()`）
+   - 存在**共享**的 `uenv`(mtd1) 里，值必须精确是 `recovery_trigger=1`（`len == sizeof(name)` 严格比较）。
+   - 用**裸读-改-写**移除该条目，**绝不用 `env_save()`**（源码注释明写：否则会替换原厂 env 让原厂引导失效）。
+   - 写回后重启即恢复正常引导 → **一次性**。
+   - ⚠️ 本机 mtd1 实测**不含**该条目（`strings /dev/mtd1` 只有 `bootcmd=` 与 `one=`）→ 官方 chainloader 启动时不会因它进恢复模式。
+2. **reset 按钮按住**（`xr1710g_recovery_button_pressed()`，读 `recovery-gpios`）
+   - 串口打印 `Recovery button detected, starting web recovery...`
+
+判定逻辑：`if (uenv_triggered) → 消费标志进恢复`；`else if (!recovery_button_pressed()) → return 0`（正常引导）；`else → 进恢复`。
+
+**恢复页 IP 源码确认**（`httpd_rec.c`）：
+```
+RECOVERY_STATIC_IPADDR      "192.168.0.1"   ← 官方 11-11 固定 IP
+RECOVERY_DHCP_CLIENT_IPADDR "192.168.0.2"
+RECOVERY_DHCP_POOL_END_IPADDR "192.168.0.50"
+RECOVERY_DHCP_BROADCAST_IPADDR "192.168.0.255"
+```
+镜像内 `strings` 实测确认这 4 个 IP 全部硬编码在 binary 中（`192.168.0.1` / `.0.2` / `.0.50` / `.0.255`）。HTTP Recovery 页在 DTB 里也内嵌了 `192.168.0.1` 的文案。
+
+**上传目标与写入路径**（`httpd_rec.c`）：
+| 目标 | env 名 | 默认值 | 偏移 |
+|---|---|---|---|
+| `firmware` | `recovery_mtd` | `fit`（**UBI 卷名**） | `recovery_ofs` |
+| `uboot` | `recovery_mtd_uboot` | `uboot`（**MTD 分区名**） | `uboot_ofs` = 0x600000 |
+
+官方 `xr1710g.env` 里 `recovery_mtd=fit`、`recovery_ubi_part=system`、`uboot_ofs=0x600000`、`recovery_size_uboot=0x100000` → 选 `uboot` 目标上传即写 mtd3 的 0x600000/1MiB，**与 SSH `mtd write ... chainloader` 是同一位置**。
+
+### C. 三项闭环的产出
+
+| 项 | 产出 | 验证状态 |
+|---|---|---|
+| ① TTL 救砖预案 | **新脚本 `ttl_rescue.sh`**：`--check`（工具链体检）/`--stage`（摆 TFTP 根目录）/`--tftp`（起服务）/`--print-serial`（打印 6 条救砖路径 A–F） | ✅ 已跑 `--check`，7 项检查全过（除缺 USB-TTL 硬件与 picocom/minicom） |
+| ② 恢复页入口重学 | 源码级确认 IP/网口/触发机制；**新脚本 `post_flash_verify.sh`** 做刷后 5 分钟核对 | ✅ 已在**未刷的真机**上实跑，脚本正确识别出"未刷"状态（MAC 重复、boot_ubi→ubi） |
+| ③ `--probe-recovery` 演练 | 增强：去重、候选覆盖 `RECOVERY_PROBE_IPS`、可达时给救援指引、不可达时给 4 条原因排查 | ✅ **正向/负向/混合三分支全部实跑验证**（本地模拟恢复页 HTTP 200 → 判可达；真机两个真 IP HTTP 000 → 判不可达） |
+
+### D. `post_flash_verify.sh` 的 5 项判据（刷后逐项打勾）
+
+1. **U-Boot 版本串** → 串口 banner 应为 `U-Boot XR1710G-2026-11-11-ga9a12de55890`
+2. **MAC 重复是否修复** → 刷前实测 `br-lan/cpu/lan2/lan3/lan4` 全为 `00:58:28:d7:63:60`（重复），`wan=00:58:28:d7:63:5f`；刷后应各不相同（这正是 11-11 的 `give the XR1710G CPU port its own MAC offset`）
+3. **恢复页 IP** → `192.168.0.1`（新）vs `192.168.255.1`（旧）
+4. **UBI fastmap** → 应开始出现 fastmap 字样（官方 11-11 独有）
+5. **引导配方归一化** → `boot_ubi` 应从 `ubi part ubi` 变为 `ubi part system`（官方 chainloader 内嵌 DTB 视图），`bootcmd` 不含 `flash `
+
+### E. 仍需人工/硬件的残余（诚实列出）
+
+- ❌ **USB-TTL 硬件不在手边**：本机 `/dev` 下无任何 `tty.usb*` 串口节点，`system_profiler` 也未检出 CH34/FTDI/CP210 芯片。TTL 救砖路径**已备好命令单与工具，但未做实机演练**。
+- ❌ **picocom/minicom 未安装**：本机只有 macOS 自带 `cu` 与 `screen`（功能足够：115200 8N1 双向交互）。可选 `brew install picocom` 提升手感。
+- ❌ **未做断电演练**：真实断电/拔线场景无法在只读约束下验证。
+- ⚠️ `tftpd` 需 root 绑定 69 端口 → `--tftp` 会触发 sudo 密码提示。
+
+---
+
 ## 🧭 U-Boot / chainloader 评估基线（2026-11-12 复核，取代早期误判）
 
 **先记住四条曾经判错、不要再重复**：
@@ -485,18 +673,20 @@ pad 到 erasesize 整数倍 → 上传后 sha256 校验 → `mtd write` 逐块�
 - 11-11 release 只挂 1 个 asset（xr1710g 937538 B），发布说明却列了 2 个文件并给出 xg2010g 的 SHA256 —— 产物与说明不符，XG2010G 镜像缺失。
 - 两条并行线：上游 `YYH2913/http-uboot` 11-02 仍在更新（分区备份下载、RTL8261 延迟初始化），恢复页仍 `192.168.255.1`。评估「新版本 U-Boot」时别只看 naoki66 新仓库。
 
-**结论（2026-11-16 修订，取代 2026-11-12 旧结论）**：不再「一概不单独刷」，改为**按路径量化 + 分步执行**（数值来自多维度离线实证，见下节）：
+**结论（2026-11-16 第六轮修订，取代 2026-11-12 旧结论）**：不再「一概不单独刷」，改为**按路径量化 + 分步执行**（数值来自多维度离线实证，见下节）：
 
 | 路径 | 成功率 | 说明 |
 |---|---|---|
-| A 只刷固件（不碰 U-Boot） | **55%** | 链路最短，但本机 mtd3 是 YYH2913 非原版 chainloader，与新固件的 FDT fixup/MAC offset 组合未验证 |
-| B 只刷 U-Boot（不换固件） | **80%** | 引导链逐环已实证吻合；但二级 U-Boot 无 `flash` 命令，若固件不匹配可能停在 `Unknown command` |
-| C U-Boot + 连带刷一次固件 | **62%** | 变量最多，但**这是唯一自洽的组合**（官方 chainloader 按官方固件布局设计），且 A/B 的失败模式在 C 里被"一起换"规避 |
+| B 只刷 U-Boot（不换固件） | **88%** ↑ | **2026-11-16 第六轮实证上修**。引导链逐环实证吻合：官方 env 走 `ubi read ${loadaddr} fit` + `bootm ${loadaddr}#config-1`（**按 UBI 卷名，不靠 `flash` 命令、不靠分区 label**），本机 fit 卷已实证含 `/configurations/config-1`；且 1112/1115/1016 三方内核 DTB 的 UBI 属性 0 差异 → **layout 零风险**。原"无 flash 命令可能停在 Unknown command"是**误判，已撤销** |
+| A 只刷固件（不碰 U-Boot） | **70%** ↑ | 链路最短，失败可 SSH 自愈（只写 UBI `fit` 卷）。原 55% 低估 —— 因 layout 风险已消除。**但 1115 明令配置不兼容，需重装约 49 包 + 恢复约 50 项配置** |
+| C U-Boot + 连带刷固件 | **72%** ↑ | 变量最多，收益也最小（MAC 问题由 U-Boot 侧 `fixup_fdt_macs` 解决，不需要为它刷固件）。仅当确实需要 1115 的 NPU/桥接改进时才做 |
 
-**推荐执行顺序（三段式，每段之间留出验证窗口）**：
-1. **先只刷固件**（`upgrade_router.sh`，A 路径）→ 拿到运行期实证（能否起来、MAC 是否变、env 是否被覆写）。这一步不碰引导链，失败可原地恢复。
-2. **修 env 冗余对**（`ubi0_1` 目前全空，真实 env 只在 `ubi0_2`）→ 用 `mkenvimage` 重建两份一致 env，把"只有一份保险"变成两份。
-3. **再刷 U-Boot + 连带刷一次官方固件**（C 路径）→ 刷前必做：备份 mtd3 + mtd1/uenv、抓 MAC 基线、确认新恢复页 `192.168.0.1`、备 TTL 串口。
+**推荐执行顺序（2026-11-16 第六轮修订，取代下方旧三段式）**：
+1. **先刷 U-Boot（B 路径）** → 立即验证：版本串应变为 `U-Boot XR1710G-2026-11-11-ga9a12de55890`、CPU 口 MAC 应不再与 lan2/3/4 重复、恢复页应为 `192.168.0.1`。失败则 `--rollback` 写回 mtd3 备份（已双份异地）。
+2. **再刷 1115 固件（A 路径，如需 NPU/桥接改进）** → 只写 UBI `fit` 卷，失败 SSH 可达、旧 chainloader 仍可启动。
+3. env 冗余对**已于 2026-11-16 修复完成**，无需再做。
+
+**为何不先刷固件（fastmap 硬约束）**：1115/1112/1016 内核 DTB 均带 `ubi.fm_autoconvert=1`，固件内核会向 UBI **写入 fastmap**；而旧 YYH2913 chainloader 的 `ubi_attach_fastmap` 符号 **strings 命中 0**（无 fastmap 支持），官方 11-11 才有全套（`CONFIG_MTD_UBI_FASTMAP=y` + `AUTOCONVERT=1`）。⇒ **先装 fastmap 读取器（B），再让内核写 fastmap（A）**，比反过来更稳。
 
 **刷前必备**：备份 mtd3 + mtd1/uenv、确认新恢复页 `192.168.0.1`、MAC 基线快照、TTL 串口就位（配方：`ECNT>` 下 `setenv bootcmd 'flash read 0x600000 0x100000 $loadaddr; bootm' + saveenv + reset`）。
 

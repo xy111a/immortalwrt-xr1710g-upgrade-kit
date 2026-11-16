@@ -832,19 +832,70 @@ REMOTE
   say "  ✅ 已写回旧 chainloader(未重启)"
 }
 
+# Recovery 页探测（救砖时用）
+#   候选 IP 来源（优先级从高到低）：
+#     1) UBOOT_STATE_RECOVERY_IP   —— 状态档案（刷 U-Boot 后需更新）
+#     2) 内置 192.168.0.1         —— 官方 naoki66 chainloader 的 HTTP Recovery 固定 IP
+#                                     (源码 httpd_rec.c: RECOVERY_STATIC_IPADDR)
+#     3) 内置 192.168.255.1       —— 现役 YYH2913 chainloader 的恢复页 IP
+#   判据：curl 拿到任意 HTTP 状态码即视为可达（恢复页返回 200/302/400 都算活着）。
+#   负向判定：全部无响应 → 设备可能没进恢复模式，而不是"设备正常"。
 probe_recovery(){
   say ""
   hr; say "---- Recovery 页探测 ----"; hr
-  local cands=(192.168.255.1 192.168.0.1) ip code found=""
+  local cands=() ip code found="" seen=""
   if [ -f "$STATE_FILE" ]; then
     local s; s=$(grep -E '^UBOOT_STATE_RECOVERY_IP=' "$STATE_FILE" 2>/dev/null | cut -d= -f2-)
-    [ -n "$s" ] && cands=("$s" "${cands[@]}")
+    [ -n "$s" ] && cands+=("$s")
   fi
+  cands+=(192.168.0.1 192.168.255.1)
+  # 允许外部覆盖候选（用于自检/自定义网段）：RECOVERY_PROBE_IPS="ip1 ip2"
+  if [ -n "${RECOVERY_PROBE_IPS:-}" ]; then
+    say "  (候选被 RECOVERY_PROBE_IPS 覆盖: $RECOVERY_PROBE_IPS)"
+    cands=($RECOVERY_PROBE_IPS)
+  fi
+  # 去重
   for ip in "${cands[@]}"; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 --noproxy '*' "http://$ip/" 2>/dev/null)
-    if [ "$code" = "000" ]; then say "  ✗ http://$ip/ 无响应"; else say "  ✓ http://$ip/ HTTP $code"; found="$ip"; fi
+    case " $seen " in *" $ip "*) continue;; esac
+    seen="$seen $ip"
+    local url="$ip"; case "$url" in *:*) url="http://$url/";; *) url="http://$url/";; esac
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 --noproxy '*' "$url" 2>/dev/null)
+    if [ "$code" = "000" ]; then
+      say "  ✗ $url 无响应"
+    else
+      say "  ✓ $url HTTP $code"
+      [ -z "$found" ] && found="$ip"
+    fi
   done
-  if [ -n "$found" ]; then say "✅ Recovery 页可达: http://$found/"; else say "⚠️ 无候选 Recovery 页可达(路由器正常运行中时本就无响应)"; fi
+
+  say ""
+  if [ -n "$found" ]; then
+    say "✅ Recovery 页可达: http://$found/"
+    say ""
+    say "  救援指引（按可达的那个提示符走）:"
+    say "    · 页面能开 → 直接用网页刷写:"
+    say "        刷 chainloader → 选 uboot 目标    → 上传 xr1710g-chainloader-*-slot.bin"
+    say "        刷固件     → 选 firmware 目标    → 上传 *-sysupgrade.itb"
+    say "        串口应出现: httpd: accepting <bytes>-byte firmware for UBI 2.0"
+    say "    · 页面开但串口停在 ECNT> → 走 TTL 路径 (见 ttl_rescue.sh --print-serial)"
+    say "    · 页面开但串口停在 U-Boot> → 二级提示符, 只有 mtd 读写, **绝不 saveenv**"
+    say ""
+    say "  ⚠️ 若本页可达但设备仍连不上 SSH, 说明进了恢复模式 —— 这是正常的,"
+    say "     恢复模式下没有操作系统, 只有 U-Boot 的 HTTP 服务。"
+  else
+    say "⚠️ 无候选 Recovery 页可达。"
+    say ""
+    say "  可能原因（按概率排序）:"
+    say "    ① 设备没进恢复模式 —— 恢复页需要**上电时按住 reset 键**, LED 变色后松手"
+    say "    ② 电脑网卡不在 192.168.0.0/24 —— 恢复页固定 192.168.0.1/24, 建议设静态 192.168.0.10/24"
+    say "    ③ 网口不对 —— 官方要求插 10GbE 口 (fport 4); 1G/2.5G 口 (fport 1) 走另一条路径, 两边都试"
+    say "    ④ 设备其实正常运行(没变砖) —— 此时本就不该有恢复页"
+    say ""
+    say "  下一步:"
+    say "    · 先确认设备是否还 SSH 得通 → 得通就不是变砖, 用 SSH 路径最省事"
+    say "    · 变砖且 SSH 不通 → 必须走 TTL 串口 (ttl_rescue.sh --print-serial)"
+    say "    · 变砖且无 TTL 硬件 → 唯一出路是拆机 TTL, 本 skill 无法覆盖"
+  fi
 }
 
 
@@ -1064,13 +1115,19 @@ case "$MODE" in
     else
       say "  ① 恢复页地址: 按 ${LINEAGE} 血脉, 应为 ${LINEAGE_RECOVERY_IP}。"
     fi
-    say "  ② 必须连带刷一次固件: 官方 chainloader 按官方固件布局(U-Boot 卷/fit 卷)设计。"
-    say "     只换二级引导而不换固件, 可能停在 Unknown command(二级 U-Boot 无 flash 命令)。"
-    say "     → 推荐顺序: 先用 upgrade_router.sh 刷官方固件 → 再刷本 chainloader → 再重启验证。"
-    say "  ③ MAC 可能变化: 若 mtd1 的 uenv CRC 失效, 二级 U-Boot 会回落官方默认 env"
-    say "     (xr1710g.env), 其 ethaddr 可能与原厂 MAC 不同。"
-    say "     → 已自动抓取 MAC 基线到备份目录, 刷后用 compare_mac 逐接口比对;"
-    say "       MAC 变了可在二级 U-Boot 里 setenv ethaddr '<原MAC>' + saveenv + reset 改回。"
+    say "  ② 无需连带刷固件(2026-11-16 第六轮实证更正): 官方 env 用的是"
+    say "     ubi read \${loadaddr} fit + bootm \${loadaddr}#config-1 —— 走 UBI 卷名 'fit',"
+    say "     不依赖 flash 命令, 也不依赖分区 label。本机 fit 卷已实证含 /configurations/config-1。"
+    say "     → 本步骤可独立完成; 刷完即可验证(版本串/MAC/恢复页 IP)。"
+    say "  ②' 配套固件(官方 20261112 release note): 「修复1710 的lan cpu 的mac地址相同问题」"
+    say "     由 11-11 chainloader 的 U-Boot 侧 fixup_fdt_macs 实现 —— 即刷本 chainloader 即修复,"
+    say "     无需为此刷固件。若还要 1115 的 NPU/桥接改进, 那是独立的固件升级, 与本步骤解耦。"
+    say "  ③ MAC: 二级 U-Boot 通过 xr1710g_sync_runtime_ethaddrs() 从 factory 卷同步 MAC,"
+    say "     不依赖 mtd1 的 ethaddr(那是原厂占位符 00:AA:BB:01:23:40)。"
+    say "     → 已自动抓取 MAC 基线到备份目录, 刷后用 compare_mac 逐接口比对。"
+    say "     → ⚠️ 绝对不要在 chainloader 里 saveenv: mtd1 是原厂 env 分区, 覆写会让原厂"
+    say "       U-Boot 找不到自己的启动配方(卡在 ECNT> 报 Unknown command 'ubi')。"
+    say "     → 预期结果: 刷完 CPU 口 MAC 不再与 lan2/lan3/lan4 重复(11-11 的 fixup_fdt_macs 修复)。"
     if [ "$MODE" = "prepare" ]; then
       backup_device "$TS"
       snapshot_mac "$TS"
