@@ -247,6 +247,74 @@ agent_created: true
 
 **实测结果**：`ubootenv` 首字节 `92ffd9c2 ff bootd...`（flags=0xFF ✅）、`ubootenv2` 首字节 `92ffd9c2 00 bootd...`（**未被触碰** ✅）、两卷各 34 个变量、`fw_printenv` 前后逐行一致、mtd1/mtd3 sha256 与基线一致。
 
+
+## 官方 SSH 刷写路径（naoki66 官方文档，2026-11-11 新增）
+
+官方已提供**完整的 SSH 刷 chainloader 文档**：`docs/ssh-flash-chainloader.md`（仓库
+`naoki66/Gemtek-brightspeed-chainloader`）。本 skill 的 `--flash` 已与其对齐。
+
+官方第 4 步原文：
+
+```sh
+ssh root@<设备IP> 'mtd write /tmp/new-slot.bin chainloader'
+```
+
+关键事实（实测确认）：
+
+- 设备 `mtd` usage 明写 **"The device is in the format of mtdX (eg: mtd4) or its label"**
+  → **可直接用 label `chainloader` 写，不依赖 mtd 编号**（编号可能随固件变）。
+- `mtd` 支持子命令：`dump / unlock / refresh / erase / verify / write / jffs2write`。
+- 官方说明 "写入只覆盖镜像长度，尾部保持擦除后的 `0xff`" → **mtd 内部自行处理末块对齐**，
+  因此**不需要**本地 pad（pad 版只留给 `dd` 兜底路径）。
+- ⚠️ **`dd` 直写 `/dev/mtdX` 仍受限**：只接受**整擦除块**写入。官方镜像 937538 B
+  = 7×131072 + 20034 B 尾巴 → dd 最后一次 `write()` 非对齐 → 内核 EINVAL。
+  这是 2026-11-16 实测故障（`WRITE_BEGIN` 后无 `WRITE_DONE`），设备未受损。
+  **结论：`mtd write` 是唯一可靠路径，`dd` 必须先 pad。**
+
+### 官方固件 release note 明确要求固件与 U-Boot 配套升级
+
+naoki66 固件 `20261112` release note 原文：
+
+> 2. 1710 开放 ssh 刷写引导功能，后期引导 uboot 也可以 OTA。
+> 3. 修复 1710 的 lan cpu 的 mac 地址相同问题，后续不再需要手改
+>    （需刷入 `2026-11-11-a9a12de55890` 实现）
+
+⇒ **只刷固件不刷 U-Boot，CPU 口 MAC 重复不会修好**。官方把两者绑定为一次升级。
+
+### 本机实测：CPU 口 MAC 重复（官方 11-11 正好修这个）
+
+```
+br-lan = cpu = lan2 = lan3 = lan4 = 00:58:28:d7:63:60   ← 5 个接口同 MAC
+```
+
+官方 11-11 提交 `board: airoha: an7581: give the XR1710G CPU port its own MAC offset`
+专治此病，官方 SSH 文档亦实测确认："重启前 CPU 口与 lan2 的 MAC 重复，重启后 CPU 口变为 LAN base + 4"。
+
+### UBI fastmap：官方版独有的启动加速
+
+| | 本机 YYH2913 `2026.07-00760-gab7fd65100f1` | 官方 `2026-11-11-ga9a12de55890` |
+|---|---|---|
+| `ubi_attach_fastmap` 符号 | **0 个**（实测 strings 计数） | `ubi_attach_fastmap` / `ubi_update_fastmap` / `ubi_write_fastmap` 全有 |
+| `CONFIG_MTD_UBI_FASTMAP` | 无 | `=y` + `AUTOCONVERT=1` |
+| U-Boot 侧 UBI attach | 全盘扫 ≈3500 PEB | 读几个 anchor PEB |
+| `CONFIG_BOOTDELAY` | 3（本机 env 实为 2） | 1 |
+| env 后端 | UBI `ubootenv`/`ubootenv2` | MTD `uenv`（共享原厂，**不可 saveenv**） |
+| 恢复页 | 192.168.255.1 | 192.168.0.1 |
+
+内核侧 attach 实测耗时：`1.635s attaching → 3.348s scanning finished`（约 1.84 s）。
+
+### sysupgrade 路径（本机走 fit_do_upgrade，不碰 mtd3）
+
+- 本机 `board_name = gemtek,xr1710g`（**不带 `-ubi`**）→ `platform_check_image` 走
+  `fit_check_image` 分支，**不触发** `gemtek_ubi_layout_check`（后者要求 `bl2` 分区 +
+  `fip`/`ubootenv`/`ubootenv2`/`factory`/`fit` 五卷，本机无 `bl2`/`fip`，故必须走非 `-ubi` 分支）。
+- `fit_do_upgrade` → `export_fitblk_bootdev` 检出 `CI_METHOD=ubi` → `nand_do_upgrade`
+  → **只写 fit 卷，不动 mtd3** ⇒ 固件升级与 U-Boot 升级**完全解耦**。
+- 平台脚本在 **`/lib/upgrade/`**（不是 `/usr/lib/upgrade/`），后者目录为空属正常。
+- **`sysupgrade -T <itb>` 是只读校验模式**（EXIT=0 即兼容），刷前必跑。
+  实测 1115 固件：`sysupgrade -T` EXIT=0，`fit_check_sign` 全 OK（kernel-1 6.18.60 /
+  fdt-1 / rootfs-1 三项 crc32+sha1 全过）。
+
 ## 🔧 U-Boot 执行手册（2026-11-16 新增，评估基线 → 可执行流程）
 
 **为什么单独成篇**：固件升级刷 UBI/fit 卷，U-Boot 升级刷 mtd3(chainloader) + env 层，**写入路径、失败模式、回退手段完全不同**。塞进同一次 sysupgrade 等于同时引入两个未验证变量，变砖后无法归因。**结论：两个独立窗口，先固件稳定，再 U-Boot。**

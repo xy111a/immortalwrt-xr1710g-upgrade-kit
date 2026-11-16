@@ -547,18 +547,47 @@ flash_chainloader(){
   local img="$1" dir="$2"
   say ""
   hr; say "---- 写入 chainloader 分区 ----"; hr
-  # 1) 上传
+
+  # 0) 预先算出目标 MTD / 擦除块大小 / pad 镜像
+  #    (PAD_FILE 在上传步骤就要用到, 必须先于 1) 定义; 原实现把它放在 3.5 步 → unbound variable)
+  local _cmtd0 ES0 ORIG_LEN0 PAD_LEN0 PAD_FILE0
+  _cmtd0=$(rssh "awk -F: '/\"chainloader\"/{gsub(/ /,\"\",\$1);print \$1}' /proc/mtd 2>/dev/null" 2>/dev/null | tr -d ' \n')
+  [ -n "$_cmtd0" ] || _cmtd0=mtd3
+  ES0=$(rssh "cat /sys/class/mtd/${_cmtd0}/erasesize 2>/dev/null" 2>/dev/null | tr -d ' \n')
+  case "$ES0" in ''|*[!0-9]*) ES0=131072 ;; esac
+  ORIG_LEN0=$(wc -c < "$img" | tr -d ' ')
+  PAD_LEN0=$(( (ORIG_LEN0 + ES0 - 1) / ES0 * ES0 ))
+  PAD_FILE0="/tmp/chainloader-slot-pad.bin"
+  if [ "$PAD_LEN0" != "$ORIG_LEN0" ]; then
+    python3 - "$img" "$PAD_FILE0" "$PAD_LEN0" <<'PYEOF'
+import sys
+src, dst, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(src, "rb").read()
+assert len(data) <= target, "镜像比 pad 目标还大"
+open(dst, "wb").write(data + b"\xff" * (target - len(data)))
+PYEOF
+    [ $? -eq 0 ] || die "镜像 pad 到 ${PAD_LEN0} 字节失败"
+    say "  ℹ️  已生成 pad 镜像 (仅供 dd 兜底路径): ${ORIG_LEN0} → ${PAD_LEN0} 字节 (erasesize=$ES0, 填充 0xFF)"
+  else
+    cp -f "$img" "$PAD_FILE0" || die "准备 pad 文件失败"
+    say "  ℹ️  镜像长度已是擦除块整数倍 (${ORIG_LEN0} 字节, erasesize=$ES0)"
+  fi
+
+  # 1) 上传 (对齐官方 docs/ssh-flash-chainloader.md: 上传**原始** slot 镜像)
   say "  上传镜像到设备"
-  # 注: 上传的是 pad 后的镜像 (PAD_FILE), 源镜像 sha 单独保留用于回读比对
-  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$PAD_FILE" "$ROUTER":/tmp/chainloader-slot.bin >/dev/null 2>&1 || die "上传镜像失败"
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$img" "$ROUTER":/tmp/chainloader-slot.bin >/dev/null 2>&1 || die "上传镜像失败"
+  # 同时上传 pad 版, 仅供 dd 兜底路径使用 (mtd 路径不用它)
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$PAD_FILE0" "$ROUTER":/tmp/chainloader-slot-pad.bin >/dev/null 2>&1 || true
   # 2) 设备侧校验 sha256 + magic, 再写
   local isha
   isha=$(rssh "sha256sum /tmp/chainloader-slot.bin 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d ' \n')
   local lsha psha
   lsha=$(shasum -a 256 "$img" | awk '{print $1}')
-  psha=$(shasum -a 256 "$PAD_FILE" | awk '{print $1}')
-  [ -n "$isha" ] && [ "$isha" != "$psha" ] && die "上传后 sha256 不符(设备 $isha vs 本地 pad $psha) —— 中止, 不写入"
+  psha=$(shasum -a 256 "$PAD_FILE0" | awk '{print $1}')
   [ -n "$isha" ] || die "设备侧无法计算 sha256"
+  # ⚠️ 2026-11-16 修复(P0, 必然失败): 原实现同时要求 isha==psha 且 isha==lsha,
+  #    而上传的是 PAD_FILE → 两个条件互斥 → --flash 100% 在此 die, 永远写不进去。
+  #    现改为单一校验: 设备上的文件必须等于**本地原图**。
   if [ "$isha" != "$lsha" ]; then die "上传后 sha256 不符(设备 $isha vs 本地 $lsha) —— 中止, 不写入"; fi
   say "  ✅ 上传完整性校验通过 (sha256=$lsha)"
 
@@ -573,38 +602,22 @@ flash_chainloader(){
 
   # 3.5) 取目标 MTD 与擦除块大小, 并把镜像 pad 成擦除块整数倍
   #   ⚠️ 实测根因（2026-11-16, 已二次实证）:
-  #     NAND mtd 字符设备只接受**整擦除块**写入。本机 mtd3 erasesize=131072 (128 KiB),
+  #     **dd 直写 /dev/mtdX** 只接受**整擦除块**写入。本机 mtd3 erasesize=131072 (128 KiB),
   #     而官方 chainloader 镜像长 937538 字节 = 7 个整块 + 20034 字节尾巴, 非整除 →
   #     无论 dd 用 bs=1M 还是 bs=128K, 最后那次 write() 长度非对齐 → 内核返回 EINVAL。
   #     （注: "bs=1M 不是 erasesize 整数倍" 是上一轮的误判, 1MiB 恰好是 128Ki 的整数倍）
-  #     正解: 写前把镜像用 0xFF 补齐到 erasesize 整数倍, 保证每次 write() 都对齐。
+  #   ✅ 但 **`mtd write` 不受此限**: 官方 docs/ssh-flash-chainloader.md 明确用
+  #     `mtd write /tmp/new-slot.bin chainloader` 直接写**未 pad** 的原始镜像, 并说明
+  #     "写入只覆盖镜像长度, 尾部保持擦除后的 0xff" —— mtd 内部自行处理末块与擦除。
+  #   ⇒ 因此: **主路径 = mtd write 原始镜像（官方同款）**; pad 版仅留给 dd 兜底。
   #     0xFF 填充与本机 mtd3 现有尾部（空闲区全 0xFF）一致, 不引入额外差异。
   _cmtd=$(rssh "awk -F: '/\"chainloader\"/{gsub(/ /,\"\",\$1);print \$1}' /proc/mtd 2>/dev/null" 2>/dev/null | tr -d ' \n')
   [ -n "$_cmtd" ] || _cmtd=mtd3
-  local ES
-  ES=$(rssh "cat /sys/class/mtd/${_cmtd}/erasesize 2>/dev/null" 2>/dev/null | tr -d ' \n')
-  case "$ES" in ''|*[!0-9]*) ES=131072 ;; esac
-  local ORIG_LEN PAD_LEN PAD_FILE
-  ORIG_LEN=$(wc -c < "$img" | tr -d ' ')
-  PAD_LEN=$(( (ORIG_LEN + ES - 1) / ES * ES ))
-  PAD_FILE="/tmp/chainloader-slot-pad.bin"
-  if [ "$PAD_LEN" != "$ORIG_LEN" ]; then
-    python3 - "$img" "$PAD_FILE" "$PAD_LEN" <<'PYEOF'
-import sys
-src, dst, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
-data = open(src, "rb").read()
-assert len(data) <= target, "镜像比 pad 目标还大"
-open(dst, "wb").write(data + b"\xff" * (target - len(data)))
-PYEOF
-    [ $? -eq 0 ] || die "镜像 pad 到 ${PAD_LEN} 字节失败"
-    say "  ℹ️  已把镜像 pad 到擦除块整数倍: ${ORIG_LEN} → ${PAD_LEN} 字节 (erasesize=$ES, 填充 0xFF)"
-  else
-    cp -f "$img" "$PAD_FILE" || die "准备写入文件失败"
-    say "  ℹ️  镜像长度已是擦除块整数倍 (${ORIG_LEN} 字节, erasesize=$ES)"
-  fi
+  local ES ORIG_LEN PAD_LEN PAD_FILE
+  ES="$ES0"; ORIG_LEN="$ORIG_LEN0"; PAD_LEN="$PAD_LEN0"; PAD_FILE="$PAD_FILE0"
 
   if [ "$DRY" = "1" ]; then
-    say "  [dry-run] 真实执行将执行: mtd -e ${_cmtd} erase && mtd write ${PAD_FILE} ${_cmtd}, 然后整块回读比对"
+    say "  [dry-run] 真实执行将执行: mtd write /tmp/chainloader-slot.bin chainloader (官方同款, 写未 pad 的原始镜像), 然后整块回读 sha256 比对"
     return 0
   fi
 
@@ -647,15 +660,18 @@ run_logged() {
   return $_rc
 }
 
+# ⚠️ 官方路径（docs/ssh-flash-chainloader.md 第 4 步）:
+#     mtd write /tmp/new-slot.bin chainloader
+#   设备 mtd 的 usage 明确支持 "mtdX eg: mtd4 or its label" → 直接用 label, 不怕编号漂移。
+#   mtd 自行处理擦除与末块对齐, 因此写**未 pad 的原始镜像**。
 if command -v mtd >/dev/null 2>&1 && mtd write 2>&1 | grep -q 'write <imagefile>'; then
-  echo "WRITE_BEGIN method=mtd-perblock erase_size=$ES"
-  # 第一步: 不预先整分区擦除。mtd write 默认逐块擦除后即写,
-  #         这样"slot 完全为空"的窗口只有 1 个 128Ki 擦除块, 而不是整 1MiB。
-  if run_logged write mtd write "$IMG" "$M"; then
+  echo "WRITE_BEGIN method=mtd-by-label (官方同款) erase_size=$ES"
+  # 首选: 按 label 写原始镜像（官方第 4 步逐字做法）
+  if run_logged write mtd write "$IMG" chainloader; then
     sync
     echo "WRITE_DONE"
   else
-    # 第二步: 逐块写失败(常见于残留位未擦净) → 整分区擦除后重试一次
+    # 回落 1: 显式 mtdN + 先整分区擦除后重试一次（残留位未擦净的常见场景）
     echo "RETRY_AFTER_FULL_ERASE"
     run_logged erase mtd -e "$M" erase || true
     if run_logged write2 mtd write "$IMG" "$M"; then
@@ -666,15 +682,18 @@ if command -v mtd >/dev/null 2>&1 && mtd write 2>&1 | grep -q 'write <imagefile>
       exit 10
     fi
   fi
+  # mtd verify 仅供参考（官方文档未使用, 且对"镜像长度 < 分区长度"的比较语义不明确）;
+  # 真正的判据是下方**整块回读 sha256 比对**, 失败则拒绝重启。
   if run_logged verify mtd verify "$IMG" "$M"; then
     echo "VERIFY_OK mtd-verify"
   else
-    echo "VERIFY_FAILED mtd-verify"
-    exit 20
+    echo "VERIFY_WARN mtd-verify 未通过, 以回读 sha256 比对为准"
   fi
 else
-  echo "WRITE_BEGIN method=dd bs=$ES (mtd write 不可用)"
+  # 兜底: dd 直写必须用 pad 过的镜像, 否则末块非对齐 → 内核 EINVAL
+  echo "WRITE_BEGIN method=dd bs=$ES (mtd write 不可用, 使用 pad 镜像)"
   BS=$ES
+  IMG=/tmp/chainloader-slot-pad.bin
   run_logged erase mtd -e "$M" erase 2>/dev/null || true
   if run_logged write dd if="$IMG" of="/dev/$M" bs=$BS conv=fsync; then
     sync
@@ -692,6 +711,8 @@ REMOTE
   say "  回读校验"
   _cmtd=$(rssh "awk -F: '/\"chainloader\"/{gsub(/ /,\"\",\$1);print \$1}' /proc/mtd 2>/dev/null" 2>/dev/null | tr -d ' \n')
   [ -n "$_cmtd" ] || _cmtd=mtd3
+  # ⚠️ 官方第 5 步用 dd bs=4096 逐块读再 head -c $SIZE —— 那是**设备侧**算 sha256。
+  #   我们直接整块回读到本机再算, 判据等价且更严格(本机 sha256sum 可信)。
   rssh "dd if=/dev/$_cmtd of=/tmp/readback.bin bs=1M 2>/dev/null" >/dev/null 2>&1
   scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER":/tmp/readback.bin /tmp/uboot-readback.bin >/dev/null 2>&1 || die "回读失败"
   local head_sha
@@ -726,7 +747,6 @@ rollback_chainloader(){
     say "  [未确认] 回滚同样是写操作, 需要 --ack-uboot-flash"
     return 1
   fi
-  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "$ROUTER":/tmp/chainloader-old.bin >/dev/null 2>&1 || die "上传备份失败"
   if [ "$DRY" = "1" ]; then say "  [dry-run] 将把备份写回 chainloader 分区"; return 0; fi
   # ⚠️ 2026-11-16 与 flash 路径统一（实测依据）:
   #   1) NAND mtd 字符设备只接受**整擦除块**写入 → 备份若非 erasesize 整数倍必须先 pad;
@@ -773,8 +793,8 @@ ES=$(cat /sys/class/mtd/$M/erasesize 2>/dev/null); [ -n "$ES" ] || ES=131072
 echo "ROLLBACK_INFO mtd=$M erase_size=$ES image_size=$SZ"
 run_logged() { _tag="$1"; shift; "$@" > /tmp/_rb.log 2>&1; _rc=$?; echo "[$_tag rc=$_rc]"; cat /tmp/_rb.log; return $_rc; }
 if command -v mtd >/dev/null 2>&1 && mtd write 2>&1 | grep -q 'write <imagefile>'; then
-  echo "ROLLBACK_BEGIN method=mtd-perblock erase_size=$ES"
-  if run_logged write mtd write "$IMG" "$M"; then
+  echo "ROLLBACK_BEGIN method=mtd-by-label (官方同款) erase_size=$ES"
+  if run_logged write mtd write "$IMG" chainloader; then
     sync; echo "ROLLBACK_DONE"
   else
     echo "RETRY_AFTER_FULL_ERASE"
