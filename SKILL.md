@@ -295,6 +295,110 @@ bash uboot_upgrade.sh --probe-recovery
 
 **恢复页地址会变**：当前血脉 `192.168.255.1` → 11-11 chainloader `192.168.0.1`（DHCP 改为按 MAC 的租约表）。`upgrade_router.sh` 现维护状态档案 `~/router-upgrade-logs/uboot-state.env`（恢复页 IP / 触发方式 / U-Boot 版本串 / env 健康度 / 最近实测时间），重连候选与失败提示一律读它，**不再散落硬编码**。刷完 U-Boot 请更新该文件并实测一次 Recovery 页。
 
+## 🔬 第五轮实证：mtd1(uenv) 的真相 + 官方 chainloader 的引导链（2026-11-16）
+
+### A. 撤销「mtd1(uenv) CRC 失效」的旧判断 ✅
+
+此前据「mtd1 存的 `0xa42efba6` vs `crc32(0, mtd1[4:4+0x4000])=0xc7d824ec`」判定 mtd1 env CRC 失效。
+**那是长度用错了**。精确穷举结果：
+
+```
+mtd1 非 0xFF 区间 = [(0, 16383), (131072, 2097151)]      # 第一份 env 只占前 16 KiB
+crc32(mtd1[4 : 4+16380]) == 0xa6fb2ea4 (LE) == 存储值 0xa42efba6 (BE)  ✅ 精确命中
+```
+
+即 **mtd1 的 env CRC 完全有效**，只是它用的是**原厂 ECNT bootloader 自己的 env 格式**（`crc(4) + data[16380]`，无 flags 字段），不是 U-Boot 的 `env_t`。
+→ **「mtd1 CRC 失效 → 二级 U-Boot 回落官方默认 env → ethaddr 可能变」这条推断链整个不成立**，本机 MAC 不会因 env 回落而变。
+
+**mtd1(uenv) 里是原厂 env 的实证内容**（`strings /dev/mtd1`）：
+```
+bootcmd=flash read 0x600000 0x100000 $loadaddr; bootm     ← 与官方教程完全一致
+arch=arm  baudrate=115200  board=an7581_evb  ethact=ecnt_eth
+ethaddr=00:AA:BB:01:23:40                                  ← 占位符, 非本机真实 MAC
+ipaddr=192.168.1.1  serverip=192.168.1.10  loadaddr=0x81800000
+root=/dev/mtdblock4 ro  product_name=xPON ONU  fdt_high=0xac000000
+```
+
+> ⚠️ `ethaddr=00:AA:BB:01:23:40` 是原厂**占位符**，不是本机 MAC。本机真实 MAC 由 factory/DSR 决定，
+> 二级 U-Boot 启动时通过 `xr1710g_sync_runtime_ethaddrs()` 从 factory 卷同步，**不依赖 mtd1 的 ethaddr**。
+
+### B. 官方 chainloader 的引导链逐环实证（读官方源码 `board/airoha/an7581/xr1710g_rfb.c`）
+
+| 环节 | 官方 11-11 行为 | 本机现状 | 结论 |
+|---|---|---|---|
+| env 存储 | `CONFIG_ENV_IS_IN_MTD=y` / `CONFIG_ENV_MTD_DEV="uenv"` / `CONFIG_ENV_OFFSET=0x0` | mtd1 名 `uenv`、偏移 0、CRC 有效 | ✅ 完美匹配 |
+| 冗余 env | `# CONFIG_ENV_REDUNDANT is not set`（**官方不用 UBI 冗余对**） | 本机 YYH2913 用 UBI 冗余对 | ⚠️ 官方 chainloader 只读 mtd1，不读 ubootenv/ubootenv2 —— 之前那对冗余是给**现役 YYH2913 二级**用的，刷官方后即失效（无害） |
+| 一级 bootcmd 归一化 | `board_late_init()` 检测 `bootcmd` 含 `"flash "` → 改写为 `run boot_ubi \|\| http_recovery` | mtd1 bootcmd 正是 `flash read 0x600000 ...` | ✅ 官方代码**主动**处理这个配方，无需手工干预 |
+| UBI 分区名 | `xr1710g_detect_ubi_part()` → 布局表只有 `{"2.0", "system"}` | 本机 mtd4 名为 `ubi` | ⚠️ `ubi part system` 会失败 → 但 `select_ubi()` 先比对 `ubi->mtd->name` |
+| fit 卷 | `ubi_read_production=ubi read ${loadaddr} fit` → 读 **UBI 卷名 `fit`** | ubi0_0 名 `fit`，46.2 MiB，内容是 FIT（magic `d00dfeed`，含 `config-1`/`kernel-1`/`rootfs-1`） | ✅ 精确匹配 |
+| bootargs | `root=/dev/fit0` | 本机 `/proc/cmdline` 含 `root=/dev/fit0` | ✅ 一致 |
+| DRAM 容量 | `ubi read ${loadaddr} fit` 要把 46 MiB 读进 RAM | MemTotal 1.86 GB，loadaddr=0x81800000 | ✅ 容量充裕 |
+| 恢复页 | `ipaddr=192.168.0.1`（`board_late_init` 硬编码） | 本机现为 192.168.255.1 | ⚠️ 刷完**会变** |
+
+**mtd4 名字问题的实质**（此前列为「待验证兼容点」，本轮已定性）：
+- 二级 chainloader 用**自己内嵌的 DTB** 解析 MTD 分区表 —— 官方 DTB 标签是 `system`（@0x700000, 0x1b700000），
+  与本机 mtd4 的**偏移与大小完全一致**，只是本机运行时对外报的名字叫 `ubi`（内核侧视角）。
+- `xr1710g_select_ubi()` 的逻辑是 `strcmp(ubi->mtd->name, part)`，即比较**二级 U-Boot 自己 DTB 里的名字**。
+  二级用的是官方 DTB（`system`），对它自己而言 `system` 存在 → 匹配 → `ubi part system` 成立。
+- ⇒ **`ubi` vs `system` 命名差异在引导链上无影响**，此前「待验证」项可以关闭。
+
+### C. 本次 prepare 产出的实证资产
+
+`~/router-upgrade-logs/uboot-backups/20261116-130340/`：
+- 备份 8 项（mtd3 / mtd1 / ubi0_1 / ubi0_2 / fw_printenv / ubinfo / proc-mtd + SHA256SUMS）→ 复核 **7/7 OK**
+- `mtd-chainloader.bin` sha256 = `a65bba65300a381b…` 与设备当前 mtd3 **逐字节一致** → 回滚可用
+- 官方镜像 `xr1710g-chainloader-20261111-051034-ga9a12de55890-slot.bin`（937538 B），sha256 与官方 release 说明**完全一致**（`dbe285a7…`）
+- MAC 基线已快照（10 个接口）
+
+### D. 本轮修复：`--rollback` 写入路径与 `--flash` 对齐
+
+原 `--rollback` 用「先整分区 erase → 再 `mtd write`」，与 `--flash` 不一致，且**无回读比对**。已统一为：
+pad 到 erasesize 整数倍 → 上传后 sha256 校验 → `mtd write` 逐块擦写（失败才整分区擦除重试一次）→ **整块回读 sha256 与备份比对，不符则明确报错并拒绝"成功"**。
+
+### E. DTB 命名差异的最终定性（三方 DTB 交叉比对）
+
+用 `pyfdt` 把三份 DTB 的分区表拉平对比，**命名差异彻底闭环**：
+
+| DTB 来源 | mtd4 的 label | offset / size | 谁在用 |
+|---|---|---|---|
+| 本机 mtd3（YYH2913 11-02，内嵌） | `ubi` | 0x700000 / 460324864 | 现役二级 U-Boot（**刷官方后即不再使用**） |
+| 官方 naoki66 chainloader 11-11（内嵌） | **`system`** | 0x700000 / 460324864 | **刷入后的二级 U-Boot** |
+| 官方 1115 固件 itb（内核 DTB） | **`ubi`** | 0x700000 / 460324864 | 刷完固件后的 **Linux 内核** |
+
+- 三者 offset 与 size **完全一致**（0x700000 / 460324864），指向同一块物理 mtd4。
+- 二级 U-Boot 用**自己内嵌的 DTB** 解析 MTD（`system`）→ `ubi part system` 在二级内**成立**。
+- Linux 内核用**固件 itb 里的 DTB**（`ubi`）→ 内核侧看到 `ubi`，与现在一致。
+- ⇒ **`system` vs `ubi` 在任何一环都不冲突**，是「两份 DTB 各说各话」的正常现象。此前的「待验证兼容点」彻底关闭。
+
+### F. `bootargs` 三方一致
+
+```
+官方 XR1710G_BOOTARGS = "console=ttyS0,115200 earlycon ubi.block=0,fit root=/dev/fit0 rootwait rdinit=/sbin/init"
+1115 固件 chosen/bootargs = 同上（逐字节一致）
+本机 /proc/cmdline      = 同上 + " ubi.fm_autoconvert=1"（内核自动追加，不影响引导）
+```
+→ 内核 root 路径 `/dev/fit0` 与 fit 卷内容自洽。
+
+### G. prepare 已就绪的资产清单（2026-11-16 13:03）
+
+**备份目录**：`~/router-upgrade-logs/uboot-backups/20261116-130340/`
+- 8 项备份 + `SHA256SUMS`，复核 **7/7 OK**
+- `mtd-chainloader.bin` sha256 `a65bba65300a381b…` == 设备当前 mtd3（**回滚可用**）
+- `mtd-uenv.bin` sha256 `19aae29fd16dbe8e…`（原厂 env，CRC 有效）
+- `mac-baseline.txt`（10 个接口）
+
+**chainloader 镜像**（官方 11-11，与 release 说明 sha256 完全一致）
+`xr1710g-chainloader-20261111-051034-ga9a12de55890-slot.bin` · 937538 B · `dbe285a7ce09884650daee5df65571809c96b6a89a2d3a0495f3e6870c688d68`
+
+**连带刷的官方固件**（已下载并校验）
+`~/router-upgrade-logs/firmware-cache/immortalwrt-naoki66-20261115-5e152df9-airoha-an7581-gemtek_xr1710g-squashfs-sysupgrade.itb`
+85,561,654 B · sha256 `7a828e881ed1a7bfc7c632293f1203e545dd27f4a6df77f1a16624a1b67d0111`（与官方 digest 一致）· FIT magic `d00dfeed` ✅
+
+### H. prepare 阶段顺带修复：`--rollback` 与 `--flash` 写入路径对齐
+
+原 `--rollback` 用「先整分区 erase → `mtd write`」，与 `--flash` 不一致且**无回读比对**（失败会被当成成功）。
+已统一为：**pad 到 erasesize 整数倍 → 上传后 sha256 校验 → `mtd write` 逐块擦写（失败才整分区擦除重试一次）→ 整块回读 sha256 与备份比对，不符则明确报错**。
+
 ## 🧭 U-Boot / chainloader 评估基线（2026-11-12 复核，取代早期误判）
 
 **先记住四条曾经判错、不要再重复**：
@@ -309,7 +413,7 @@ bash uboot_upgrade.sh --probe-recovery
 - fastmap、DHCP 租约表、WAN PCS、备份 API 都是 **10-16~10-19 那批**就有的；11-11 的 5 个提交里**唯一行为变更是 MAC offset**（另 4 个：SSH 刷写文档、裁 FAT/ext4/SPI-NOR 死代码使体积 1002314→937538、CI 固定 ubuntu-24.04、GCC14 编译修复）。别把「新仓库相对老仓库的全部改进」当成 11-11 的更新内容。
 - 恢复页：`192.168.255.1`（当前 / YYH2913 上游）→ `192.168.0.1`（11-11 chainloader，提交 `d59b7f54cb94`）；进入方式两边都是「上电后按 reset、LED 变色松手」，只是措辞与 LED 判据不同，**不要写成「触发时序变了」**。
 - `saveenv` 陷阱：README §5.1 留了一句危险旧话「用 `setenv bootdelay 1; saveenv` 覆盖」，与优化文档 §2.2 / §10 坑 6「连 bootdelay 这种小事也别为它去 save」冲突（作者其实已在优化文档里明确）。本机 `bootdelay=2` 正是坑 8 说的「被 saveenv 持久化过」。**二级 chainloader 里绝不执行 `saveenv` / `env default -a`**（uenv 是原厂共享分区）。
-- 待验证兼容点：本机 mtd4 名为 `ubi`、`recovery_ubi_part=ubi`，新仓库板级代码只认 `system`。env 在 mtd1 会被沿用、启动大概率不受影响；但恢复模式刷 firmware 时是否识别，既不能断言会变砖也不能当无风险。
+- ✅ **已闭环（原「待验证兼容点」，2026-11-16 第五轮实证）**：本机 mtd4 名为 `ubi`、`recovery_ubi_part=ubi`，新仓库板级代码只认 `system` —— **在引导链上无影响**。理由：二级 chainloader 用**自己内嵌的官方 DTB** 解析 MTD（标签 `system` @0x700000/0x1b700000，与本机 mtd4 偏移大小完全一致），`xr1710g_select_ubi()` 比较的正是二级自己 DTB 里的名字，故 `ubi part system` 在二级内成立。恢复模式刷 firmware 只按 **UBI 卷名 `fit`** 写，与分区 label 无关。详见上方「第五轮实证」章节。
 - 11-11 release 只挂 1 个 asset（xr1710g 937538 B），发布说明却列了 2 个文件并给出 xg2010g 的 SHA256 —— 产物与说明不符，XG2010G 镜像缺失。
 - 两条并行线：上游 `YYH2913/http-uboot` 11-02 仍在更新（分区备份下载、RTL8261 延迟初始化），恢复页仍 `192.168.255.1`。评估「新版本 U-Boot」时别只看 naoki66 新仓库。
 

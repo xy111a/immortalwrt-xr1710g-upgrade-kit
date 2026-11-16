@@ -728,6 +728,42 @@ rollback_chainloader(){
   fi
   scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "$ROUTER":/tmp/chainloader-old.bin >/dev/null 2>&1 || die "上传备份失败"
   if [ "$DRY" = "1" ]; then say "  [dry-run] 将把备份写回 chainloader 分区"; return 0; fi
+  # ⚠️ 2026-11-16 与 flash 路径统一（实测依据）:
+  #   1) NAND mtd 字符设备只接受**整擦除块**写入 → 备份若非 erasesize 整数倍必须先 pad;
+  #      (本机备份是整分区 1MiB 备份, 恰好整除, 但不假设这一点, 一律检查+pad)
+  #   2) 不预先整分区擦除 → mtd write 逐块擦+写, 把"slot 全空"窗口缩到单个擦除块;
+  #   3) 写后整块回读 sha256 比对 → 与备份不一致则明确报错, 不伪装成功;
+  #   4) 绝不把写命令接管道后取 $?（那是 tail 的退出码, 会伪装成功）→ 一律 run_logged。
+  local ES_ ES
+  ES=$(rssh "cat /sys/class/mtd/mtd3/erasesize 2>/dev/null" 2>/dev/null | tr -d ' \n')
+  case "$ES" in ''|*[!0-9]*) ES=131072 ;; esac
+  local OLEN PLEN PFILE
+  OLEN=$(wc -c < "$src" | tr -d ' ')
+  PLEN=$(( (OLEN + ES - 1) / ES * ES ))
+  PFILE="/tmp/chainloader-old-pad.bin"
+  if [ "$PLEN" != "$OLEN" ]; then
+    python3 - "$src" "$PFILE" "$PLEN" <<'PYEOF'
+import sys
+s, d, t = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(s, "rb").read()
+assert len(data) <= t, "备份比 pad 目标还大"
+open(d, "wb").write(data + b"\xff" * (t - len(data)))
+PYEOF
+    [ $? -eq 0 ] || die "备份 pad 到 ${PLEN} 字节失败"
+    say "  ℹ️  已把备份 pad 到擦除块整数倍: ${OLEN} → ${PLEN} 字节 (erasesize=$ES, 填充 0xFF)"
+  else
+    cp -f "$src" "$PFILE" || die "准备回写文件失败"
+    say "  ℹ️  备份长度已是擦除块整数倍 (${OLEN} 字节, erasesize=$ES)"
+  fi
+  local bsha psha
+  bsha=$(shasum -a 256 "$src" | awk '{print $1}')
+  psha=$(shasum -a 256 "$PFILE" | awk '{print $1}')
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$PFILE" "$ROUTER":/tmp/chainloader-old.bin >/dev/null 2>&1 || die "上传备份失败"
+  local isha
+  isha=$(rssh "sha256sum /tmp/chainloader-old.bin 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d ' \n')
+  [ -n "$isha" ] && [ "$isha" != "$psha" ] && die "上传后 sha256 不符(设备 $isha vs 本地 $psha) —— 中止, 不写入"
+  [ -n "$isha" ] || die "设备侧无法计算 sha256"
+  say "  ✅ 上传完整性校验通过 (备份 sha256=$bsha)"
   rssh "sh -s" 2>/dev/null <<'REMOTE'
 M=$(awk -F: '/"chainloader"/{gsub(/ /,"",$1);print $1}' /proc/mtd 2>/dev/null)
 [ -z "$M" ] && M=mtd3
@@ -737,17 +773,42 @@ ES=$(cat /sys/class/mtd/$M/erasesize 2>/dev/null); [ -n "$ES" ] || ES=131072
 echo "ROLLBACK_INFO mtd=$M erase_size=$ES image_size=$SZ"
 run_logged() { _tag="$1"; shift; "$@" > /tmp/_rb.log 2>&1; _rc=$?; echo "[$_tag rc=$_rc]"; cat /tmp/_rb.log; return $_rc; }
 if command -v mtd >/dev/null 2>&1 && mtd write 2>&1 | grep -q 'write <imagefile>'; then
-  run_logged erase mtd -e "$M" erase || true
-  run_logged write mtd write "$IMG" "$M" || { echo "ROLLBACK_FAILED"; exit 10; }
-  sync
-  echo "ROLLBACK_DONE"
+  echo "ROLLBACK_BEGIN method=mtd-perblock erase_size=$ES"
+  if run_logged write mtd write "$IMG" "$M"; then
+    sync; echo "ROLLBACK_DONE"
+  else
+    echo "RETRY_AFTER_FULL_ERASE"
+    run_logged erase mtd -e "$M" erase || true
+    if run_logged write2 mtd write "$IMG" "$M"; then
+      sync; echo "ROLLBACK_DONE"
+    else
+      echo "ROLLBACK_FAILED"; exit 10
+    fi
+  fi
 else
-  run_logged write dd if="$IMG" of="/dev/$M" bs=$ES conv=fsync || { echo "ROLLBACK_FAILED"; exit 10; }
-  sync
-  echo "ROLLBACK_DONE"
+  echo "ROLLBACK_BEGIN method=dd bs=$ES (mtd write 不可用)"
+  run_logged erase mtd -e "$M" erase 2>/dev/null || true
+  if run_logged write dd if="$IMG" of="/dev/$M" bs=$ES conv=fsync; then
+    sync; echo "ROLLBACK_DONE"
+  else
+    echo "ROLLBACK_FAILED"; exit 10
+  fi
 fi
 REMOTE
   [ $? -eq 0 ] || die "回写失败"
+  # 写后整块回读比对: 确认回写的确实是备份内容, 而不是"命令返回 0 就当成功"
+  say "  回读校验"
+  local _cmtd rb_sha
+  _cmtd=$(rssh "awk -F: '/\"chainloader\"/{gsub(/ /,\"\",\$1);print \$1}' /proc/mtd 2>/dev/null" 2>/dev/null | tr -d ' \n')
+  [ -n "$_cmtd" ] || _cmtd=mtd3
+  rssh "dd if=/dev/$_cmtd of=/tmp/readback-old.bin bs=1M 2>/dev/null" >/dev/null 2>&1
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER":/tmp/readback-old.bin /tmp/uboot-readback-old.bin >/dev/null 2>&1 || die "回读失败"
+  rb_sha=$(dd if=/tmp/uboot-readback-old.bin bs=1 count="$OLEN" 2>/dev/null | shasum -a 256 | awk '{print $1}')
+  if [ "$rb_sha" != "$bsha" ]; then
+    say "  ❌ 回读比对失败: 回读 $rb_sha vs 备份 $bsha —— 回滚未生效, 请勿重启"
+    die "回滚回读校验不通过"
+  fi
+  say "  ✅ 回读比对通过 (与备份逐字节一致)"
   say "  ✅ 已写回旧 chainloader(未重启)"
 }
 

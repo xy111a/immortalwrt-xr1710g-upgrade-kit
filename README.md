@@ -304,3 +304,27 @@ router_watch.sh --now --force --ack-config-reset --ack-manual-reboot   # 立即�
 
 **剩余已知缺口**：1115 完整 rootfs 3,101 节点中 10 个第三方包关键词 0 命中，出厂确不含；kit 已离线注入 `openclash`/`dawn`/`pushbot`/`tailscale`/`wifihistory` 程序本体，但 `glass`/`usteer`/`socat`/`udpxy`/`msd_lite`/`rtp2httpd` 仍是「配置已保真、程序未装回」的悬空配置（无害但不生效），需刷后按需装回。
 
+### prepare 阶段已就绪的资产（2026-11-16）
+
+| 资产 | 位置 | 校验 |
+|---|---|---|
+| 备份（mtd3/mtd1/ubi0_1/ubi0_2/fw_printenv/ubinfo/proc-mtd） | `~/router-upgrade-logs/uboot-backups/20261116-130340/` | SHA256SUMS 复核 **7/7 OK** |
+| chainloader 镜像（官方 11-11） | 同上目录 | sha256 `dbe285a7…` == 官方 release ✅ |
+| 连带刷的官方固件（1115 itb） | `~/router-upgrade-logs/firmware-cache/` | sha256 `7a828e88…` == 官方 digest ✅ |
+| MAC 基线（10 接口） | 备份目录 `mac-baseline.txt` | ✅ |
+
+### U-Boot 引导链实证台账（2026-11-16 第五轮）
+
+| 环节 | 本机实测 | 与官方 11-11 chainloader |
+|---|---|---|
+| 一级 env (mtd1 `uenv`) | 原厂 ECNT 格式，`crc32(data[16380])` **CRC 有效**，`bootcmd=flash read 0x600000 0x100000 $loadaddr; bootm` | `CONFIG_ENV_IS_IN_MTD` + `ENV_MTD_DEV="uenv"` ✅ 完全匹配 |
+| 一级 bootcmd 含 `flash` | 是 | 官方 `board_late_init()` **主动**归一化为 `run boot_ubi \|\| http_recovery` ✅ 无需手工干预 |
+| UBI 分区名 | mtd4 = `ubi` | 官方 DTB = `system`（偏移/大小相同）→ 二级用自己 DTB 解析，**无影响** ✅ |
+| fit 卷 | ubi0_0 名 `fit`，46.2 MiB，FIT magic `d00dfeed`，含 `config-1`/`kernel-1`/`rootfs-1` | `ubi read ${loadaddr} fit` ✅ 精确匹配 |
+| bootargs | `root=/dev/fit0` | 一致 ✅ |
+| DRAM | 1.86 GB | 读 46 MiB 到 0x81800000 容量充裕 ✅ |
+| 恢复页 | 现在 `192.168.255.1` | 刷完变 **`192.168.0.1`** ⚠️ |
+
+> ✅ **撤销旧结论**：「mtd1 uenv CRC 失效 → 二级回落官方默认 env → ethaddr/MAC 可能变」——**不成立**。
+> 此前是 CRC 长度用错（用了 16384，实际 16380）。本机 MAC 不受 env 影响。
+
