@@ -15,7 +15,12 @@
 #   5. 2026-10-30: BusyBox `nc` **不支持 -z** 参数(报 Usage), 一切基于 `nc -z` 的探测都是假阴性;
 #      `/dev/tcp` 需 bash(路由器有 /bin/bash)。更坑的是: 从路由器 shell 直连会被 nft
 #      `redirect to :7892` 劫持, **测的是本地 clash 端口而非远端服务器** —— 必须先插 nft 豁免规则
-#      (`nft insert rule inet fw4 openclash_output ip daddr <IP> return`) 才能测到真实路径, 测完记得删。
+#      才能测到真实路径, 测完记得删。
+#      ⚠️ 2026-11-17 修复: **链名绝不能硬编码**。旧版是 `inet fw4 openclash_output`,
+#      但 1115 固件 + 新版 OpenClash 上该链**不存在**, 真正承载 TCP redirect 的是 `inet fw4 openclash`。
+#      硬编码 + `2>/dev/null` 会让插入静默失败, 而脚本仍打印"已豁免"并给出"真实可达/入口被封"的
+#      **假结论**(本次实战即被此坑误导)。现改为: 动态定位链 → 检查插入 rc → 回读自证规则在链里 →
+#      任一环节失败就**跳过本节并声明结果不可信**, 绝不输出可达性判定。见 oc_find_redirect_chain/oc_exempt。
 #   6. 2026-10-30: OpenClash 的 `openclash_custom_overwrite.sh` 里 ruby_edit 的 hash 参数必须是
 #      **合法 Ruby 源码**(用 `=>` 而非 YAML 的 `:`), 否则被 OpenClash 的 overwrite 安全检查判为
 #      "skip unsafe Overwrite command" 静默跳过; 且 mihomo 的 nameserver-policy 里 `+` 通配符
@@ -69,6 +74,48 @@ $SSH "$ROUTER" bash -s <<'OC_SCRIPT_EOF'
 OC_PASS() { [ "$(uci get openclash.config.enabled 2>/dev/null)" = "1" ] && echo 启用 || echo 未启用; }
 # 本构建 OpenClash 的 start_service 检查的是 option enable(不带 d, /etc/init.d/openclash:3594), 而非 enabled!
 OC_STARTSW() { [ "$(uci get openclash.config.enable 2>/dev/null)" = "1" ] && echo "1(开机可自启)" || echo "0(开机不自启-致命)"; }
+
+# ---- nft 豁免公共函数(8d 与 2d 共用) ----
+# 链名随固件/OpenClash 版本变化, 必须动态定位: 找"含 ip protocol tcp 且 redirect to :<port>"的 openclash 链。
+# 排除 DNS 劫持链(它 redirect 到 :53, 不是我们要绕开的 TCP 重定向)。
+oc_find_redirect_chain(){
+  nft -a list ruleset 2>/dev/null | awk '
+    /^table /{t=$2" "$3}
+    /^[ \t]*chain /{c=$2}
+    /ip protocol tcp/ && /redirect to :[0-9]+/ && c ~ /openclash/ {print t" "c; exit}'
+}
+# 插豁免并**自证生效**; 失败返回非 0, 调用方必须据此跳过判定而不是硬给结论。
+OC_EXEMPT_CHAIN=""; OC_EXEMPT_HANDLE=""
+oc_exempt(){
+  local ip="$1" chain
+  chain=$(oc_find_redirect_chain)
+  if [ -z "$chain" ]; then
+    echo "    ⚠️ 未定位到承载 TCP redirect 的 openclash 链(代理可能未运行/规则未安装)"
+    return 1
+  fi
+  OC_EXEMPT_CHAIN="$chain"
+  if ! nft insert rule $chain ip daddr "$ip" return 2>/tmp/_ocex.err; then
+    echo "    ⚠️ nft 豁免插入失败 [$chain]: $(head -1 /tmp/_ocex.err 2>/dev/null)"
+    OC_EXEMPT_CHAIN=""; return 1
+  fi
+  OC_EXEMPT_HANDLE=$(nft -a list chain $chain 2>/dev/null | grep -F "ip daddr $ip return" | grep -oE "handle [0-9]+" | awk '{print $2}' | head -1)
+  if [ -z "$OC_EXEMPT_HANDLE" ]; then
+    echo "    ⚠️ 插入命令返回成功但回读未在链中找到该规则 -> 视为未生效"
+    OC_EXEMPT_CHAIN=""; return 1
+  fi
+  return 0
+}
+oc_unexempt(){
+  [ -n "$OC_EXEMPT_CHAIN" ] && [ -n "$OC_EXEMPT_HANDLE" ] || return 0
+  if nft delete rule $OC_EXEMPT_CHAIN handle "$OC_EXEMPT_HANDLE" 2>/dev/null; then
+    echo "    已清理临时 nft 豁免 (handle $OC_EXEMPT_HANDLE)"
+  else
+    echo "    ⚠️ 豁免清理失败, 请手工核对: nft -a list chain $OC_EXEMPT_CHAIN"
+  fi
+  OC_EXEMPT_CHAIN=""; OC_EXEMPT_HANDLE=""
+}
+# 真·直连 TCP 握手(必须在豁免生效后才可信)
+oc_tcp_probe(){ timeout 10 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 echo ""
 echo "===== 1. 基本状态 ====="
 echo "OpenClash 启用(LuCI 显示): $(OC_PASS)"
@@ -111,6 +158,68 @@ if [ "$AU" = "1" ] && [ "$AUM" = "1" ] && [ "$SE" = "1" ]; then
   echo "✅ 三层闸门全开, 订阅会自动刷新节点。"
 else
   echo "🟡 有闸门未开 -> 订阅不会自动更新(机场换节点后你仍用旧配置)!"
+fi
+
+echo ""
+echo "===== 2d. 订阅拉取健康度(龄期 + 路径级拒绝判别) ====="
+# ⚠️ 本节所有"直连"探测必须先自证 nft 豁免生效, 否则测到的是代理出口, 会得出假 403/假"443不通"。
+#    2026-11-17 实战: 坏豁免曾把"机场拒绝代理节点出口"误判成"订阅失效/家宽被封", 结论完全错误。
+# 🔒 安全: 只打印域名与指标, 绝不打印订阅 URL / token / 响应正文。
+NOW=$(date +%s)
+for f in /etc/openclash/config/*.yaml; do
+  [ -f "$f" ] || continue
+  MT=$(date -r "$f" +%s 2>/dev/null); [ -n "$MT" ] || continue
+  AGE=$(( (NOW - MT) / 86400 ))
+  if [ "$AGE" -ge 7 ]; then
+    echo "  🟡 $(basename "$f"): 已 ${AGE} 天未更新(疑似自动更新失效)"
+  else
+    echo "  ✅ $(basename "$f"): ${AGE} 天前更新"
+  fi
+done
+SUB_ADDR=$(uci get openclash.@config_subscribe[0].address 2>/dev/null)
+if [ -z "$SUB_ADDR" ]; then
+  echo "  (uci 未取到订阅地址, 跳过拉取探测)"
+else
+  SUB_HOST=$(printf '%s' "$SUB_ADDR" | sed -E 's#^https?://##; s#/.*$##; s#[:?].*$##')
+  echo "  订阅主机(仅域名): $SUB_HOST"
+  SIP=$(nslookup -port=7874 "$SUB_HOST" 127.0.0.1 2>/dev/null | grep -A1 'Name:' | tail -1 | awk '{print $2}')
+  [ -z "$SIP" ] && SIP=$(nslookup "$SUB_HOST" 223.5.5.5 2>/dev/null | grep -A1 'Name:' | tail -1 | awk '{print $2}')
+  if [ -z "$SIP" ]; then
+    echo "  ⚠️ 域名解析失败 -> 先查 DNS(第 8 节), 本节不给拉取结论"
+  elif oc_exempt "$SIP"; then
+    echo "  豁免生效(chain=$OC_EXEMPT_CHAIN), 以下为真·直连结果"
+    _p(){ curl -s -o /tmp/_ocsub.bin -w '%{http_code}' --max-time 20 "$1" 2>/dev/null; }
+    ROOT_CODE=$(_p "https://$SUB_HOST/")
+    RAND_CODE=$(_p "https://$SUB_HOST/zzz-oc-probe-no-such-path")
+    SUB_CODE=$(_p "$SUB_ADDR"); cp /tmp/_ocsub.bin /tmp/_ocsub_real.bin 2>/dev/null
+    BAD_CODE=$(_p "${SUB_ADDR%?}X")
+    SAME=不同; cmp -s /tmp/_ocsub_real.bin /tmp/_ocsub.bin && SAME=相同
+    echo "    根路径 /          : HTTP $ROOT_CODE"
+    echo "    随机不存在路径    : HTTP $RAND_CODE"
+    echo "    真实订阅地址      : HTTP $SUB_CODE"
+    echo "    末位改坏 token    : HTTP $BAD_CODE (响应体与真实订阅: $SAME)"
+    if [ "$SUB_CODE" = "200" ]; then
+      echo "    ✅ 订阅可直连拉取 -> 路径正常。若文件仍陈旧, 问题在调度闸门(见 2c), 不在网络。"
+    elif [ "$ROOT_CODE" != "200" ]; then
+      echo "    🟡 连根路径都非 200 -> 疑似家宽 IP/边缘级拦截或服务器异常, 需跨网络对照验证。"
+    elif [ "$SUB_CODE" = "403" ] && [ "$RAND_CODE" = "404" ] && [ "$SAME" = "相同" ]; then
+      echo "    🔴 路径级拒绝: 路由存在(随机路径才 404) + 根路径 200(家宽 IP 未被封)"
+      echo "       + 真/假 token 响应完全相同 -> **拒绝发生在校验 token 之前**。"
+      echo "       ⛔ 据此不能断言『订阅过期/失效』(token 根本没被评估), 本地配置也改不了这个。"
+      echo "       处置: 1) 去机场面板重新生成/复制订阅链接(旧链接路径可能已作废)"
+      echo "             2) 找面板的备用/海外订阅域名换上再测"
+      echo "             3) 手机关 WiFi 用蜂窝打开订阅链接做跨网对照"
+      echo "             4) 仍 403 则联系机场(疑似边缘 WAF 规则或订阅下发被关闭)"
+    elif [ "$SUB_CODE" = "403" ] && [ "$SAME" = "不同" ]; then
+      echo "    🟡 403 且真/假 token 响应不同 -> 与 token/账号状态相关, 去面板查套餐/流量/到期。"
+    else
+      echo "    🟡 订阅返回 HTTP $SUB_CODE -> 未归类, 需人工看面板; 不要据此断言订阅失效。"
+    fi
+    rm -f /tmp/_ocsub.bin /tmp/_ocsub_real.bin
+    oc_unexempt
+  else
+    echo "    ⛔ 豁免未生效 -> 跳过拉取判定(任何『直连』码都可能是代理出口造成的假象)"
+  fi
 fi
 
 echo ""
@@ -219,13 +328,20 @@ if [ -n "${MAIN_SRV:-}" ]; then
   echo ""
   echo "--- 8d. 真实 TCP 握手测试(必须绕开 nft redirect, 否则测到的是本地 clash 端口) ---"
   if [ -n "${CIP:-}" ] && [ -n "${MAIN_PORT:-}" ]; then
-    # 临时插豁免规则, 让本机出向流量不走 redirect
-    nft insert rule inet fw4 openclash_output ip daddr "$CIP" return 2>/dev/null
-    echo "    已临时豁免 $CIP (测完自动删除)"
-    if timeout 10 bash -c "exec 3<>/dev/tcp/$CIP/$MAIN_PORT" 2>/dev/null; then
+    # 豁免必须自证生效; 失败则跳过判定(硬编码链名在新版上不存在, 会静默失败并给出假结论)
+    if oc_exempt "$CIP"; then
+      echo "    已临时豁免 $CIP (链: $OC_EXEMPT_CHAIN, 测完自动删除)"
+      EXEMPT_OK=1
+    else
+      EXEMPT_OK=0
+      echo "    ⛔ 豁免未生效 -> 本节跳过, **不给可达性结论**。"
+      echo "       此时任何『直连』探测仍被 nft 劫持到本地 clash 端口, 测的不是远端服务器;"
+      echo "       据此断言『入口 IP 被封』或『真实可达』都是假结论。请先修好豁免再测。"
+    fi
+    if [ "$EXEMPT_OK" = "1" ] && oc_tcp_probe "$CIP" "$MAIN_PORT"; then
       echo "    ✅ $CIP:$MAIN_PORT 真实可达 -> 入口正常"
       echo "    (若日志仍报 i/o timeout, 说明 clash 缓存了别的旧 IP, 重启 clash 即可重新解析)"
-    else
+    elif [ "$EXEMPT_OK" = "1" ]; then
       echo "    ❌ $CIP:$MAIN_PORT 真实不可达 -> 入口 IP 已被封锁!"
       echo "    ---- 处置方案 ----"
       echo "    1) 机场入口域名会轮转多 IP, 等几分钟让 DNS 刷新, 再跑本节复测"
@@ -233,9 +349,7 @@ if [ -n "${MAIN_SRV:-}" ]; then
       echo "    3) 重启 clash 清 DNS 缓存: /etc/init.d/openclash restart"
       echo "    4) 给入口域名配 nameserver-policy 绑定多上游(见 skill 文档第 8 节)"
     fi
-    # 清理临时规则
-    H=$(nft -a list chain inet fw4 openclash_output 2>/dev/null | grep "$CIP" | grep -oE "handle [0-9]+" | awk "{print \$2}" | head -1)
-    [ -n "$H" ] && nft delete rule inet fw4 openclash_output handle "$H" 2>/dev/null && echo "    已清理临时 nft 规则"
+    oc_unexempt
   else
     echo "    (缺少 IP 或端口, 跳过)"
   fi

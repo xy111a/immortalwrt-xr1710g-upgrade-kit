@@ -85,7 +85,7 @@ agent_created: true
     ```
     env_t = { u32 crc(LE) ; u8 flags ; u8 data[ENV_SIZE-5] }   总长 == CONFIG_ENV_SIZE == 16384
     CRC   = crc32(0, data, ENV_SIZE-5)        // 即 crc32(data[0:16379])
-    data  = "key=value " 串, 尾部用 0xFF 填充到 16379 字节
+    data  = "key=value\0" 串, 尾部用 0xFF 填充到 16379 字节
     ```
     ⚠️ **踩过的坑**：`fw_env.config` 里写的 size 是 `0x4000`，容易误以为 CRC 覆盖 16384 字节；实测**第 5 个字节是 flags（不是 data 的首字节）**，data 从偏移 **5** 开始、长度 **16379**。用偏移 4 + 长度 16380 / 16379 全试都对不上，只有 `data=raw[5:5+16379]` 精确命中 `crc32`。
     - 判定依据链：YYH2913 `defconfig`(`CONFIG_ENV_SIZE=0x4000` `CONFIG_ENV_IS_IN_UBI=y` `CONFIG_ENV_REDUNDANT=y` `CONFIG_ENV_UBI_VOLUME="ubootenv"` `CONFIG_ENV_UBI_VOLUME_REDUND="ubootenv2"`) + `env/ubi.c` 的 `ubi_volume_write(..., 0, CONFIG_ENV_SIZE)` + `env_check_redund` 的 flags 比较逻辑 + 实机 CRC 穷举。
@@ -116,7 +116,9 @@ agent_created: true
 5. **节点"能连 TCP" ≠ "App 能用"（2026-10-28 TikTok 实战）**：`自动选择`(url-test) 会挑"延迟最低"的节点，但某节点可能**能被 TikTok/Netflix 等封 IP**（TCP 通、业务不给数据，App 反复重试/转圈）。定位：对每个候选节点测 `GET /proxies/<name>/delay?url=https://www.tiktok.com&timeout=7000`，返回 `{"delay":N}`=能连、`{"message":"An error occurred..."}`=被该站封/不可达；把可用节点固定或从自动选择池剔除即可。
 6. **provider 模式下节点不在 `/proxies` 顶层**（2026-10-30）：机场新订阅是 `proxy-providers` 结构，节点在 `/providers/proxies` 里。只查 `/proxies` 会**误报 0 节点**并触发"静默断网"结论。两个来源都要查、取大值。
 7. **provider 内节点的 delay API 两条路径都 404**（2026-10-30）：`GET /proxies/<name>/delay` 和 `GET /providers/proxies/<prov>/proxies/<name>/delay` 对 provider 内节点都返回 `{"message":"Resource not found"}`（emoji 名 URL 编码亦然）。**唯一可靠的读法是直接读 `/providers/proxies` 响应里的 `history` 数组**：`{n:.name, d:((.history//[])[-1].delay // 0)}`，配合 `.alive` 字段。
-8. **路由器 shell 直连会被 nft 劫持，测出来是假阳性**（2026-10-30）：`openclash_output` 链最后一条是 `ip protocol tcp → redirect to :7892`，凡 gid≠65534 的本机出向 TCP 都被劫持到本地 clash 端口。于是 `bash -c 'exec 3<>/dev/tcp/<服务器IP>/<端口>'` 会**秒连成功**，但连的其实是本地 7892，**根本不是远端服务器**——我据此差点误判"入口正常"。要测真实路径必须先插豁免：`nft insert rule inet fw4 openclash_output ip daddr <IP> return`，测完按 handle 删除。（另：BusyBox `nc` **不支持 `-z`**，一切 `nc -z` 探测都是假阴性；`/dev/tcp` 需 bash，路由器有 `/bin/bash`。）
+8. **路由器 shell 直连会被 nft 劫持，测出来是假阳性**（2026-10-30）：承载 `ip protocol tcp → redirect to :7892` 的那条 openclash 链会把本机出向 TCP 劫持到本地 clash 端口。于是 `bash -c 'exec 3<>/dev/tcp/<服务器IP>/<端口>'` 会**秒连成功**，但连的其实是本地 7892，**根本不是远端服务器**——我据此差点误判"入口正常"。要测真实路径必须先插豁免，测完按 handle 删除。（另：BusyBox `nc` **不支持 `-z`**，一切 `nc -z` 探测都是假阴性；`/dev/tcp` 需 bash，路由器有 `/bin/bash`。）
+   - **⚠️ 2026-11-17 重大更正：链名绝不能硬编码。** 本文旧版与 `check_openclash.sh` 都写死 `inet fw4 openclash_output`，但**1115 固件 + 新版 OpenClash 上该链不存在**，真正承载 TCP redirect 的是 **`inet fw4 openclash`**。硬编码 + `2>/dev/null` 会让插入**静默失败**，脚本却照样打印"已豁免"并给出"真实可达 / 入口 IP 被封"的**假结论**。本次实战即被此坑误导：把"机场拒绝代理节点出口"错判成"订阅失效 / 家宽 IP 被封 / 443 不通"，而修好豁免后实测**真·直连 443 通、根路径 HTTP 200**。
+   - **正确做法**（已落进 `check_openclash.sh` 的 `oc_find_redirect_chain` / `oc_exempt` / `oc_unexempt`）：① 动态定位链——扫 ruleset 找"含 `ip protocol tcp` 且 `redirect to :<port>`"的 openclash 链（排除 DNS 劫持链的 `:53`）；② 检查 `nft insert` 的 **rc**；③ **回读自证**规则确实在链里（拿到 handle）；④ 任一环节失败就**跳过本节并声明结果不可信**，绝不输出可达性判定；⑤ 测完按 handle 删除并**核查残留为 0**。
 - **正确验证法**：查控制器统计"真实节点数"（过滤掉 Selector/URLTest/Fallback 等代理组，只数 `Vless/Vmess/Trojan/Hysteria2/...` 等真实类型，**且要合并 `/proxies` 与 `/providers/proxies` 两个来源**）+ 看 `/connections` 活跃连接数 + 看 `nft` 的 `openclash` TCP 重定向包计数随出网探针**增长**。三者任一成立即证明代理真在扛流量。
 
 ### 🚨 入口 IP 被封：全体节点超时但 DNS 正常（2026-10-30 实战，故障率最高）
@@ -710,13 +712,13 @@ RECOVERY_DHCP_BROADCAST_IPADDR "192.168.0.255"
 
 **刷前必备（2026-11-17 已全部完成）**：备份 mtd3 + mtd1/uenv ✅、确认新恢复页 `192.168.0.1` ✅、MAC 基线快照 ✅。~~TTL 串口就位~~ **已撤销**（U-Boot 刷成功，用户明确不拆机；且不要在 `ECNT>` 下 `saveenv`——会覆写原厂 env 毁掉启动配方）。
 
-## 📌 当前固件状态（2026-11-15，会过期）
+## 📌 当前固件状态（2026-11-17 活体复核，会过期）
 
-- 本机 `20261016-1a34e17c` / 6.18.55。**11-15 21:36 复核 uptime 仅 57 分钟**，dmesg 有 `UBIFS recovery needed/completed`，pstore 空、无 Oops/panic/看门狗痕迹 → 48h 异常复位观察窗内拒绝刷机（闸正确生效）。
-- **最新 `20261115` 正式版**（`5e152df9`，85,561,654 B，digest `7a828e88…d0111`，北京 11-15 14:51，`prerelease=false`，走 `asset.digest`），发布后 6h / 308 次下载 / 零新建 issue。说明主打全链路 NPU 加速、重写 NPU 监控与风扇控制、修复默认 APK 源，并**明令配置不兼容、不得导入旧配置**（`OTA: wipe-config`）。72h 闸到 **11-18 14:51**。
-- 镜像内嵌 commit `5e152df9` 在公开 master 查不到；作者未确认修了 `#82`（报告者称「升级以后需要双清，就好了」，属用户经验）。`#95` 作者 11-15 让「刷入最新版测试」，未确认已修；`#96`（XG2010G NPU 通路卡死）求日志。
-- **结论：仍不刷机**。触发条件=过 72h + 复核 issue + 按新固件重建 kit（**`--config-policy selective`**）+ 人工核对重配清单 + `--ack-config-reset`。旧的「全量配置保真」链路对 1115 已不适用，见下方「wipe-config 版本适配」。
-- U-Boot 两线仍静止：chainloader 11-11 版下载 119 次、0 open issue、缺 XG2010G asset；YYH2913 停 11-02。结论不变：**不单独刷**。
+- **已完成升级**：本机现实测 `DISTRIB_RELEASE='20261115-5e152df9'`（`DISTRIB_REVISION='2026-11-15-32bec3df41-5e152df97c'`），即 1016 → 1115 全清刷（`--force --allow-recent-crash --ack-config-reset`，用户显式授权自担风险）已执行完毕。下面这段历史判断**已过期，仅留档**：1115 为 `OTA: wipe-config` 版本、72h 沉淀闸到 11-18 14:51、当时结论「仍不刷机」。
+- **U-Boot 也已升级**：chainloader 由 YYH2913 旧版换为 naoki66 主线，走 **HTTP Recovery（物理按 reset 进恢复页 192.168.0.1，用户亲自上传）**，非活体 `mtd write`。旧 chainloader 整块备份留档于 `~/router-upgrade-logs/uboot-backups/MIRROR-20261116/mtd-chainloader.bin`。
+- **⚠️ 分区可写性已变化（关键，影响 U-Boot 升级路径选择）**：旧固件 1016 上 chainloader 分区只读，活体 `mtd write` 报 `Can't open device for writing`；**升级到 1115 后实测 `mtd3 flags=0x400`（`MTD_WRITEABLE` 已置位），非破坏性 `O_WRONLY` 打开成功** → 当前固件下活体 `mtd write` 路径可用。对照：`mtd0`/`mtd5` 为 `0x0`（只读）。**可写性随固件版本变化，每次写前必须实测**，已做成 `assert_mtd_writable` 预检（见下方 2026-11-17 修复）。
+- 刷后实测：OpenClash 内核 `v1.19.34`、Tailscale 重启服务即自动恢复在线（`tailscaled.state` 在 `/etc/tailscale`，无需重新登录）、`geo_auto_update` 四项已置 1。
+- **仍未解决**：订阅 `bingling.yaml` 已 15 天未刷新。用**修好的 nft 豁免**做真·直连判别后定性为**路径级拒绝**（详见下方 2026-11-17 修复第 6 项），**不是**订阅过期、**不是**家宽 IP 被封、**不是**本地 OpenClash 配置问题；需机场面板侧处理。
 
 ## 🔧 2026-11-13 二次审计后的修复（本轮改动，7 项 + 1 项实测新发现）
 
@@ -866,4 +868,68 @@ router_watch.sh --now --force --ack-config-reset --ack-manual-reboot   # 立即�
 **当前实测（2026-11-16 00:02，只读）**：固件 `20261016-1a34e17ca0`，`uptime=3.4h`，`UBIFS recovery=1`，`Oops/panic=0` → 48h 闸机械判据成立且确认为人工重启；1115 发布于 11-15 14:51，72h 闸到 **11-18 14:51** 才过。故此刻 `router_watch.sh --now --ack-config-reset --ack-manual-reboot`（不带 `--force`）仍会在 72h 闸处等待，属预期行为。
 
 **剩余已知缺口**：1115 完整 rootfs 3,101 节点中 10 个第三方包关键词 0 命中，出厂确不含；kit 已离线注入 `openclash`/`dawn`/`pushbot`/`tailscale`/`wifihistory` 程序本体，但 `glass`/`usteer`/`socat`/`udpxy`/`msd_lite`/`rtp2httpd` 仍是「配置已保真、程序未装回」的悬空配置（无害但不生效），需刷后按需装回。
+
+## 🔧 2026-11-17 实战后修复（6 项，全部活体/单元实证）
+
+本轮修复全部来自 11-16 真实升级过程中踩到的坑，**不是理论推断**。改前副本留档于 `~/router-upgrade-logs/skill-prefix-20261117-071126/`（该目录非 git 仓库，故先存副本再改）。
+
+**① P0：`check_openclash.sh` nft 豁免链名硬编码失效 + 失败被吞掉还谎报成功**
+
+原第 223 行写死 `nft insert rule inet fw4 openclash_output ... 2>/dev/null`，紧接着**无条件**打印「已临时豁免」。活体实测该链在 1115 + 新版 OpenClash 上**不存在**（`nft list chain inet fw4 openclash_output` → 不存在），真正承载 TCP redirect 的是 **`inet fw4 openclash`**。于是插入静默失败、豁免从未生效，`/dev/tcp` 与 `curl` 测的仍是**本地 clash / 代理出口**，却输出「✅ 真实可达」或「❌ 入口 IP 已被封锁」——**两种结论都可能是假的**。清理规则同样打在不存在的链上空转。
+
+修法：新增 `oc_find_redirect_chain`（扫 ruleset 定位含 `ip protocol tcp` + `redirect to :<port>` 的 openclash 链，排除 DNS 劫持的 `:53`）、`oc_exempt`（检查插入 rc + **回读自证**拿到 handle）、`oc_unexempt`（按 handle 删除并报告成败）。8d 改为**只有豁免自证生效才给可达性判定**，否则明确打印「⛔ 豁免未生效 → 本节跳过，不给可达性结论」。文件头第 5 条教学注释与本文第 119 行同步更正。
+
+实证：动态定位活体返回 `inet fw4 openclash`；把**写进文件的函数原样抽出**在路由器跑闭环 → 插入成功、真·直连 443 **通**、HTTP **200**、清理成功、**残留 0**；完整跑 `check_openclash.sh` 后 8d 正确豁免节点入口 `<入口IP>:<端口>`（真实值不入库）并判「真实可达」，残留复核 0。
+
+**② P0：`uboot_upgrade.sh` 缺写权限预检（并更正一处误判）**
+
+原实现直接以 `mtd write` 为主路径，注释断言「官方同款可行」，**从不读 `/sys/class/mtd/mtdX/flags`**。在只读分区上会依次空烧「label 写 → 整分区 erase → mtdN 写 → dd」四条必败路径才 die，且注释把历史根因归到「末块对齐」（那是另一种故障）。
+
+**⚠️ 诚实更正**：本轮曾据此断言「主路径在本机必然失败」——**该断言对当前固件是错的**。活体实测 `mtd3 flags=0x400`（`MTD_WRITEABLE` 已置位）、非破坏性 `O_WRONLY` 打开成功，即**1115 下 chainloader 可写**；历史上的 `Can't open device for writing` 发生在**旧固件 1016**。可写性随固件版本变化，所以正确修法不是「改主路径为 Recovery」，而是**每次写前实测并分支**。
+
+修法：新增 `assert_mtd_writable`，按位与判 `0x400`；可写 → 放行 `mtd write`；不可写 → 立即给 HTTP Recovery（192.168.0.1，不拆机）指引并 `die`，**不做任何写入尝试**；`--dry-run` 下只报告不中止；flags 读不到/格式异常 → 明示跳过预检而非假通过。`flash_chainloader` 与 `rollback_chainloader` 均在上传/pad 之前调用（fail fast）。3.5 节注释补上「两个不同故障」的更正说明。
+
+实证（含假值对照，三分支全验）：真设备 → `✅ 预检通过 flags=0x400` rc=0；stub `flags=0x0` + DRY=0 → `🛑` + Recovery 指引 + **退出码 1**；stub `flags=0x0` + DRY=1 → 报告但 **rc=0 不中止**。**全程未对 bootloader 做任何写入**。
+
+**③ P1：itb 下载 300s 硬上限（本次真失败点）**
+
+原 `curl -fL --max-time 300 ... 2>/dev/null`：85MB itb 在 300s 内下不完 → **本次实战真超时失败**；单次、无重试、无续传，且错误全被吞掉只剩一句「下载失败」。回退路径 `curl -fL` **连 `--max-time` 都没有**，可能无限挂住。
+
+修法：新增 `fetch_itb`，改用 **stall 检测**（`--speed-limit 10240 --speed-time 60`，低于 10KB/s 持续 60s 才判停滞）替代总时长硬帽，总上限兜底 `ITB_DL_MAXTIME`（默认 1800，可环境变量覆盖）；加 `--retry 3 --retry-delay 5 --retry-all-errors -C -` 断点续传；`--no-progress-meter` + stderr **落 `<dest>.curl.log`**，失败时打印 curl rc 与日志末行。主路径与回退路径统一走它。
+
+实证：坏 URL → `rc=1`、日志落盘、末行 `curl: (56) The requested URL returned error: 404`（判因可见，不再静默）。
+
+**④ P1：回退镜像完全不校验完整性（缺口在"出事时才走"的安全路径上）**
+
+主路径明确「无 digest 就拒绝下载」，但回退镜像下载后**无任何 sha256 校验**就被 `scp` 上去刷机；本地命中的回退镜像同样不校验。
+
+修法：新增 `verify_itb_sha`（0=通过 / 1=不符 / 2=无基准）与 `asset_digest_by_name`（与主路径同一权威来源 GitHub `asset.digest`）。`ensure_rollback_itb` 三个入口全部覆盖：已选定的 ROLLBACK、本地命中、新下载。**无 digest 基准就不下载**无校验镜像；校验不符则弃用/删除并回落 `FALLBACK_ITB`；已在本地的文件若取不到基准则**明示「未经校验，仅 best-effort」**而不是静默当作可信。另修一个边界缺陷：`gh` 出错时会把 JSON 错误体打到 stdout，原样返回会被当成期望 sha → 现**只接受 64 位 hex**，否则返回 `NONE`。
+
+实证：真资产 digest `7a828e88…d0111` 与本地 1115 itb 实际 sha **逐字一致**；`verify_itb_sha` 四例（正确/错误/无基准/带 `sha256:` 前缀）rc 分别 0/1/2/0；假值对照——错误 REPO → `NONE`（不再吐 JSON）、不存在资产名 → `NONE`。
+
+**⑤ P2：`SKILL.md` 含裸 NUL 字节，整份文档被当成二进制**
+
+env 布局代码块里 `data = "key=value<NUL>"` 混进了**真实 NUL 字节**，导致 `file` 报 `data`、`grep` 只回 `Binary file matches`——本轮**两度让文档内容搜不出来**。根目录与打包目录 `skill/router-immortalwrt-upgrade/SKILL.md` **两份都有**。
+
+修法：裸 NUL 替换为可见转义文本 `\0`（语义不变）。实证：两份均 `file` → `Unicode text, UTF-8`，`grep -c 订阅` → 15（搜索恢复正常），`cmp` 两份**一致**；全仓扫描确认其余文件无 NUL。
+
+**⑥ P2：新增订阅拉取诊断节（2d），并撤回一个错误结论**
+
+原脚本只测节点入口可达性，对「订阅长期不刷新」零覆盖。新增 2d：订阅文件**龄期**（≥7 天告警）+ **豁免自证后**的真·直连四路对照（根路径 / 随机不存在路径 / 真实订阅地址 / 末位改坏 token），据此分类而**不是**一律断言订阅失效。全程**只打印域名与指标，绝不打印订阅 URL / token / 响应正文**。
+
+**⚠️ 撤回**：本轮先前基于坏豁免得出的「订阅 403 → 订阅失效 / 家宽 IP 被机场封 / 443 不通」**结论错误，现公开撤回**。修好豁免后的可信实测：
+
+| 探测（真·直连，豁免自证生效） | 结果 |
+|---|---|
+| 订阅服务器 TCP 443 | **通** |
+| 根路径 `/` | **HTTP 200** |
+| 随机不存在路径 | HTTP 404 |
+| 真实订阅地址 | HTTP 403（6614B HTML，title `Forbidden`） |
+| 末位改坏 token | HTTP 403，**响应体与真实订阅字节完全相同** |
+| 6 种客户端/浏览器 UA、HTTP1.1/2、Referer、Accept | **一律 403** |
+| 随机路径 + `?token=abc` / 根路径 + `?token=abc` | 404 / 200（**`token=` 不是触发点**） |
+
+定性：**路径级拒绝，且拒绝发生在校验 token 之前**（真/假 token 响应完全相同）。根路径 200 证明**家宽 IP 未被封**；随机路径 404 证明**路由存在、URL 没写错**。故**不能断言订阅过期/失效**——用户「订阅应该还是有效的」的判断与证据一致。这不是本地 OpenClash 配置能修的。处置指向机场侧：面板**重新生成/复制订阅链接**（旧路径可能已作废）→ 找**备用/海外订阅域名** → **手机关 WiFi 用蜂窝**做跨网对照 → 仍 403 则联系机场（响应头有 `cf-ray: …-HKG`，疑似边缘 WAF 规则或订阅下发被关闭）。
+
+**验证汇总**：`bash -n` 三脚本全通过；`check_openclash.sh` 完整活体跑通（2d/8d 均正确豁免、判定、清理，nft 残留 0）；预检与下载/校验函数均做**假值对照**单元验证；`uboot_upgrade.sh --flash --dry-run` 确认 ack 闸仍在最前（未带 `--ack-uboot-flash` 时 rc=1 拒刷）。**本轮未刷机、未写 bootloader、未改路由器任何配置**（nft 豁免为临时插入且已自证清零）。
 

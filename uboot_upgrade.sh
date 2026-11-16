@@ -543,10 +543,48 @@ REMOTE
 }
 
 # ---------- 写入 + 回读校验 ----------
+# ---- 写前权限预检(2026-11-17 新增, 依据活体实测) ----
+# mtd 工具在 !(flags & MTD_WRITEABLE=0x400) 时直接报 "Can't open device for writing"。
+# 历史事实(两个不同故障, 别混为一谈):
+#   - 旧固件 1016: chainloader 分区**只读**, 活体 mtd write 必败 -> 只能走 HTTP Recovery(不拆机)。
+#   - 升级到 1115 后实测: mtd3 flags=0x400(可写), 非破坏性 O_WRONLY 打开成功 -> mtd write 路径恢复可用。
+# ⇒ 可写性**随固件版本变化**, 绝不能假设; 每次写前实测。不可写时立即给 Recovery 指引并中止,
+#   不再空烧 "label写 → 整分区erase → mtdN写 → dd" 四条在该前提下必败的路径。
+assert_mtd_writable(){
+  local m flags fv
+  m=$(rssh "awk -F: '/\"chainloader\"/{gsub(/ /,\"\",\$1);print \$1}' /proc/mtd 2>/dev/null" 2>/dev/null | tr -d ' \n')
+  [ -n "$m" ] || m=mtd3
+  flags=$(rssh "cat /sys/class/mtd/$m/flags 2>/dev/null" 2>/dev/null | tr -d ' \n')
+  case "$flags" in
+    0x[0-9a-fA-F]*|[0-9]*) : ;;
+    *) say "  ⚠️ 读不到/无法解析 $m 的 flags(${flags:-空}), 跳过写权限预检(写入失败仍会明确报错)"; return 0 ;;
+  esac
+  fv=$(( flags ))
+  if [ $(( fv & 0x400 )) -ne 0 ]; then
+    say "  ✅ 写权限预检通过: $m flags=$flags (MTD_WRITEABLE 已置位, 可活体 mtd write)"
+    return 0
+  fi
+  say "  🛑 写权限预检失败: $m flags=$flags (无 MTD_WRITEABLE 0x400) -> 当前固件下该分区只读"
+  say "     活体 mtd write / dd 均不可能成功, 已跳过全部写入尝试(未做任何写入)。"
+  say "     可行路径 = HTTP Recovery(不拆机):"
+  say "       1) 断电, 按住 reset 上电进入恢复模式(naoki66 chainloader 恢复页固定 ${LINEAGE_RECOVERY_IP:-192.168.0.1})"
+  say "       2) Mac 网卡设同网段静态 IP, 浏览器打开 http://${LINEAGE_RECOVERY_IP:-192.168.0.1}"
+  say "       3) 上传 chainloader 镜像, 完成后设备自动重启"
+  say "     或: 先升级到把 chainloader 设为可写的固件版本, 再走本脚本 mtd write 路径。"
+  if [ "${DRY:-0}" = "1" ]; then
+    say "  [dry-run] 真实执行会在此中止(只读分区无法活体写入)"
+    return 0
+  fi
+  die "chainloader 分区只读, 已中止(未做任何写入)"
+}
+
 flash_chainloader(){
   local img="$1" dir="$2"
   say ""
   hr; say "---- 写入 chainloader 分区 ----"; hr
+
+  # 0-pre) 写权限预检: 只读分区直接中止并给 Recovery 指引, 不浪费上传/pad/四条必败写入
+  assert_mtd_writable
 
   # 0) 预先算出目标 MTD / 擦除块大小 / pad 镜像
   #    (PAD_FILE 在上传步骤就要用到, 必须先于 1) 定义; 原实现把它放在 3.5 步 → unbound variable)
@@ -601,6 +639,11 @@ PYEOF
   say "  ✅ 设备侧 magic 校验通过"
 
   # 3.5) 取目标 MTD 与擦除块大小, 并把镜像 pad 成擦除块整数倍
+  #   ⚠️ 2026-11-17 更正: 历史上有**两个不同**的写入失败, 下面的"对齐"只是其中之一,
+  #      不要把它当成唯一根因 —— 另一个是**分区只读**(旧固件 1016 上 mtd3 无 MTD_WRITEABLE,
+  #      mtd write 直接报 "Can't open device for writing", 与镜像长度/bs 完全无关)。
+  #      只读那一类已由上方 assert_mtd_writable 预检拦截; 本节只处理"可写但 dd 末块不对齐"。
+  #      升级到 1115 后实测 mtd3 flags=0x400 可写, 故 mtd write 主路径在当前固件上可用。
   #   ⚠️ 实测根因（2026-11-16, 已二次实证）:
   #     **dd 直写 /dev/mtdX** 只接受**整擦除块**写入。本机 mtd3 erasesize=131072 (128 KiB),
   #     而官方 chainloader 镜像长 937538 字节 = 7 个整块 + 20034 字节尾巴, 非整除 →
@@ -747,6 +790,7 @@ rollback_chainloader(){
     say "  [未确认] 回滚同样是写操作, 需要 --ack-uboot-flash"
     return 1
   fi
+  assert_mtd_writable
   if [ "$DRY" = "1" ]; then say "  [dry-run] 将把备份写回 chainloader 分区"; return 0; fi
   # ⚠️ 2026-11-16 与 flash 路径统一（实测依据）:
   #   1) NAND mtd 字符设备只接受**整擦除块**写入 → 备份若非 erasesize 整数倍必须先 pad;

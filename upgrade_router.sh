@@ -807,6 +807,57 @@ case "$CONFIG_POLICY" in
   *) die "未知 --config-policy: $CONFIG_POLICY (仅支持 full|selective)" ;;
 esac
 
+# ---- 大镜像下载/校验公共函数(2026-11-17 修复) ----
+# 原缺陷(本次实战真踩到):
+#   1) 主路径 `curl -fL --max-time 300` 对 85MB itb 不够 -> 真超时失败; 单次、无重试、无续传。
+#   2) `2>/dev/null` 把 curl 错误全吞掉, 失败只剩一句"下载失败", 无法判因。
+#   3) 回退路径 `curl -fL` **连 --max-time 都没有** -> 可能无限挂住。
+#   4) 回退镜像下载后**完全不校验 sha256** 就被 scp 上去刷机 —— 缺口恰在"出事时才走"的安全路径上。
+# 现改为: stall 检测(限速判停滞, 不再用总时长硬帽卡死大文件) + 重试 + 断点续传 + stderr 落日志 + digest 校验。
+ITB_DL_MAXTIME="${ITB_DL_MAXTIME:-1800}"           # 总时长兜底上限(可用环境变量覆盖)
+ITB_DL_STALL_SPEED="${ITB_DL_STALL_SPEED:-10240}"  # 低于 10KB/s ...
+ITB_DL_STALL_TIME="${ITB_DL_STALL_TIME:-60}"       # ... 持续 60s 即判停滞并重试
+fetch_itb(){  # $1=url $2=dest; 成功返回 0
+  local url="$1" dest="$2" log rc
+  log="${dest}.curl.log"
+  curl -fL --no-progress-meter --retry 3 --retry-delay 5 --retry-all-errors -C - \
+       --speed-limit "$ITB_DL_STALL_SPEED" --speed-time "$ITB_DL_STALL_TIME" \
+       --max-time "$ITB_DL_MAXTIME" \
+       "$url" -o "$dest" 2>"$log"
+  rc=$?
+  if [ $rc -ne 0 ] || [ ! -s "$dest" ]; then
+    echo "❌ 下载失败(curl rc=$rc, 日志 $log): $(tail -2 "$log" 2>/dev/null | tr '\n' ' ')" >&2
+    return 1
+  fi
+  return 0
+}
+# 返回: 0=校验通过 1=不符 2=无官方基准(无法校验)
+verify_itb_sha(){  # $1=file $2=期望 sha256(可空/NONE)
+  local f="$1" want="${2:-}" act
+  want="${want#sha256:}"
+  if [ -z "$want" ] || [ "$want" = "NONE" ]; then
+    echo "⚠️ 无官方 digest 基准, 无法校验 $(basename "$f")" >&2
+    return 2
+  fi
+  act=$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')
+  if [ "$act" = "$want" ]; then return 0; fi
+  echo "❌ $(basename "$f") sha256 不符(实际 ${act:-空} vs 官方 $want)" >&2
+  return 1
+}
+# 按 asset 名取官方 digest(回退镜像用; 与主路径同一权威来源 GitHub asset.digest)
+asset_digest_by_name(){  # $1=asset name; 取不到或格式非法一律返回 NONE
+  local jqf out
+  jqf=$(printf '[.[] | .assets[] | select(.name=="%s")] | .[0].digest // "NONE"' "$1")
+  out=$(gh api "repos/$REPO/releases?per_page=100" --jq "$jqf" 2>/dev/null | head -1)
+  out="${out#sha256:}"
+  # gh 出错时可能把 JSON 错误体打到 stdout(如 404/401), 那不是 digest。
+  # 外部 API 边界必须校验格式: 只接受 64 位 hex, 否则视为无基准, 避免把错误体当期望值。
+  case "$out" in
+    ''|*[!0-9a-fA-F]*) echo "NONE" ;;
+    *) if [ "${#out}" -eq 64 ]; then echo "$out"; else echo "NONE"; fi ;;
+  esac
+}
+
 # 官方目标 itb 本地缺失时自动下载并用官方 digest 校验(仅真实执行; dry-run 不下载)。
 download_official_itb(){
   local dest="$PREP_DIR/$OFFICIAL_ITB_NAME" act
@@ -814,8 +865,8 @@ download_official_itb(){
   [ -n "$OFFICIAL_ITB_URL" ] || { echo "❌ 无官方 itb 下载地址" >&2; return 1; }
   [ -n "$OFFICIAL_ITB_SHA" ] || { echo "❌ 无官方 digest 基准, 拒绝下载无校验镜像" >&2; return 1; }
   echo "⬇️ 官方目标 itb 本地缺失, 自动下载: $OFFICIAL_ITB_NAME"
-  if ! curl -fL --max-time 300 "$OFFICIAL_ITB_URL" -o "$dest" 2>/dev/null || [ ! -s "$dest" ]; then
-    rm -f "$dest"; echo "❌ 下载失败" >&2; return 1
+  if ! fetch_itb "$OFFICIAL_ITB_URL" "$dest"; then
+    rm -f "$dest"; return 1
   fi
   act=$(shasum -a 256 "$dest" 2>/dev/null | awk '{print $1}')
   if [ "$act" != "$OFFICIAL_ITB_SHA" ]; then
@@ -998,7 +1049,19 @@ resolve_rollback(){
 # 不存在则 best-effort 从官方 release 下载(按日期/commit 匹配), 与 backup_config 的
 # 配置级备份形成"固件+配置"双保险。失败不阻断升级, 回落到 FALLBACK_ITB。
 ensure_rollback_itb(){
-  [ -n "$ROLLBACK" ] && [ -f "$ROLLBACK" ] && { echo "✅ 回退镜像已本地就位: $(basename "$ROLLBACK")"; return 0; }
+  if [ -n "$ROLLBACK" ] && [ -f "$ROLLBACK" ]; then
+    local _rsha _vrc
+    _rsha=$(asset_digest_by_name "$(basename "$ROLLBACK")")
+    verify_itb_sha "$ROLLBACK" "$_rsha"; _vrc=$?
+    if [ "$_vrc" = "1" ]; then
+      echo "⚠️ 已选定的回退镜像与官方 digest 不符, 弃用(依赖 FALLBACK_ITB): $(basename "$ROLLBACK")"
+      ROLLBACK=""
+    else
+      [ "$_vrc" = "2" ] && echo "ℹ️ 回退镜像未经校验(无 digest 基准), 仅作 best-effort 回退点"
+      echo "✅ 回退镜像已本地就位: $(basename "$ROLLBACK")"
+      return 0
+    fi
+  fi
   [ "$DRY" = "1" ] && { echo "ℹ️ dry-run 不下载回退镜像(仅本地检查)"; return 0; }
   command -v gh >/dev/null 2>&1 || { echo "⚠️ 无 gh CLI, 跳过回退镜像下载(依赖 FALLBACK_ITB)"; return 0; }
   local rev ymd y m d date hash jqf url name
@@ -1016,15 +1079,33 @@ ensure_rollback_itb(){
   fi
   [ -z "$url" ] && { echo "⚠️ 未找到当前版本($date/$hash)的回退 itb 下载源, 依赖 FALLBACK_ITB"; return 0; }
   name=$(basename "$url")
-  if [ -f "$PREP_DIR/$name" ]; then echo "✅ 回退镜像已本地就位: $name"; ROLLBACK="$PREP_DIR/$name"; return 0; fi
-  echo "⬇️ 下载当前版本回退镜像: $name"
-  if curl -fL "$url" -o "$PREP_DIR/$name" 2>/dev/null && [ -s "$PREP_DIR/$name" ]; then
-    echo "✅ 已下载回退镜像到 $PREP_DIR/$name"
-    ROLLBACK="$PREP_DIR/$name"
-  else
-    rm -f "$PREP_DIR/$name"
-    echo "⚠️ 回退镜像下载失败, 依赖 FALLBACK_ITB"
+  local rsha vrc
+  rsha=$(asset_digest_by_name "$name")
+  if [ -f "$PREP_DIR/$name" ]; then
+    verify_itb_sha "$PREP_DIR/$name" "$rsha"; vrc=$?
+    if [ "$vrc" = "1" ]; then
+      echo "⚠️ 本地回退镜像与官方 digest 不符, 拒绝用作回退点(依赖 FALLBACK_ITB): $name"
+      return 0
+    fi
+    [ "$vrc" = "2" ] && echo "ℹ️ 回退镜像未经校验(无 digest 基准), 仅作 best-effort 回退点: $name"
+    echo "✅ 回退镜像已本地就位: $name"
+    ROLLBACK="$PREP_DIR/$name"; return 0
   fi
+  # 与主路径同一纪律: 无官方 digest 基准就不下载无校验镜像。
+  # 回退是"出事时才走"的安全路径, 绝不能把未校验/被截断的镜像刷进去。
+  if [ -z "$rsha" ] || [ "$rsha" = "NONE" ]; then
+    echo "⚠️ 取不到回退镜像官方 digest, 拒绝下载无校验镜像(依赖 FALLBACK_ITB): $name"
+    return 0
+  fi
+  echo "⬇️ 下载当前版本回退镜像: $name"
+  if ! fetch_itb "$url" "$PREP_DIR/$name"; then
+    rm -f "$PREP_DIR/$name"; echo "⚠️ 回退镜像下载失败, 依赖 FALLBACK_ITB"; return 0
+  fi
+  if ! verify_itb_sha "$PREP_DIR/$name" "$rsha"; then
+    rm -f "$PREP_DIR/$name"; echo "⚠️ 回退镜像校验未通过, 已删除, 依赖 FALLBACK_ITB"; return 0
+  fi
+  echo "✅ 已下载并通过官方 digest 校验的回退镜像: $PREP_DIR/$name"
+  ROLLBACK="$PREP_DIR/$name"
 }
 # 与 resolve_rollback 的固件级回退互补: 固件刷成功但配置被搞坏时, 可手动 scp 此备份回路由 sysupgrade -f 还原。
 backup_config(){
