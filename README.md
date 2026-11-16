@@ -15,7 +15,7 @@
 | `upgrade_router.sh` | Mac 侧编排器：上传固件+kit、路由器侧 sha 复核、触发干净刷、轮询重连、终验、强终验失败自动回退；刷前还有 T2 兜底实测核验与 kit 有效性核验 | ✅ 入库 |
 | `router_watch.sh` | 按需守护：查最新 release（按 `published_at` 排序）、72h 沉淀闸、版本性质与配置兼容性双闸、独立 sha256 校验、watch.log 轮转、触发 `upgrade_router.sh --auto`；`--no-download` 为零副作用巡检 | ✅ 入库 |
 | `check_openclash.sh` | Mac 侧 OpenClash 一键健康诊断：真实节点数 / 订阅自动更新三层闸门 / config_path 一致性 / 出口节点对关键站点可达性（识别被封节点） | ✅ 入库 |
-| `uboot_upgrade.sh` | **U-Boot(chainloader) 独立升级/回滚**：`--status` 只读探测 / `--plan` 选片校验 / `--prepare` 备份+下载校验 / `--flash` 真刷（写后整块回读比对）/ `--rollback` 回滚 / `--probe-recovery` 救砖探测。五道闸：官方选片纪律、备份 fail-closed、三层 sha256、双入口 magic、写后回读；**绝不触碰 uenv/ubootenv** | ✅ 入库 |
+| `uboot_upgrade.sh` | **U-Boot(chainloader) 独立升级/回滚 + env 冗余对修复**（`--fix-env-redundancy`）：`--status` 只读探测 / `--plan` 选片校验 / `--prepare` 备份+下载校验 / `--flash` 真刷（写后整块回读比对）/ `--rollback` 回滚 / `--probe-recovery` 救砖探测。五道闸：官方选片纪律、备份 fail-closed、三层 sha256、双入口 magic、写后回读；**绝不触碰 uenv/ubootenv** | ✅ 入库 |
 | `zzz-restore-router` | 路由器首启动自举（`/etc/uci-defaults`）：写 LAN/WAN/三频/防火墙、恢复 root 密码与 WiFi key、注入 OpenClash 安装步骤 | ✅ 入库 |
 | `build_kit.sh` | 本地从源码组装 `kit.tar.gz`（默认安全写到 `dist/`，**拒绝覆盖真 kit**），写入无敏感信息的 `etc/kit-manifest` | ✅ 入库 |
 | `scripts/secret-scan.sh` | 提交前/CI 自动密钥扫描：拦截任何明文密码/订阅/token 进 Git | ✅ 入库 |
@@ -134,7 +134,7 @@ bash uboot_upgrade.sh --probe-recovery             # 救砖时探测恢复页
 - **绝不**在 chainloader 里 `saveenv` / `env default -a` —— `uenv`(mtd1) 是原厂 U-Boot 的 env 分区，chainloader 只是共用读取；saveenv 会让原厂 U-Boot 找不到启动配方（卡在 `ECNT>` 报 `Unknown command 'ubi'`）。
 - 本机**已处于「已刷 chainloader」状态**，上游 TTL+TFTP 教程针对的是原厂 U-Boot 状态 → 本机日常路径是 HTTP Recovery 的 `uboot` 目标上传；TTL 是最后的救砖手段。
 - 恢复页会变：当前 `192.168.255.1` → 11-11 chainloader `192.168.0.1`。状态档案在 `~/router-upgrade-logs/uboot-state.env`。
-- 🔴 **env 冗余对已单点失效**（实测：`ubi0_1` 全空，真实 env 只在 `ubi0_2`）→ 刷 U-Boot 前建议先修冗余对。
+- ✅ **env 冗余对已修复**（2026-11-16）：`ubootenv`(`ubi0_1`, dynamic) 原为全 0xFF 空卷，真实 env 只在 `ubootenv2`(`ubi0_2`, **static**)，属单点保险。已用 `uboot_upgrade.sh --fix-env-redundancy --ack-env-fix` 把 ubootenv2 的 env_t 复制成 ubootenv 的有效副本（`flags` 置 `0xFF` obsolete）→ U-Boot 仍选 ubootenv2（引导行为零变化），但 ubootenv2 损坏时可回落。ubootenv2 未被触碰。
 - ⚠️ **NAND 写入必须按擦除块对齐**（2026-11-16 实机故障，两轮实证）：官方镜像长 **937538** 字节，不是 `erasesize`(131072) 的整数倍 → NAND 字符设备拒绝非整擦除块写入，内核 **EINVAL**。**症状是 `WRITE_BEGIN` 后没有 `WRITE_DONE` 且 dd 静默失败**。解法：写前把镜像用 `0xFF` pad 到 1048576 字节，优先 `mtd write` + `mtd verify`；**绝不把写命令接管道后取 `$?`**（那是 `tail` 的退出码，会伪装成功）。详见 `SKILL.md`「NAND 写入路径踩坑」。
 - 📌 **MAC 可能变**：若 `mtd1` 的 uenv CRC 失效，二级 U-Boot 会回落官方默认 env（`xr1710g.env`），其 `ethaddr` 可能与原厂 MAC 不同。脚本已自动抓 MAC 基线到备份目录，刷后逐接口比对；变了可在二级 U-Boot 里 `setenv ethaddr '<原MAC>' + saveenv + reset` 改回。
 - 🧭 **必须连带刷一次固件**：官方 chainloader 按官方固件布局设计，只换二级引导而不换固件，可能停在 `Unknown command`（二级 U-Boot 无 `flash` 命令）。推荐顺序：先刷固件 → 修 env 冗余对 → 再刷 chainloader 并连带刷一次官方固件。

@@ -60,7 +60,18 @@ agent_created: true
 3. **authorized_keys 每行必须换行结尾**。缺尾 `\n` 时 `cat >>` 追加会拼成非法长行，两把 key 全被拒。
 4. **SSH host key 变更陷阱**：干净刷后路由器默认生成**全新 host key**，`StrictHostKeyChecking=accept-new` 语义是"接受新 key、拒绝密钥变更" → 对 clean flush **直接拒连**（脚本误报"重连失败"）。**根治**：`upgrade_router.sh` 的 `collect_runtime()` 在刷前从活路由抓取 `/etc/dropbear/dropbear_*_host_key` 注入 kit，`sysupgrade -f` 还原后 host key 不变 → **其他终端零感知，无需 `ssh-keygen -R`**；自举脚本 `zzz-restore-router` 再 `chown root:root` 这些 host key 兜底。仅当抓取失败才降级：轮询/终验前 `ssh-keygen -R <路由器地址或别名>` 清旧 key，或验证用 `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`。
 5. **U-Boot env 校验陷阱（2026-11-16 实测校准）**：活跃 env 在 **UBI 卷 ubootenv(ubi0_1) / ubootenv2(ubi0_2)**，正确校验：`cat /dev/ubi0_2 | strings | grep -E '^bootcmd='`。**旧文档说「`fw_env.config` 把 mtd0 陈旧副本列首位导致读不到真 env」——此说法已被实机证伪**：本机 `/etc/fw_env.config` 实为 `/dev/ubi0_1 0x0 0x4000 0x1f000 1` + `/dev/ubi0_2 ...`，指向的正是**活跃 UBI 卷**，`fw_printenv` 读到的 `bootcmd=run boot_ubi || http_recovery` 与直读 UBI 卷完全一致。但结论不变：**判据一律直读 UBI 卷**（不依赖 fw_env.config，因为该文件本身可能被刷机覆盖，且它只覆盖两个卷、非完整真相），且**必须逐卷读** —— 旧实现把 ubi0_1/ubi0_2/fw_printenv 三路并联进同一管道，任一路命中即判「兜底在位」，掩盖了「哪一路真的在位」。现已改为逐卷分离判定 + 冗余健康度报告。
-   - **🔴 2026-11-16 实测新风险：env 冗余对已单点失效** —— `ubi0_1`(ubootenv) 内容**全 0xFF（空）**，真实 env 只存在于 `ubi0_2`(ubootenv2)。一旦该卷被写坏，兜底彻底消失且无处可退。**刷 U-Boot 前应先修复冗余对**（`mkenvimage` 重建两份一致 env），否则是在"只有一份保险"的状态下动引导链。
+   - **✅ 2026-11-16 已修复：env 冗余对单点失效** —— 排查确认 `ubi0_1`(ubootenv) 是 **dynamic 卷但内容全 0xFF（0 个变量，CRC 必然不通过）**，真实 env 只存在于 `ubi0_2`(ubootenv2，**static 卷**，34 个变量，CRC 有效)。已用 `uboot_upgrade.sh --fix-env-redundancy --ack-env-fix` 修复：把 ubootenv2 的 env_t 原样复制成 ubootenv 的**有效副本**，仅把 `flags` 改为 `0xFF`(obsolete) —— 命中 `env_check_redund` 的 `flags1==255 && flags2==0 → ENV_REDUND` 分支，**U-Boot 仍选 ubootenv2，引导行为零变化**（`fw_printenv` 输出修复前后逐行一致），但 ubootenv2 一旦损坏即可回落到 ubootenv。ubootenv2 全程未被触碰（首字节比对 `92ffd9c2 00` → `92ffd9c2 00` 保持不变）。
+  - **📐 env_t 布局（2026-11-16 实机反推 + 上游源码交叉验证，本 skill 最重要的格式知识）**：
+    ```
+    env_t = { u32 crc(LE) ; u8 flags ; u8 data[ENV_SIZE-5] }   总长 == CONFIG_ENV_SIZE == 16384
+    CRC   = crc32(0, data, ENV_SIZE-5)        // 即 crc32(data[0:16379])
+    data  = "key=value " 串, 尾部用 0xFF 填充到 16379 字节
+    ```
+    ⚠️ **踩过的坑**：`fw_env.config` 里写的 size 是 `0x4000`，容易误以为 CRC 覆盖 16384 字节；实测**第 5 个字节是 flags（不是 data 的首字节）**，data 从偏移 **5** 开始、长度 **16379**。用偏移 4 + 长度 16380 / 16379 全试都对不上，只有 `data=raw[5:5+16379]` 精确命中 `crc32`。
+    - 判定依据链：YYH2913 `defconfig`(`CONFIG_ENV_SIZE=0x4000` `CONFIG_ENV_IS_IN_UBI=y` `CONFIG_ENV_REDUNDANT=y` `CONFIG_ENV_UBI_VOLUME="ubootenv"` `CONFIG_ENV_UBI_VOLUME_REDUND="ubootenv2"`) + `env/ubi.c` 的 `ubi_volume_write(..., 0, CONFIG_ENV_SIZE)` + `env_check_redund` 的 flags 比较逻辑 + 实机 CRC 穷举。
+    - **flags 语义**：`255`=obsolete、`0`=active。两份 CRC 都有效时按 flags 大小选：`flags1==255&&flags2==0→ENV_REDUND(用 buf2)`；`flags2==255&&flags1==0→ENV_VALID(用 buf1)`；否则 flags 大者胜。
+    - **`ubootenv2` 是 static 卷**（UBI static 卷不可原地重写），所以修复策略必须是「**只写 ubootenv、绝不碰 ubootenv2**」；`ubootenv` 是 dynamic 卷可安全覆盖。
+    - 修复用 `ubiupdatevol /dev/ubi0_1 <env_t.img>`（设备上有 mtd-utils 2.3.1），**不要用 `fw_setenv`** —— 它会走 `ubi_ioctl` 并自行管理 flags 语义，无法精确控制"只写一份、且让 ubootenv2 保持 active"。
 6. **⚠️ BusyBox tar 没有 `--exclude`（2026-10-21 实测，曾长期静默失败）**：路由器 busybox tar 只认 `-X <模式文件>`；写 `--exclude=xxx` 会报 `unrecognized option` 并使整条抓取管道失败——**而失败被 fallback 分支掩盖**，表现为"功能在文档里、实际从未跑过"（P1 的 oc-data 另存、P2 的真实配置还原都因此静默失效过，直到只读审计+试抓测试才发现）。三条纪律：① 路由侧 tar 一律用 `-X`；② Mac 侧 bsdtar 解 busybox 流**退出码不可信**（对 `._*` 条目会报 `Truncated tar archive` 但文件已抽全），成功判定必须校验落盘内容而非 `$?`；③ 抓取/打包链路要有用 `find -name '._*' -delete` 的本地兜底清理。
 
 ## ⚠️ 执行机拓扑前提（P0，已加固）
@@ -215,6 +226,26 @@ agent_created: true
 **副作用**：mtd 二进制里没有 `padd` 相关字符串 → 该版本 `mtd write` **不会自动补齐末块**，所以第 1 步的自行 pad 是必需的，不能省。
 
 **离线验证（已通过）**：pad 后双 magic 完好、尾部全 0xFF、8 次写入全部 128 KiB 对齐、整块回读 == pad 后镜像、**回滚写回备份逐字节完全恢复原 sha256**。
+
+## 🧩 env 冗余对修复（2026-11-16 已实施，可复现）
+
+**问题**：YYH2913 血脉的 U-Boot 用 UBI 冗余 env 对（`CONFIG_ENV_UBI_VOLUME="ubootenv"` + `CONFIG_ENV_UBI_VOLUME_REDUND="ubootenv2"` + `CONFIG_ENV_REDUNDANT=y`）。本机 `ubootenv`(ubi0_1, dynamic) **内容全 0xFF**、0 个变量（CRC 必然不通过），真实 env 只在 `ubootenv2`(ubi0_2, **static**)。→ 冗余对实际只有一份保险。
+
+**修法**（已实施并验证）：
+```bash
+./uboot_upgrade.sh --fix-env-redundancy --dry-run    # 只读体检 + 备份 + 构造，不写
+./uboot_upgrade.sh --fix-env-redundancy --ack-env-fix # 真写（只写 ubootenv）
+```
+原理：把 ubootenv2 的 env_t **原样**复制成 ubootenv 的有效副本，仅把 `flags` 改成 `0xFF`(obsolete) → 命中 `env_check_redund` 的 `flags1==255 && flags2==0 → ENV_REDUND`，U-Boot **仍用 ubootenv2**，引导行为零变化；但 ubootenv2 损坏时能回落到 ubootenv。
+
+**安全设计**：
+- **绝不写 ubootenv2**（static 卷 = 唯一有效保险，写了不可原地恢复）
+- 目标必须是 dynamic 且当前无有效变量，否则拒绝写入（不覆盖未知内容）
+- 写前备份两卷 + `fw_printenv` + `ubinfo`，备份失败 = fail-closed
+- 写后回读：变量数、flags 字节、`fw_printenv` 前后逐行比对
+- **幂等**：已修复时重跑只报"无需修复"
+
+**实测结果**：`ubootenv` 首字节 `92ffd9c2 ff bootd...`（flags=0xFF ✅）、`ubootenv2` 首字节 `92ffd9c2 00 bootd...`（**未被触碰** ✅）、两卷各 34 个变量、`fw_printenv` 前后逐行一致、mtd1/mtd3 sha256 与基线一致。
 
 ## 🔧 U-Boot 执行手册（2026-11-16 新增，评估基线 → 可执行流程）
 

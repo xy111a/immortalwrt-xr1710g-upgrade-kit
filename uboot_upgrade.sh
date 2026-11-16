@@ -19,6 +19,7 @@
 #   ./uboot_upgrade.sh --flash --ack-uboot-flash # 真刷 (需显式确认)
 #   ./uboot_upgrade.sh --rollback --ack-uboot-flash  # 用备份把旧 chainloader 写回
 #   ./uboot_upgrade.sh --probe-recovery         # 探测 Recovery 页是否可达(救砖时用)
+#   ./uboot_upgrade.sh --fix-env-redundancy --ack-env-fix   # 修 env 冗余对(只写 ubootenv, 不动 ubootenv2)
 #
 # 关键参数:
 #   --router <host[:port]>   路由器 SSH 地址(默认读 router-target.conf)
@@ -52,7 +53,15 @@ ENV_VOL_PRIMARY="/dev/ubi0_1"       # ubootenv
 ENV_VOL_REDUND="/dev/ubi0_2"        # ubootenv2
 VENDOR_ENV_MTD="uenv"               # mtd1, 原厂 U-Boot 的 env 分区(2MiB)
 
-DRY=0; ACK_FLASH=0; MODE="status"; RELEASE_TAG=""; ASSET_NAME=""; EXPECT_SHA=""
+# U-Boot env_t 布局(2026-11-16 实机反推 + 上游源码交叉验证, 见 SKILL.md)
+#   env_t = { u32 crc(LE) ; u8 flags ; u8 data[ENV_SIZE-5] }  总长 == CONFIG_ENV_SIZE
+#   CRC = crc32(0, data, ENV_SIZE-5)   data = "k=v\0" 串, 尾部 0xFF 填充
+#   YYH2913 defconfig: CONFIG_ENV_SIZE=0x4000, CONFIG_ENV_IS_IN_UBI=y, CONFIG_ENV_REDUNDANT=y
+#   flags 语义(env_check_redund): 255=obsolete, 0=active; 两份 CRC 都有效时按 flags 大小选
+ENV_SIZE_HEX="0x4000"
+ENV_LAYOUT_NOTE="crc(4,LE)+flags(1)+data(ENV_SIZE-5)"
+
+DRY=0; ACK_FLASH=0; ACK_ENV_FIX=0; MODE="status"; RELEASE_TAG=""; ASSET_NAME=""; EXPECT_SHA=""
 ROUTER_OVERRIDE=""; BACKUP_DIR=""
 
 die(){ echo "❌ $1" >&2; exit 1; }
@@ -68,6 +77,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --status)          MODE="status";;
     --plan)            MODE="plan";;
+    --fix-env-redundancy) MODE="fix-env";;
+    --ack-env-fix)     ACK_ENV_FIX=1;;
     --prepare)         MODE="prepare";;
     --flash)           MODE="flash";;
     --rollback)        MODE="rollback";;
@@ -755,6 +766,184 @@ probe_recovery(){
   if [ -n "$found" ]; then say "✅ Recovery 页可达: http://$found/"; else say "⚠️ 无候选 Recovery 页可达(路由器正常运行中时本就无响应)"; fi
 }
 
+
+# ---------- env 冗余对修复 ----------
+# 背景(2026-11-16 实机确认):
+#   YYH2913 血脉的 U-Boot 用 UBI 冗余 env 对:
+#     CONFIG_ENV_UBI_VOLUME="ubootenv"  -> /dev/ubi0_1
+#     CONFIG_ENV_UBI_VOLUME_REDUND="ubootenv2" -> /dev/ubi0_2
+#   本机 ubootenv(ubi0_1) 是 dynamic 卷但**内容全 0xFF**(0 个变量, CRC 必然不通过),
+#   真实 env 只存在于 ubootenv2(ubi0_2, static 卷, 34 个变量, CRC 有效)。
+#   => 冗余对实际只有一份保险, ubootenv2 一坏, U-Boot 走 env_set_default("bad CRC"),
+#      引导配方(bootcmd/http_recovery)全丢, 只能拆机 TTL。
+#
+# 修复原理(依据 U-Boot env_check_redund 的 flags 比较逻辑):
+#   把 ubootenv2 的 data 原样复制成 ubootenv 的有效副本, 但 flags 设 0xFF(obsolete):
+#     - 两份 CRC 都有效, flags1==255 && flags2==0 -> ENV_REDUND -> **仍用 ubootenv2**
+#       => 引导行为零变化, 不冒险
+#     - 但 ubootenv 变成有效副本 => ubootenv2 损坏时能回落, 兜底能力恢复
+#   **绝不写 ubootenv2**: 它是 static 卷, 写了就毁掉唯一有效保险。
+fix_env_redundancy(){
+  local ts; ts="${BACKUP_DIR:-$LOG_DIR/env-backups/$(date +%Y%m%d-%H%M%S)}"
+  say ""
+  hr; say "---- env 冗余对检查与修复 ----"; hr
+
+  # --- 1) 读取两卷现状 ---
+  local raw
+  raw=$(rssh "sh -s" 2>/dev/null <<'REMOTE'
+V1=/dev/ubi0_1; V2=/dev/ubi0_2
+echo "---T1_TYPE---"
+ubinfo -a 2>/dev/null | awk '/Name:[[:space:]]*ubootenv$/{f=1} f&&/Type:/{print $2;exit}'
+echo "---T2_TYPE---"
+ubinfo -a 2>/dev/null | awk '/Name:[[:space:]]*ubootenv2$/{f=1} f&&/Type:/{print $2;exit}'
+echo "---V1_NONFF---"
+dd if=$V1 bs=1M 2>/dev/null | tr -d '\377' | wc -c
+echo "---V1_VARS---"
+cat $V1 2>/dev/null | strings | grep -cE '^[a-zA-Z_][a-zA-Z0-9_]*='
+echo "---V2_VARS---"
+cat $V2 2>/dev/null | strings | grep -cE '^[a-zA-Z_][a-zA-Z0-9_]*='
+echo "---V1_SZ---"
+wc -c < $V1 2>/dev/null
+echo "---V2_SZ---"
+wc -c < $V2 2>/dev/null
+echo "---V2_ENV_SIZE---"
+dd if=$V2 bs=1 count=16384 2>/dev/null | wc -c
+REMOTE
+)
+  local t1 t2 v1nonff v1vars v2vars v1sz v2sz
+  t1=$(printf '%s\n' "$raw" | sed -n '/^---T1_TYPE---$/,/^---T2_TYPE---$/p' | grep -v '^---' | head -1)
+  t2=$(printf '%s\n' "$raw" | sed -n '/^---T2_TYPE---$/,/^---V1_NONFF---$/p' | grep -v '^---' | head -1)
+  v1nonff=$(printf '%s\n' "$raw" | sed -n '/^---V1_NONFF---$/,/^---V1_VARS---$/p' | grep -v '^---' | head -1)
+  v1vars=$(printf '%s\n' "$raw" | sed -n '/^---V1_VARS---$/,/^---V2_VARS---$/p' | grep -v '^---' | head -1)
+  v2vars=$(printf '%s\n' "$raw" | sed -n '/^---V2_VARS---$/,/^---V1_SZ---$/p' | grep -v '^---' | head -1)
+  v1sz=$(printf '%s\n' "$raw" | sed -n '/^---V1_SZ---$/,/^---V2_SZ---$/p' | grep -v '^---' | head -1)
+  v2sz=$(printf '%s\n' "$raw" | sed -n '/^---V2_SZ---$/,/^---V2_ENV_SIZE---$/p' | grep -v '^---' | head -1)
+
+  say "  ubootenv  (ubi0_1) 类型=$t1 大小=$v1sz 有效变量数=$v1vars 非0xFF字节=$v1nonff"
+  say "  ubootenv2 (ubi0_2) 类型=$t2 大小=$v2sz 有效变量数=$v2vars"
+  say "  env_t 布局: $ENV_LAYOUT_NOTE (CONFIG_ENV_SIZE=$ENV_SIZE_HEX = 16384)"
+
+  # --- 2) 幂等性: 已修好就直接退出 ---
+  if [ "${v1vars:-0}" -gt 0 ] 2>/dev/null; then
+    say ""
+    say "  ✅ ubootenv 已有 $v1vars 个有效变量 —— 冗余对已恢复, 无需修复(幂等)"
+    return 0
+  fi
+
+  if [ "${v2vars:-0}" -le 0 ] 2>/dev/null; then
+    die "ubootenv2 也没有有效变量 —— 两份都空, 无法从中恢复。此情形需人工介入(TTL), 本脚本不处理。"
+  fi
+  if [ "$t1" != "dynamic" ]; then
+    die "ubootenv 类型为 '$t1' 而非 dynamic —— 拒绝写入(动态卷才能安全覆盖)"
+  fi
+  if [ "${v1nonff:-0}" -gt 0 ] 2>/dev/null; then
+    die "ubootenv 存在 $v1nonff 个非 0xFF 字节但解析不出变量 —— 状态未知, 拒绝盲目覆写"
+  fi
+
+  # --- 3) 备份两卷(fail-closed) ---
+  say ""
+  say "  备份两卷到 $ts"
+  mkdir -p "$ts" || die "无法创建备份目录 $ts"
+  rssh "dd if=/dev/ubi0_1 bs=1M 2>/dev/null | gzip -c > /tmp/ubi0_1.gz; dd if=/dev/ubi0_2 bs=1M 2>/dev/null | gzip -c > /tmp/ubi0_2.gz" >/dev/null 2>&1
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER":/tmp/ubi0_1.gz "$ts/ubi0_1.gz" >/dev/null 2>&1 || die "备份 ubi0_1 失败 —— 中止, 未做任何写入"
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER":/tmp/ubi0_2.gz "$ts/ubi0_2.gz" >/dev/null 2>&1 || die "备份 ubi0_2 失败 —— 中止, 未做任何写入"
+  rssh "rm -f /tmp/ubi0_1.gz /tmp/ubi0_2.gz" >/dev/null 2>&1
+  [ -s "$ts/ubi0_1.gz" ] && [ -s "$ts/ubi0_2.gz" ] || die "备份文件为空 —— 中止, 未做任何写入"
+  rssh "fw_printenv" > "$ts/fw_printenv.before.txt" 2>&1 || true
+  rssh "ubinfo -a" > "$ts/ubinfo.before.txt" 2>&1 || true
+  say "  ✅ 备份完成: $(basename "$ts")"
+
+  # --- 4) 提取 ubootenv2 的 env_t 并构造 ubootenv 副本 ---
+  say ""
+  say "  提取 ubootenv2 的 env_t (16384 字节) 并构造 ubootenv 副本"
+  rssh "dd if=/dev/ubi0_2 bs=16384 count=1 2>/dev/null | gzip -c > /tmp/ubi0_2env.gz" >/dev/null 2>&1
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER":/tmp/ubi0_2env.gz "$ts/ubi0_2env.gz" >/dev/null 2>&1 || die "提取 ubootenv2 env_t 失败 —— 中止"
+  rssh "rm -f /tmp/ubi0_2env.gz" >/dev/null 2>&1
+
+  local img="$ts/ubootenv1.img"
+  python3 - "$ts/ubi0_2env.gz" "$img" <<'PYEOF'
+import sys, gzip, struct, zlib, hashlib
+gz, out = sys.argv[1], sys.argv[2]
+raw = gzip.open(gz, "rb").read()
+if len(raw) < 16384:
+    raise SystemExit("env_t 长度不足: %d" % len(raw))
+crc_stored = struct.unpack("<I", raw[0:4])[0]
+flags = raw[4]
+data = raw[5:5+16379]
+if zlib.crc32(data) & 0xffffffff != crc_stored:
+    raise SystemExit("源 env_t CRC 校验失败, 拒绝使用")
+# 构造副本: data 原样, flags 改为 255(obsolete) —— 使两份都有效时 U-Boot 仍选 ubootenv2
+img = struct.pack("<I", crc_stored) + b"\xff" + data
+if len(img) != 16384:
+    raise SystemExit("构造长度错误: %d" % len(img))
+if zlib.crc32(img[5:5+16379]) & 0xffffffff != struct.unpack("<I", img[0:4])[0]:
+    raise SystemExit("副本 CRC 自校验失败")
+open(out, "wb").write(img)
+print("    源 flags=0x%02x -> 副本 flags=0xff, sha256=%s" % (flags, hashlib.sha256(img).hexdigest()))
+PYEOF
+  [ $? -eq 0 ] || die "构造 ubootenv 副本失败 —— 中止, 未做任何写入"
+  local isha lsha
+  lsha=$(shasum -a 256 "$img" | awk '{print $1}')
+  say "  副本 sha256: $lsha"
+
+  if [ "$DRY" = "1" ]; then
+    say "  [dry-run] 将执行: scp 副本 -> /tmp/ubootenv1.img -> ubiupdatevol /dev/ubi0_1"
+    say "  [dry-run] 绝不触碰 ubootenv2"
+    return 0
+  fi
+  if [ "$ACK_ENV_FIX" != "1" ]; then
+    say "  [未确认] 写入 env 需要显式 --ack-env-fix"
+    return 1
+  fi
+
+  # --- 5) 写入 ubootenv (只写这一个卷) ---
+  say ""
+  say "  写入 ubootenv (只写 /dev/ubi0_1, 绝不触碰 ubootenv2)"
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$img" "$ROUTER":/tmp/ubootenv1.img >/dev/null 2>&1 || die "上传副本失败"
+  local devsha
+  devsha=$(rssh "sha256sum /tmp/ubootenv1.img 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d ' \n')
+  [ "$devsha" = "$lsha" ] || die "上传后 sha256 不符(设备 $devsha vs 本地 $lsha) —— 中止, 未写入"
+
+  local wout
+  wout=$(rssh "ubiupdatevol /dev/ubi0_1 /tmp/ubootenv1.img 2>&1" 2>/dev/null)
+  say "  ubiupdatevol: $(printf '%s' "$wout" | tail -2)"
+  case "$wout" in
+    *"error"*|*"Error"*|*"failed"*) die "ubiupdatevol 报错 —— 中止, ubootenv2 未受影响" ;;
+  esac
+  rssh "rm -f /tmp/ubootenv1.img" >/dev/null 2>&1
+
+  # --- 6) 回读校验 ---
+  say ""
+  say "  回读校验"
+  rssh "dd if=/dev/ubi0_1 bs=1M 2>/dev/null | gzip -c > /tmp/ubi0_1new.gz" >/dev/null 2>&1
+  scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER":/tmp/ubi0_1new.gz "$ts/ubi0_1.after.gz" >/dev/null 2>&1 || die "回读失败"
+  rssh "rm -f /tmp/ubi0_1new.gz" >/dev/null 2>&1
+
+  local nvars nflags nvars2
+  nvars=$(rssh "cat /dev/ubi0_1 2>/dev/null | strings | grep -cE '^[a-zA-Z_][a-zA-Z0-9_]*='" 2>/dev/null | tr -d ' \n')
+  nvars2=$(rssh "cat /dev/ubi0_2 2>/dev/null | strings | grep -cE '^[a-zA-Z_][a-zA-Z0-9_]*='" 2>/dev/null | tr -d ' \n')
+  nflags=$(rssh "dd if=/dev/ubi0_1 bs=1 skip=4 count=1 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n'" 2>/dev/null)
+  say "  ubootenv  变量数=$nvars  flags=0x$nflags"
+  say "  ubootenv2 变量数=$nvars2 (应保持不变)"
+  [ "${nvars:-0}" -gt 0 ] 2>/dev/null || die "回读校验失败: ubootenv 仍无有效变量 —— 中止, 请用备份排查"
+  [ "$nvars" = "$nvars2" ] || say "  ⚠️ 两卷变量数不同($nvars vs $nvars2) —— 请人工核对"
+
+  rssh "fw_printenv" > "$ts/fw_printenv.after.txt" 2>&1 || true
+  if diff -q "$ts/fw_printenv.before.txt" "$ts/fw_printenv.after.txt" >/dev/null 2>&1; then
+    say "  ✅ fw_printenv 输出与修复前逐行一致 —— 引导行为零变化"
+  else
+    say "  ⚠️ fw_printenv 输出有差异(应只是读取源从 ubootenv2 变为 ubootenv, 内容相同):"
+    diff "$ts/fw_printenv.before.txt" "$ts/fw_printenv.after.txt" | sed 's/^/      /' | head -20
+  fi
+
+  say ""
+  say "✅ env 冗余对已恢复: ubootenv 成为有效副本(flags=0xff obsolete), ubootenv2 仍是 active"
+  say "   现在即使 ubootenv2 损坏, U-Boot 也能回落到 ubootenv, 不再是单点保险。"
+  say "📦 备份与产物: $ts"
+  say "   回滚: ubiupdatevol /dev/ubi0_1 <(从 ubi0_1.gz 解压还原) 或直接写入全 0xFF 恢复空卷"
+  return 0
+}
+
 # ================= 主流程 =================
 case "$MODE" in
   status)
@@ -857,5 +1046,10 @@ case "$MODE" in
     ;;
   probe)
     probe_recovery
+    ;;
+  fix-env)
+    read_device_state
+    detect_lineage
+    fix_env_redundancy
     ;;
 esac
