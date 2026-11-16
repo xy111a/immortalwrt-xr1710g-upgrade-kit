@@ -8,6 +8,14 @@
 
 ---
 
+## ✅ 当前状态（2026-11-17 真机实证）
+
+**B+A 双刷已完成，设备正常**：固件 `20261115-5e152df9`（内核 6.18.60）+ 官方 11-11 chainloader `U-Boot XR1710G-2026-11-11-ga9a12de55890`。mtd3 前 937538B 与官方镜像逐字节一致，MAC 重复已修复（cpu/lan3/lan4 = `…64`/`…65`/`…66`），mtd1 未动，`post_flash_verify.sh` 重跑 3 pass / 0 fail / 2 warn。刷后基线在 `~/router-upgrade-logs/post-flash-20261117-0650/`。
+
+**TTL 不再需要**（用户 2026-11-17 明确）：U-Boot 已刷好，不拆机。TTL 工具保留为最后兜底，非刷机前置条件。下方第六/七轮的"待办清单"是历史快照。
+
+---
+
 ## 文件清单
 
 | 文件 | 作用 | 是否入库 |
@@ -201,7 +209,7 @@ br-lan = cpu = lan2 = lan3 = lan4 = 00:58:28:d7:63:60   ← 5 个接口同 MAC
 
 **`--probe-recovery` 已增强并实跑验证**：候选去重 + `RECOVERY_PROBE_IPS` 覆盖（可自检）+ 可达时给救援指引 + 不可达时给 4 条原因排查（没进恢复模式 / 网卡网段不对 / 网口不对 / 其实没变砖）。
 
-**残余（诚实列出）**：USB-TTL 硬件不在手边（`/dev` 下无 `tty.usb*` 节点），TTL 路径**命令单与工具已备好但未做实机演练**；`picocom/minicom` 未装（本机 `cu`/`screen` 够用）。
+**TTL 残余（2026-11-17 用户决定不需要）**：USB-TTL 硬件不在手边，因 U-Boot 已刷成功、不拆机，TTL 演练已撤销。工具与命令单保留为最后兜底（真变砖时才用）。
 
 ### 🔬 A/B 顺序定案（2026-11-16 第六轮只读实证）
 
@@ -216,7 +224,7 @@ br-lan = cpu = lan2 = lan3 = lan4 = 00:58:28:d7:63:60   ← 5 个接口同 MAC
 
 官方 20261112 release note 原文绑定："修复1710 的lan cpu 的mac地址相同问题…（**需刷入** chainloader `2026-11-11-a9a12de55890` 实现）"；1115 未对 chainloader 提新要求，chainloader 仓库 11-11 后无新提交 → **1115 + 11-11 chainloader 组合合法**。
 
-**B 之前必须先落实**：① TTL 救砖预案（USB-TTL 3.3V + 官方 `docs/flashing-xr1710g.md` TFTP 流程）；② 恢复页 IP 从 `192.168.255.1` → `192.168.0.1` 的入口重学；③ mtd3 备份双份异地（已完成）；④ MAC 基线逐接口比对（现役 `br-lan/cpu/lan2/lan3/lan4` MAC 全同 `00:58:28:d7:63:60`，正是 11-11 修的那个）。
+**B 之前必须先落实（2026-11-17 已完成/撤销）**：① ~~TTL 救砖预案~~ **已撤销**（U-Boot 刷成功，不拆机）；② 恢复页 IP `192.168.255.1` → `192.168.0.1` 入口已记录；③ mtd3 备份双份异地 ✅；④ MAC 基线逐接口比对 ✅（刷前全同 `…60` → 刷后 cpu/lan3/lan4 = `…64`/`…65`/`…66`）。
 
 ## 🔧 U-Boot(chainloader) 升级（独立窗口，与固件升级分离）
 
@@ -252,7 +260,7 @@ bash uboot_upgrade.sh --probe-recovery             # 救砖时探测恢复页
 - **NPU 修复溯源**：最新公开提交仍是 11-13 `9a70b257`（README），其前是 11-11 晚那批 NPU/MT7996 根因修复；release 基线逻辑上包含它们，但镜像内嵌 commit `5e152df9` 在公开 master **查不到**，作者从未明确声明「修了 #82」。`#82` 报告者 11-15 回复「升级以后需要双清，就好了」—— 用户经验，与「配置不兼容」呼应，非作者确认。
 - issue 动态：`#95`（1112 AP 模式 Qualcomm 重试风暴）作者 11-15 回复「刷入最新版测试」+ 复测方法，**未确认**已修；`#96`（XG2010G NPU 数据通路卡死）作者求补全日志；其余 open：`#94`（5G/6G VIF flowtable）、`#92`（B17 PCIe）、`#62`（PON 校准）。1029 的 `#81` bridger 断流仍靠停服务规避。
 - **72h 沉淀闸**：到 **11-18 14:51（北京）** 才过。叠加 48h 异常复位观察窗、镜像 commit 不可溯源、配置不兼容，**当前不刷机**。
-- **U-Boot**：当前 `2026.07-00760-gab7fd65100f1`（恢复页 `192.168.255.1`）；11-11 的 `a9a12de55890` 同源 chainloader、同 mtd3/0x600000/1MiB 槽位。**`ubi` vs `system` 的兼容疑点已于 2026-11-16 彻底闭环**（第六轮实证：官方 1112 固件内核 DTB 的 partition label 也是 `ubi`，与 1115/1016 逐属性一致；label=`system` 的那份是 chainloader 内嵌控制 DTB，非固件 DTB）。**成功率（第六轮上修）：只刷 U-Boot 88% / 只刷固件 70% / 两者都刷 72%**，推荐顺序：**先刷官方 11-11 chainloader**（fastmap 硬约束：固件内核写 fastmap，旧 chainloader 无 `ubi_attach_fastmap` 符号）→ 立即验证版本串/MAC/恢复页 IP `192.168.0.1` → 需要 NPU 改进再单独刷 1115 固件。刷前必备：mtd3 + mtd1/uenv 备份（已双份异地）+ MAC 基线 + TTL 串口就位。
+- **U-Boot**：当前 `2026.07-00760-gab7fd65100f1`（恢复页 `192.168.255.1`）；11-11 的 `a9a12de55890` 同源 chainloader、同 mtd3/0x600000/1MiB 槽位。**`ubi` vs `system` 的兼容疑点已于 2026-11-16 彻底闭环**（第六轮实证：官方 1112 固件内核 DTB 的 partition label 也是 `ubi`，与 1115/1016 逐属性一致；label=`system` 的那份是 chainloader 内嵌控制 DTB，非固件 DTB）。**成功率（第六轮上修）：只刷 U-Boot 88% / 只刷固件 70% / 两者都刷 72%**，推荐顺序：**先刷官方 11-11 chainloader**（fastmap 硬约束：固件内核写 fastmap，旧 chainloader 无 `ubi_attach_fastmap` 符号）→ 立即验证版本串/MAC/恢复页 IP `192.168.0.1` → 需要 NPU 改进再单独刷 1115 固件。刷前必备：mtd3 + mtd1/uenv 备份（已双份异地）+ MAC 基线。~~TTL 串口~~ 已撤销（2026-11-17 刷成功，不拆机）。
 - **固件建议（触发条件）**：过 72h → 复核新 issue 与作者是否确认 #82 → **先按新固件重建 kit（`--config-policy selective`）** → 人工核对 `config-restore-todo-*.md` 重配清单 → `upgrade_router.sh --ack-config-reset` 全清刷（**不走 LuCI OTA**）。旧的「全量配置保真」路径对 1115 已不适用，详见下方「wipe-config 版本适配」。
 
 ### ⚠️ 真刷前必须先重建 kit（2026-11-13 实测）

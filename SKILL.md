@@ -8,6 +8,26 @@ agent_created: true
 
 > 本 skill 来自一次真实的全清刷升级复盘。可直接调起，不必重踩坑。
 
+## ✅ 当前状态（2026-11-17 真机实证，最新）
+
+**B+A 双刷均已完成并验证通过，设备正常运行。后续加载本 skill 请勿再把刷机当作"待办"。**
+
+| 项 | 现状 |
+|---|---|
+| 固件 | **`20261115-5e152df9`**（内核 6.18.60），2026-11-16 下午刷入 |
+| U-Boot / chainloader | **官方 11-11 `U-Boot XR1710G-2026-11-11-ga9a12de55890`** |
+| 刷写完整性 | mtd3 前 937538B 与官方 slot.bin **逐字节 cmp 完全一致**（sha `5990b9fd…`） |
+| MAC 重复 | **已修复**：cpu=`…64`/lan3=`…65`/lan4=`…66`（刷前全撞 `…60`） |
+| mtd1 原厂 env | 未改动（sha `19aae29f…`） |
+| UBI | 6 卷全 OK、0 坏块、3.3s attach；fastmap 未写（内核未编 `CONFIG_MTD_UBI_FASTMAP`，不影响引导） |
+| 验证脚本 | `post_flash_verify.sh` 重跑 **3 pass / 0 fail / 2 warn** |
+| 刷后基线归档 | `~/router-upgrade-logs/post-flash-20261117-0650/` + 双份异地副本 |
+
+**TTL 结论（用户 2026-11-17 明确）**：U-Boot 已刷好，**不需要拆机**，不再主动准备 TTL 硬件。
+`ttl_rescue.sh` / `ttl_purchase_guide.md` 保留为**真变砖时的最后兜底资产**，非刷机前置条件。
+
+> 下方第六/七轮的"未闭环"清单是**当时（2026-11-16 14:30）的历史快照**，已被本节取代。
+
 ## 何时用
 用户要升级路由器固件（ImmortalWrt，第三方构建 naoki66，Airoha AN7581 平台）。
 **关键前提**：固件来自第三方 GitHub `naoki66/ImmortalWrt-for-Gemtek-brightspeed`（原仓库名 `ImmortalWrt-for-Gemtek-XR1710G` 已改名；非官方，官方 airoha/an7581 目录空）。⚠️ 上游把 XG2010G 机型 build 标为 GitHub "Latest"，`releases/latest` 不含 XR1710G 固件，故脚本统一改用**遍历 `releases` 取首个含 `gemtek_xr1710g` itb 的 release**（见 `upgrade_router.sh`/`router_watch.sh` 的 `REPO` 与 release 解析）。升前**必看该仓库 release note** 是否写"不建议保留配置升级"——若写，则**必须全清刷**（keep-settings OFF），不可走"保留 network/wireless"捷径（子系统重构会导致首启动网络异常）。
@@ -571,9 +591,9 @@ recovery_size_uboot=0x100000
 | mtd3 备份双份异地副本 | ✅ `~/router-upgrade-logs/uboot-backups/MIRROR-20261116/` + `/tmp/xr1710g-mirror-20261116/`，三份 sha256 一致 `a65bba65…` |
 | fit 卷 48.5MB 备份双份异地副本 | ✅ `~/router-upgrade-logs/fit-backup/MIRROR-20261116/`，sha256 `b9a550eb…` 一致 |
 
-### H. 仍未闭环的项（进入真实写入前必须处理）
+### H. 当时的未闭环项（2026-11-16 14:30 历史快照；已于 2026-11-17 全部完成或撤销，见文首「当前状态」）
 
-- ❌ **TTL 救砖预案未落地**：需要 USB-TTL 线 + 3.3V 电平 + 一台能跑 `minicom`/`picocom` 的机器，以及官方 `docs/flashing-xr1710g.md` 的 TFTP 流程。这是 B 步骤的**唯一无 SSH 退路**，必须先落实。
+- ~~❌ TTL 救砖预案未落地~~ → **2026-11-17 撤销**：U-Boot 已刷成功，用户明确不需拆机。TTL 降为最后兜底，非前置条件（工具与命令单保留在 `ttl_rescue.sh`）。
 - ❌ **恢复页 IP 变更未实地演练**：刷入 11-11 后恢复页由 `192.168.255.1` → `192.168.0.1`（官方 HTTP Recovery）。刷前必须重学入口与 IP，否则"兜底在位但连不上"。
 - ❌ **MAC 基线比对未执行**：`mac-baseline.txt` 已抓，但刷后需逐接口（`br-lan`/`cpu`/`lan2`/`lan3`/`lan4`）核对。已知问题：现役 `br-lan/cpu/lan2/lan3/lan4` MAC **全为 `00:58:28:d7:63:60`**（重复），官方 11-11 的 `give the XR1710G CPU port its own MAC offset` 正是修这个；factory 卷 WAN=`00:58:28:d7:63:5f` / LAN=`00:58:28:d7:63:60`（与基线一致，可还原）。
 - ❌ **`--probe-recovery` 未演练**：需在真实故障态下验证脚本能扫到 `192.168.0.1`。
@@ -688,7 +708,7 @@ RECOVERY_DHCP_BROADCAST_IPADDR "192.168.0.255"
 
 **为何不先刷固件（fastmap 硬约束）**：1115/1112/1016 内核 DTB 均带 `ubi.fm_autoconvert=1`，固件内核会向 UBI **写入 fastmap**；而旧 YYH2913 chainloader 的 `ubi_attach_fastmap` 符号 **strings 命中 0**（无 fastmap 支持），官方 11-11 才有全套（`CONFIG_MTD_UBI_FASTMAP=y` + `AUTOCONVERT=1`）。⇒ **先装 fastmap 读取器（B），再让内核写 fastmap（A）**，比反过来更稳。
 
-**刷前必备**：备份 mtd3 + mtd1/uenv、确认新恢复页 `192.168.0.1`、MAC 基线快照、TTL 串口就位（配方：`ECNT>` 下 `setenv bootcmd 'flash read 0x600000 0x100000 $loadaddr; bootm' + saveenv + reset`）。
+**刷前必备（2026-11-17 已全部完成）**：备份 mtd3 + mtd1/uenv ✅、确认新恢复页 `192.168.0.1` ✅、MAC 基线快照 ✅。~~TTL 串口就位~~ **已撤销**（U-Boot 刷成功，用户明确不拆机；且不要在 `ECNT>` 下 `saveenv`——会覆写原厂 env 毁掉启动配方）。
 
 ## 📌 当前固件状态（2026-11-15，会过期）
 
