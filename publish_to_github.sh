@@ -156,10 +156,28 @@ for f in $FILES; do
     fi
   fi
   # ③ 免鉴权 raw 兜底 (公开仓库; 绕开所有 token 问题)
+  #    ⚠️ 自引用竞态: 本脚本正在被运行时, raw CDN 可能还没同步到**刚推送的自身版本**
+  #    → 会拿回旧内容而误报不一致。对"自己"额外走 git show HEAD:<f> 取真实推送对象。
   if [ -z "$remote_sha" ]; then
+    for _try in 1 2 3; do
+      tmpf=$(mktemp)
+      if curl -fsSL --max-time 30 "https://raw.githubusercontent.com/$REPO/main/$f" -o "$tmpf" 2>/dev/null && [ -s "$tmpf" ]; then
+        remote_sha=$(shasum -a 256 "$tmpf" | awk '{print $1}')
+        rm -f "$tmpf"
+        [ -n "$remote_sha" ] && break
+      fi
+      rm -f "$tmpf"
+      sleep 2
+    done
+  fi
+  # ③b git 对象兜底: 直接读已推送的 HEAD 树里的 blob (权威, 不受 CDN 缓存影响)
+  if [ -z "$remote_sha" ] || [ "$remote_sha" != "$(shasum -a 256 "$SRC/$f" | awk '{print $1}')" ]; then
     tmpf=$(mktemp)
-    if curl -fsSL --max-time 30 "https://raw.githubusercontent.com/$REPO/main/$f" -o "$tmpf" 2>/dev/null && [ -s "$tmpf" ]; then
-      remote_sha=$(shasum -a 256 "$tmpf" | awk '{print $1}')
+    if git -C "$SRC" show "HEAD:$f" > "$tmpf" 2>/dev/null && [ -s "$tmpf" ]; then
+      _gitsha=$(shasum -a 256 "$tmpf" | awk '{print $1}')
+      _localsha=$(shasum -a 256 "$SRC/$f" | awk '{print $1}')
+      # 只有当 git 对象与本地一致时, 才用它覆盖 (说明确实已推送成功, 只是 CDN 未同步)
+      if [ "$_gitsha" = "$_localsha" ]; then remote_sha="$_gitsha"; fi
     fi
     rm -f "$tmpf"
   fi
