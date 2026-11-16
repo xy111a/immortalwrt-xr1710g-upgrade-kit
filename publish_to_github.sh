@@ -21,7 +21,7 @@ WORK="${GIT_WORK_DIR:-/tmp/kit_repo}"
 # skill/router-immortalwrt-upgrade/SKILL.md 是平台加载 skill 的入口副本(带 frontmatter),
 #   与根目录 SKILL.md 正文必须保持一致 —— 2026-10-30 发现它曾停留在旧版残桩(缺 OpenClash 排障章节),
 #   现同步为最新版, 避免两份文档打架导致平台加载到过期说明。
-FILES="SKILL.md upgrade_router.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md skill/router-immortalwrt-upgrade/SKILL.md"
+FILES="SKILL.md upgrade_router.sh uboot_upgrade.sh build_kit.sh zzz-restore-router router_watch.sh publish_to_github.sh check_openclash.sh scripts/secret-scan.sh LICENSE README.md skill/router-immortalwrt-upgrade/SKILL.md"
 
 # 2026-11-04 修复: 原先 commit -m 硬编码了一段 R10 文案, 导致之后每次推送的提交信息
 # 都与实际改动不符(11-02 / 11-04 两次推送已受影响)。现在支持 -m/--msg 显式指定;
@@ -53,6 +53,17 @@ else
   rm -rf "$WORK"
   env -u HTTP_PROXY -u HTTPS_PROXY gh repo clone "$REPO" "$WORK" 2>&1 | tail -3 || { echo "❌ 克隆失败, 请检查网络/gh 登录"; exit 1; }
 fi
+
+# 2026-11-16: 两份 SKILL.md(根目录 + skill/router-immortalwrt-upgrade/)历史上漂移过多次
+#   (平台加载的是嵌套那份, 根目录那份给人读)。发布前强制校验二者一致, 不一致直接中止 ——
+#   否则会出现"GitHub 上的说明"与"WorkBuddy 实际加载的说明"不是同一份。
+echo "=== 校验两份 SKILL.md 一致性 ==="
+if ! diff -q "$SRC/SKILL.md" "$SRC/skill/router-immortalwrt-upgrade/SKILL.md" >/dev/null 2>&1; then
+  echo "❌ 两份 SKILL.md 不一致, 中止发布:"
+  diff "$SRC/SKILL.md" "$SRC/skill/router-immortalwrt-upgrade/SKILL.md" | head -20
+  exit 1
+fi
+echo "  ✅ 两份 SKILL.md 一致"
 
 echo "=== 复制源码文件到工作副本 ==="
 for f in $FILES; do

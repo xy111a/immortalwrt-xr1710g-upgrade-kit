@@ -17,6 +17,7 @@ agent_created: true
 - `upgrade_router.sh` — Mac 侧编排器（上传 itb+kit → `sysupgrade -n -f` → 轮询重连 → 终验；支持 `--dry-run` / `--auto` / `--force`）。
 - `zzz-restore-router` — uci-defaults 首启动自举脚本（设 LAN、三频 SSID、开 flow offload、注入 rc.local 装 OpenClash）。
 - `build_kit.sh` — 本地从源码组装 `kit.tar.gz`（**不入库**；含你的 SSH 公钥、可选 OpenClash 配置、**强烈建议用 `--openclash-core` 烘焙内核**）。
+- `uboot_upgrade.sh` — **U-Boot(chainloader) 独立升级/回滚子流程**（与固件升级完全分离，两个独立窗口）：只读探测 / 规划 / 备份下载校验 / 真刷 / 回滚 / Recovery 探测。详见下方「U-Boot 执行手册」。
 - `*.itb` — 待刷固件（sha256 须先校验；从作者 Release 下载，不要入库）。
 
 > **敏感信息处理方式（零明文）**：`zzz-restore-router` 与 `upgrade_router.sh` 源码**不存储任何明文密码/WiFi key/订阅/MAC**。升级前 `upgrade_router.sh` 的 `collect_runtime()` 会从活路由器实时抓取 root shadow hash + WiFi key + 三频 SSID + OpenClash 配置 + **DHCP 静态租约** + **SSH host key**（dropbear，使升级后其他终端无需更新 known_hosts），注入**临时** kit（仅存于 `/tmp`，脚本退出即清理）。DHCP 租约以 `etc/dhcp-hosts.uci`（每行 `host <name> <mac> <ip> <leasetime>`）随 kit 携带、首启动自举按文件重建——不写死任何 MAC，设备变更后升级自动跟手。因此本仓库可安全公开。
@@ -58,7 +59,8 @@ agent_created: true
 2. **sysupgrade -f 还原的 tar 会保留源机 uid** → `/etc/dropbear` 属主变成原机的 uid（如 503）→ dropbear 报 `must be owned by user or root` 并**直接禁用公钥认证** → SSH key 登录全挂（密码仍能进）。自举脚本必须 `chown root:root /etc/dropbear /etc/dropbear/authorized_keys`（原只 chmod 漏 chown，这是根因）。
 3. **authorized_keys 每行必须换行结尾**。缺尾 `\n` 时 `cat >>` 追加会拼成非法长行，两把 key 全被拒。
 4. **SSH host key 变更陷阱**：干净刷后路由器默认生成**全新 host key**，`StrictHostKeyChecking=accept-new` 语义是"接受新 key、拒绝密钥变更" → 对 clean flush **直接拒连**（脚本误报"重连失败"）。**根治**：`upgrade_router.sh` 的 `collect_runtime()` 在刷前从活路由抓取 `/etc/dropbear/dropbear_*_host_key` 注入 kit，`sysupgrade -f` 还原后 host key 不变 → **其他终端零感知，无需 `ssh-keygen -R`**；自举脚本 `zzz-restore-router` 再 `chown root:root` 这些 host key 兜底。仅当抓取失败才降级：轮询/终验前 `ssh-keygen -R <路由器地址或别名>` 清旧 key，或验证用 `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`。
-5. **U-Boot env 校验陷阱**：`fw_printenv` 默认 `fw_env.config` 把 **mtd0 "vendor" 陈旧出厂副本列首位**，读它报 `Incompatible flash types!` 即中止，读不到真正活跃 env → **会误判兜底消失**。活跃 env 在 **UBI 卷 ubi0_1/ubi0_2**，正确校验：`cat /dev/ubi0_2 | strings | grep -E '^bootcmd='`。根治：升级脚本终验段直接读 UBI 卷，不依赖 fw_env.config。
+5. **U-Boot env 校验陷阱（2026-11-16 实测校准）**：活跃 env 在 **UBI 卷 ubootenv(ubi0_1) / ubootenv2(ubi0_2)**，正确校验：`cat /dev/ubi0_2 | strings | grep -E '^bootcmd='`。**旧文档说「`fw_env.config` 把 mtd0 陈旧副本列首位导致读不到真 env」——此说法已被实机证伪**：本机 `/etc/fw_env.config` 实为 `/dev/ubi0_1 0x0 0x4000 0x1f000 1` + `/dev/ubi0_2 ...`，指向的正是**活跃 UBI 卷**，`fw_printenv` 读到的 `bootcmd=run boot_ubi || http_recovery` 与直读 UBI 卷完全一致。但结论不变：**判据一律直读 UBI 卷**（不依赖 fw_env.config，因为该文件本身可能被刷机覆盖，且它只覆盖两个卷、非完整真相），且**必须逐卷读** —— 旧实现把 ubi0_1/ubi0_2/fw_printenv 三路并联进同一管道，任一路命中即判「兜底在位」，掩盖了「哪一路真的在位」。现已改为逐卷分离判定 + 冗余健康度报告。
+   - **🔴 2026-11-16 实测新风险：env 冗余对已单点失效** —— `ubi0_1`(ubootenv) 内容**全 0xFF（空）**，真实 env 只存在于 `ubi0_2`(ubootenv2)。一旦该卷被写坏，兜底彻底消失且无处可退。**刷 U-Boot 前应先修复冗余对**（`mkenvimage` 重建两份一致 env），否则是在"只有一份保险"的状态下动引导链。
 6. **⚠️ BusyBox tar 没有 `--exclude`（2026-10-21 实测，曾长期静默失败）**：路由器 busybox tar 只认 `-X <模式文件>`；写 `--exclude=xxx` 会报 `unrecognized option` 并使整条抓取管道失败——**而失败被 fallback 分支掩盖**，表现为"功能在文档里、实际从未跑过"（P1 的 oc-data 另存、P2 的真实配置还原都因此静默失效过，直到只读审计+试抓测试才发现）。三条纪律：① 路由侧 tar 一律用 `-X`；② Mac 侧 bsdtar 解 busybox 流**退出码不可信**（对 `._*` 条目会报 `Truncated tar archive` 但文件已抽全），成功判定必须校验落盘内容而非 `$?`；③ 抓取/打包链路要有用 `find -name '._*' -delete` 的本地兜底清理。
 
 ## ⚠️ 执行机拓扑前提（P0，已加固）
@@ -196,6 +198,72 @@ agent_created: true
 
 验证：`bash -n` 双脚本通过；`upgrade_router.sh --dry-run` 应同时打印「沉淀闸 <72h」与「测试版闸」告警；`router_watch.sh --check` 应在测试版闸处停止且零下载；`scripts/secret-scan.sh` 无命中。**全程只读，未刷机、未改路由器配置。**
 
+## ⚠️ NAND 写入路径踩坑（2026-11-16 实机故障，两轮实证，**别再改回 dd bs=1M**）
+
+**故障现象**：`dd if=镜像 of=/dev/mtd3 bs=1M conv=fsync` 打印 `WRITE_BEGIN` 后**没有 `WRITE_DONE`**，dd 静默非零退出。
+
+**根因（第二轮才定位准，第一轮判断错了）**：
+- ❌ 第一轮误判：「`bs=1M` 不是 erasesize 的整数倍 → 必然 EINVAL」。**错** —— 本机 `erasesize=131072`（128 KiB），1 MiB 恰好是它的整数倍（`1048576 % 131072 == 0`）。
+- ✅ 真根因：**NAND mtd 字符设备只接受「整擦除块」写入**。官方 chainloader 镜像长 **937538** 字节 = 7×131072 + **20034 字节尾巴**，非整除 → dd 的最后一次 `write()` 长度不对齐 → 内核返回 **EINVAL**。换 `bs=128K` 尾巴照样不对齐 —— 关键在**镜像长度**，不在 `bs` 选多少。
+
+**修法（已落地 `uboot_upgrade.sh`）**：
+1. **写前把镜像用 `0xFF` pad 到 erasesize 整数倍**（937538 → 1048576，填 111038 字节 0xFF）。0xFF 与本机 mtd3 现有空闲区一致，不引入额外差异；pad 后双入口 magic 不变。
+2. 优先 `mtd write`（内核侧处理擦除与对齐）+ `mtd verify` 逐字节校验；不可用才回落 `dd bs=erasesize`。
+3. **不预先整分区 `mtd -e erase`** —— 让 `mtd write` 逐块擦后即写，把"slot 全空"的窗口从 1 MiB 缩到 1 个 128 KiB 块；只有逐块写明确失败才整分区擦除重试一次。
+4. ⚠️ **rc 捕获纪律**：绝不能 `cmd | tail -2` 后取 `$?` —— 那是 `tail` 的退出码，**会把失败伪装成成功**。远端统一用 `run_logged`：`cmd > log 2>&1; rc=$?; cat log`。
+
+**副作用**：mtd 二进制里没有 `padd` 相关字符串 → 该版本 `mtd write` **不会自动补齐末块**，所以第 1 步的自行 pad 是必需的，不能省。
+
+**离线验证（已通过）**：pad 后双 magic 完好、尾部全 0xFF、8 次写入全部 128 KiB 对齐、整块回读 == pad 后镜像、**回滚写回备份逐字节完全恢复原 sha256**。
+
+## 🔧 U-Boot 执行手册（2026-11-16 新增，评估基线 → 可执行流程）
+
+**为什么单独成篇**：固件升级刷 UBI/fit 卷，U-Boot 升级刷 mtd3(chainloader) + env 层，**写入路径、失败模式、回退手段完全不同**。塞进同一次 sysupgrade 等于同时引入两个未验证变量，变砖后无法归因。**结论：两个独立窗口，先固件稳定，再 U-Boot。**
+
+**执行 `uboot_upgrade.sh`（本机路径 = HTTP Recovery 的 uboot 目标）**：
+
+```bash
+cd ~/.workbuddy/skills/router-immortalwrt-upgrade
+
+# 1) 只读探测现状（mtd 布局 / env 冗余健康度 / chainloader 版本串 / magic）
+bash uboot_upgrade.sh --status
+
+# 2) 规划：官方选片 + digest + 结构校验（不写入）
+bash uboot_upgrade.sh --plan
+
+# 3) 备份 + 下载 + 校验（不写入任何分区）—— 推荐先跑这步
+bash uboot_upgrade.sh --prepare
+
+# 4) 真刷（必须显式 --ack-uboot-flash；写后整块回读比对，不符则不重启）
+bash uboot_upgrade.sh --flash --ack-uboot-flash
+
+# 5) 回滚（用 prepare 阶段的备份写回旧 chainloader）
+bash uboot_upgrade.sh --rollback --ack-uboot-flash --backup-dir ~/router-upgrade-logs/uboot-backups/<ts>
+
+# 6) 救砖时探测 Recovery 页
+bash uboot_upgrade.sh --probe-recovery
+```
+
+**脚本内置的五道闸**（对应"变砖"的每个入口）：
+1. **官方选片纪律**：只认本机机型 `xr1710g-chainloader-*-slot.bin`，只认 `*-slot.bin`（**绝不刷 `u-boot.bin` / 裸 `.itb`** —— 上游明确说裸 FIT 不能通过 HTTP Recovery 上传）。release body 常列 xg2010g 的 sha256 但该 asset 可能未上传，XR1710G 与 XG2010G 镜像**不通用**，混刷直接变砖。
+2. **备份 fail-closed**：刷前必备份 `mtd3`(chainloader 1MiB) + `mtd1`(uenv 2MiB) + `ubi0_1`/`ubi0_2` + `/proc/mtd` + `fw_printenv` 全量 + `ubinfo`，落盘并生成 sha256；备份不全/大小不符直接中止。
+3. **三层 sha256**：下载后本机校验 → 设备侧上传后复算 → 与 GitHub `asset.digest` 官方基准比对，任一不符即中止。
+4. **双入口 magic 校验**（实机确认的判据）：`0x0` = `27 05 19 56`（prefix shim）+ `0x2100` = `d0 0d fe ed`（内嵌控制 DTB `airoha,xr1710g-chainloader-control`），且镜像必须 ≤ 1MiB。**已做负向测试**：裸 itb / 随机数据 / 超大文件全部正确拒绝。
+5. **写后整块回读比对**：回读前 N 字节与源镜像 sha256 必须一致，**不一致则拒绝重启**（设备仍可重写），并提示用备份回滚。
+
+**绝不触碰 env**：脚本只写 chainloader 分区，**从不执行 `saveenv` / `env default -a`**。原因：`uenv`(mtd1) 是**原厂 U-Boot 的 env 分区**，二级 chainloader 只是共用读取；一旦在 chainloader 里 `saveenv`，原厂环境会被整套替换成 chainloader 的环境（如 `bootcmd=run boot_ubi || http_recovery`），原厂 U-Boot 再启动时找不到自己的启动配方（表现为卡在 `ECNT>` 报 `Unknown command 'ubi'`）。恢复办法是在**原厂** `ECNT>` 提示符下 `setenv bootcmd 'flash read 0x600000 0x100000 0x81800000; bootm 0x81800000'` + `saveenv` + `reset`。
+
+**⚠️ 本机现状与上游教程前提不同（2026-11-16 实机确认）**：上游 `docs/flashing-xr1710g.md` 的 TTL+TFTP 流程针对的是「**原厂** U-Boot(`ECNT>`)」状态；**本机已处于「已刷 chainloader」状态**（mtd3 已是 chainloader FIT，mtd1 uenv 的 bootcmd 已是 `flash read 0x600000 0x100000 $loadaddr; bootm`）。所以本机日常路径是「HTTP Recovery 的 uboot 目标上传 `*-slot.bin`」，**拆机 TTL 是最后的救砖手段而非常规路径**。
+
+**✅ 兼容点已闭环（2026-11-16 离线实证，撤销此前"system vs ubi 可能变砖"的判断）**：本机 mtd4 名为 `ubi`、`recovery_ubi_part=ubi`；官方 11-11 chainloader 的上游 DTS 标签为 `system`。**两者并不冲突**，原因有两层实证：
+- **Recovery 侧写固件只按 UBI 卷名 `fit` 写**（`recovery_mtd=fit`），**与分区 label 无关** —— 所以 `ubi` / `system` 命名差异在刷固件路径上无影响。
+- **官方文档 §7.2 明写**：一级/二级引导都按**固定偏移**读取（`uboot_ofs=0x600000`、`recovery_size_uboot=0x100000`），**不查分区表** —— 所以二级 chainloader 也不会因为 `system` 标签不存在而失败。
+- 附：官方 DTB 的分区表与本机 `/proc/mtd` **逐一精确吻合**（`@0=bootloader(2M)` / `@200000=uenv(2M)` / `@400000=dsd(2M)` / `@600000=chainloader(1M)` / `@700000=system(0x1b700000)`）；本机 YYH2913 DTB 只是把 `0x0-0x600000` 合并为 `vendor`（6MB）并多出 ubi1.5/ubi1.0 两个备选档。
+
+**⚠️ 撤销的另一处旧判断**：「一级 bootcmd 不兼容」同样被推翻 —— `0x602100 - 0x600000 = 0x2100`，官方 SSH 文档回读偏移正是 `skip=8448`（=0x2100），YYH2913 README 明写 dual-entry 支持从 `0x600000` 无参 `bootm`。本机 uenv 实测 `bootcmd=flash read 0x600000 0x100000 $loadaddr; bootm` **与官方完全一致**。
+
+**恢复页地址会变**：当前血脉 `192.168.255.1` → 11-11 chainloader `192.168.0.1`（DHCP 改为按 MAC 的租约表）。`upgrade_router.sh` 现维护状态档案 `~/router-upgrade-logs/uboot-state.env`（恢复页 IP / 触发方式 / U-Boot 版本串 / env 健康度 / 最近实测时间），重连候选与失败提示一律读它，**不再散落硬编码**。刷完 U-Boot 请更新该文件并实测一次 Recovery 页。
+
 ## 🧭 U-Boot / chainloader 评估基线（2026-11-12 复核，取代早期误判）
 
 **先记住四条曾经判错、不要再重复**：
@@ -214,7 +282,20 @@ agent_created: true
 - 11-11 release 只挂 1 个 asset（xr1710g 937538 B），发布说明却列了 2 个文件并给出 xg2010g 的 SHA256 —— 产物与说明不符，XG2010G 镜像缺失。
 - 两条并行线：上游 `YYH2913/http-uboot` 11-02 仍在更新（分区备份下载、RTL8261 延迟初始化），恢复页仍 `192.168.255.1`。评估「新版本 U-Boot」时别只看 naoki66 新仓库。
 
-**结论（截至 2026-11-12）**：不单独刷 U-Boot；与「把 NPU 根因修复编进去的下一版正式固件」配套做（1112 发布说明已把 MAC 修复绑成固件+U-Boot 配套件，推翻了早期「先固件、U-Boot 后置」的顺序）。刷前备份 mtd3 + mtd1/uenv、确认新恢复页 `192.168.0.1`、验证 `ubi`/`system` 恢复路径、备好 TTL。
+**结论（2026-11-16 修订，取代 2026-11-12 旧结论）**：不再「一概不单独刷」，改为**按路径量化 + 分步执行**（数值来自多维度离线实证，见下节）：
+
+| 路径 | 成功率 | 说明 |
+|---|---|---|
+| A 只刷固件（不碰 U-Boot） | **55%** | 链路最短，但本机 mtd3 是 YYH2913 非原版 chainloader，与新固件的 FDT fixup/MAC offset 组合未验证 |
+| B 只刷 U-Boot（不换固件） | **80%** | 引导链逐环已实证吻合；但二级 U-Boot 无 `flash` 命令，若固件不匹配可能停在 `Unknown command` |
+| C U-Boot + 连带刷一次固件 | **62%** | 变量最多，但**这是唯一自洽的组合**（官方 chainloader 按官方固件布局设计），且 A/B 的失败模式在 C 里被"一起换"规避 |
+
+**推荐执行顺序（三段式，每段之间留出验证窗口）**：
+1. **先只刷固件**（`upgrade_router.sh`，A 路径）→ 拿到运行期实证（能否起来、MAC 是否变、env 是否被覆写）。这一步不碰引导链，失败可原地恢复。
+2. **修 env 冗余对**（`ubi0_1` 目前全空，真实 env 只在 `ubi0_2`）→ 用 `mkenvimage` 重建两份一致 env，把"只有一份保险"变成两份。
+3. **再刷 U-Boot + 连带刷一次官方固件**（C 路径）→ 刷前必做：备份 mtd3 + mtd1/uenv、抓 MAC 基线、确认新恢复页 `192.168.0.1`、备 TTL 串口。
+
+**刷前必备**：备份 mtd3 + mtd1/uenv、确认新恢复页 `192.168.0.1`、MAC 基线快照、TTL 串口就位（配方：`ECNT>` 下 `setenv bootcmd 'flash read 0x600000 0x100000 $loadaddr; bootm' + saveenv + reset`）。
 
 ## 📌 当前固件状态（2026-11-15，会过期）
 

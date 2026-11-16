@@ -211,17 +211,107 @@ precheck_recent_crash(){
   echo "✅ 无近期异常复位痕迹(或已超过 48h 观察窗)"
 }
 
+# ---------- U-Boot 兜底状态档案(2026-11-16 新增) ----------
+# 问题: 恢复页地址不是常量 —— 旧 chainloader 血脉是 192.168.255.1, 11-11 新版是
+#   192.168.0.1, 且新版是**按 MAC 的 DHCP 租约表**下发(不同 MAC 可能拿到不同 IP)。
+#   原实现靠 grep mtd3 里的 IP 字符串 + 硬编码兜底, 刷完 U-Boot 后必然失真。
+# 方案: 维护一份持久化状态档案 uboot-state.env, 记录当前已知的 U-Boot 血脉 /
+#   恢复页地址 / 触发方式 / 最近实测时间, 刷 U-Boot 后由用户或流程更新, 之后所有
+#   提示、重连候选、失败指引一律读它, 不再散落硬编码。
+UBOOT_STATE_FILE="${UBOOT_STATE_FILE:-$HOME/router-upgrade-logs/uboot-state.env}"
+PROBE_RECOVERY_OK=0; PROBE_RECOVERY_IP=""
+UBOOT_STATE_VERSION=1
+
+uboot_state_load(){
+  # 只接受 KEY=VALUE 的白名单键, 避免被任意内容注入
+  if [ -f "$UBOOT_STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$UBOOT_STATE_FILE" 2>/dev/null || true
+  fi
+  UBOOT_STATE_RECOVERY_IP="${UBOOT_STATE_RECOVERY_IP:-}"
+  UBOOT_STATE_TRIGGER="${UBOOT_STATE_TRIGGER:-}"
+  UBOOT_STATE_VERSION_STR="${UBOOT_STATE_VERSION_STR:-}"
+  UBOOT_STATE_ENV_HEALTH="${UBOOT_STATE_ENV_HEALTH:-}"
+  UBOOT_STATE_LAST_VERIFIED="${UBOOT_STATE_LAST_VERIFIED:-}"
+}
+
+uboot_state_set(){
+  # 用法: uboot_state_set KEY VALUE
+  local k="$1" v="$2"
+  mkdir -p "$(dirname "$UBOOT_STATE_FILE")" 2>/dev/null || return 1
+  local tmp="$UBOOT_STATE_FILE.tmp.$$"
+  {
+    echo "# U-Boot 兜底状态档案 —— 由 router-immortalwrt-upgrade skill 维护"
+    echo "# 刷 U-Boot 后请更新 RECOVERY_IP / VERSION_STR / TRIGGER 并写回本文件"
+    echo "UBOOT_STATE_VERSION=$UBOOT_STATE_VERSION"
+    grep -E '^(UBOOT_STATE_RECOVERY_IP|UBOOT_STATE_TRIGGER|UBOOT_STATE_VERSION_STR|UBOOT_STATE_ENV_HEALTH|UBOOT_STATE_LAST_VERIFIED)=' "$UBOOT_STATE_FILE" 2>/dev/null       | grep -v "^$k=" || true
+    echo "$k=$v"
+  } > "$tmp" 2>/dev/null || return 1
+  mv -f "$tmp" "$UBOOT_STATE_FILE" 2>/dev/null || return 1
+  return 0
+}
+
+uboot_state_save(){
+  uboot_state_set UBOOT_STATE_RECOVERY_IP    "${UBOOT_STATE_RECOVERY_IP:-}"
+  uboot_state_set UBOOT_STATE_TRIGGER       "${UBOOT_STATE_TRIGGER:-}"
+  uboot_state_set UBOOT_STATE_VERSION_STR   "${UBOOT_STATE_VERSION_STR:-}"
+  uboot_state_set UBOOT_STATE_ENV_HEALTH    "${UBOOT_STATE_ENV_HEALTH:-}"
+  uboot_state_set UBOOT_STATE_LAST_VERIFIED "${UBOOT_STATE_LAST_VERIFIED:-}"
+}
+
+# 恢复页 HTTP 探测: 真去戳一下候选地址, 判断 T2 兜底入口是否真的在位。
+# 刷 U-Boot 后 / 救砖时, 唯一能进系统的路就是 Recovery 页 —— 它必须在**事前**被证实可达,
+# 而不是靠文档里写着一个 IP 就相信。
+probe_recovery_page(){
+  # 用法: probe_recovery_page [候选IP...]
+  local cands=("$@") ip code
+  [ ${#cands[@]} -eq 0 ] && cands=(192.168.255.1 192.168.0.1)
+  for ip in "${cands[@]}"; do
+    [ -z "$ip" ] && continue
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 --noproxy '*' "http://$ip/" 2>/dev/null)
+    if [ "$code" = "000" ]; then
+      echo "   ✗ http://$ip/ 无响应"
+    else
+      echo "   ✓ http://$ip/ 有响应 (HTTP $code)"
+      PROBE_RECOVERY_OK=1; PROBE_RECOVERY_IP="$ip"
+    fi
+  done
+  return 0
+}
+
 # ---------- 刷前 T2 兜底核验(2026-11-13 新增, 把"执行顺序第 1 步"从文档变成代码) ----------
 # 安全模型最底层是 U-Boot 常住 bootcmd=run boot_ubi || http_recovery。此前脚本只在"终验"里
 # echo 打印一次, 刷前从不判定 —— 万一刷 U-Boot / 改 env 把兜底改没了, 脚本仍会照常刷机,
 # 真出事时才发现进不去 Recovery。现改为刷前 fail-closed 校验, 并把刷前基线存进全局,
 # 供 post_upgrade_report 输出"刷前 vs 刷后"对比(刷过 chainloader 后恢复页会变, 必须能看出来)。
 T2_PRE_BOOTCMD=""; T2_PRE_UBOOT=""; T2_PRE_RECOVERY_IP=""; T2_PRE_OK=0
+T2_ENV_HEALTH="unknown"; T2_ENV_LIVE=""
+# 2026-11-16: 实机复核推翻了一个假设并暴露新风险, 故重写本函数。
+#   实测 A: /etc/fw_env.config 指向的是**活跃 UBI 卷**(ubootenv=/dev/ubi0_1,
+#           ubootenv2=/dev/ubi0_2), 不是 mtd0 的厂商陈旧副本 —— fw_printenv 本身是可信来源。
+#   实测 B: ubi0_1(ubootenv) 内容已**全 0xFF(空)**, 真实 env 只存在于 ubi0_2(ubootenv2)
+#           单点 —— 即 env 冗余对已失效, 一旦该卷被写坏, bootcmd/http_recovery 兜底即失效。
+#   故 T2 判据改为: 只认活跃 UBI 卷里的 bootcmd(不含 fw_printenv 兜底), 并额外报告
+#   env 冗余健康度(单点=高风险, 刷 U-Boot 前必须先修)。
 verify_t2_fallback(){
   echo "---- T2 兜底(U-Boot) 刷前核验 ----"
+  uboot_state_load
+  if [ -n "$UBOOT_STATE_RECOVERY_IP" ]; then
+    echo "   已加载状态档案: 恢复页=$UBOOT_STATE_RECOVERY_IP / U-Boot=${UBOOT_STATE_VERSION_STR:-?} / 触发=${UBOOT_STATE_TRIGGER:-?}"
+  else
+    echo "   ⚠️ 无 U-Boot 状态档案($UBOOT_STATE_FILE) —— 恢复页地址将退化为推定值"
+  fi
   local raw
   raw=$(ssh -o ConnectTimeout=10 "$ROUTER" 'sh -s' 2>/dev/null <<'REMOTE'
-( cat /dev/ubi0_2 2>/dev/null; cat /dev/ubi0_1 2>/dev/null; fw_printenv 2>/dev/null ) | strings 2>/dev/null | grep -E '^bootcmd=|^recovery_mtd=|^boot_ubi=' | sort -u
+# 只读活跃 UBI 卷(ubootenv / ubootenv2), 不用 fw_printenv 兜底 ——
+# 旧实现把三路来源并联进同一管道, 任一路含 http_recovery 就判在位, 掩盖了"哪一路真的在位"。
+# 现在逐卷分开读, 由 Mac 侧按卷判定, 哪一路失效一目了然。
+for v in /dev/ubi0_1 /dev/ubi0_2; do
+  echo "---ENV:$v---"
+  if [ -r "$v" ]; then
+    cat "$v" 2>/dev/null | strings 2>/dev/null | grep -E '^bootcmd=|^recovery_mtd=|^boot_ubi=' | sort -u
+  fi
+done
 echo '---UBOOT---'
 M=$(awk -F: '/"chainloader"/{gsub(/ /,"",$1);print $1}' /proc/mtd 2>/dev/null)
 [ -z "$M" ] && M=mtd3
@@ -231,26 +321,92 @@ grep -a -o -E '192\.168\.(255|0)\.(1|2|255)' /dev/$M 2>/dev/null | sort -u | tr 
 echo
 REMOTE
 )
-  T2_PRE_BOOTCMD=$(printf '%s\n' "$raw" | grep '^bootcmd=' | head -1)
+  local env1 env2
+  env1=$(printf '%s\n' "$raw" | sed -n '/^---ENV:\/dev\/ubi0_1---$/,/^---ENV:\/dev\/ubi0_2---$/p' | grep '^bootcmd=' | head -1)
+  env2=$(printf '%s\n' "$raw" | sed -n '/^---ENV:\/dev\/ubi0_2---$/,/^---UBOOT---$/p' | grep '^bootcmd=' | head -1)
   T2_PRE_UBOOT=$(printf '%s\n' "$raw" | sed -n '/^---UBOOT---$/,/^---IP---$/p' | grep '^U-Boot' | head -1)
-  T2_PRE_RECOVERY_IP=$(printf '%s\n' "$raw" | sed -n '/^---IP---$/,$p' | grep -v '^---IP---$' | head -1)
-  if printf '%s' "$T2_PRE_BOOTCMD" | grep -qE 'http_recovery|boot_ubi'; then
+  # 恢复页地址: mtd3 里 grep 出来的可能是多个 IP 拼在一行(如 "192.168.255.1 192.168.255.2 ..."),
+  #   原实现直接整行塞进 T2_PRE_RECOVERY_IP, 后续用它拼 URL/提示都会得到垃圾串。
+  #   现在: 取第一个合法单 IP; 若 mtd3 未读出则用状态档案的值; 都没有才退化为推定。
+  T2_PRE_RECOVERY_IP=$(printf '%s\n' "$raw" | sed -n '/^---IP---$/,$p' | grep -v '^---IP---$' | tr ' ' '\n' | grep -oE '^192\.168\.[0-9]{1,3}\.[0-9]{1,3}$' | head -1)
+
+  # env 冗余健康度: 两卷都有 = 健康; 只有一卷 = 单点(高风险)
+  local env_health="unknown" env_live=""
+  if [ -n "$env1" ] && [ -n "$env2" ]; then
+    env_health="redundant"; env_live="ubootenv+ubootenv2"
+  elif [ -n "$env1" ]; then
+    env_health="single"; env_live="ubootenv(ubi0_1)"
+  elif [ -n "$env2" ]; then
+    env_health="single"; env_live="ubootenv2(ubi0_2)"
+  fi
+  T2_ENV_HEALTH="$env_health"; T2_ENV_LIVE="$env_live"
+
+  if [ -n "$env1" ] && [ -n "$env2" ] && [ "$env1" != "$env2" ]; then
+    echo "⚠️ 两个 env 卷的 bootcmd 不一致(冗余对已不同步):"
+    echo "     ubootenv : $env1"
+    echo "     ubootenv2: $env2"
+    echo "     -> 以 fw_printenv 实际读到的为准, 但建议刷机前用 mkenvimage 重建冗余对"
+  fi
+
+  # 判据: 任意**活跃 UBI 卷**读到含 http_recovery/boot_ubi 的 bootcmd 即算 T2 在位
+  local picked=""
+  for c in "$env1" "$env2"; do
+    if printf '%s' "$c" | grep -qE 'http_recovery|boot_ubi'; then picked="$c"; break; fi
+  done
+  if [ -n "$picked" ]; then
     T2_PRE_OK=1
-    echo "✅ T2 兜底在位: $T2_PRE_BOOTCMD"
+    T2_PRE_BOOTCMD="$picked"
+    echo "✅ T2 兜底在位: $picked  (来源: $env_live)"
   else
+    T2_PRE_BOOTCMD="${env1:-$env2}"
     echo "🛑 刷前未读到 U-Boot 常住兜底 bootcmd(http_recovery / boot_ubi) —— T2 命门可能已失效"
   fi
+  case "$env_health" in
+    redundant) echo "   env 冗余: ✅ 健康(ubootenv + ubootenv2 两卷均在位)";;
+    single)    echo "   env 冗余: 🔴 单点失效(仅 $env_live 有 env, 另一卷为空) —— 兜底无备份, 刷 U-Boot 前建议先修复冗余对";;
+    *)         echo "   env 冗余: ⚠️ 两个 env 卷都读不到 bootcmd";;
+  esac
   [ -n "$T2_PRE_UBOOT" ] && echo "   U-Boot 版本串(mtd3): $T2_PRE_UBOOT"
   if [ -n "$T2_PRE_RECOVERY_IP" ]; then
     echo "   恢复页(mtd3 实测): $T2_PRE_RECOVERY_IP"
+  elif [ -n "$UBOOT_STATE_RECOVERY_IP" ]; then
+    T2_PRE_RECOVERY_IP="$UBOOT_STATE_RECOVERY_IP"
+    echo "   恢复页(取自状态档案): $UBOOT_STATE_RECOVERY_IP"
   else
     T2_PRE_RECOVERY_IP="192.168.255.1(推定, mtd3 未读出)"
-    echo "   ⚠️ mtd3 未读出恢复页 IP, 按当前 U-Boot 血脉推定 192.168.255.1 (刷过 11-11 chainloader 则为 192.168.0.1)"
+    echo "   ⚠️ mtd3 未读出恢复页 IP 且无状态档案, 按当前 U-Boot 血脉推定 192.168.255.1 (刷过 11-11 chainloader 则为 192.168.0.1)"
   fi
+  # 恢复页可达性实测(事前证明 T2 入口真的在位, 而不是文档里写着一个 IP 就相信)
+  echo "   恢复页可达性探测(事后救砖的唯一入口, 必须事前证实):"
+  _pc=()
+  [ -n "$UBOOT_STATE_RECOVERY_IP" ] && _pc+=("$UBOOT_STATE_RECOVERY_IP")
+  _pc+=(192.168.255.1 192.168.0.1)
+  probe_recovery_page "${_pc[@]}"
+  if [ "$PROBE_RECOVERY_OK" = "1" ]; then
+    echo "   ✅ Recovery 页可达: http://$PROBE_RECOVERY_IP/ —— T2 入口已实证"
+    UBOOT_STATE_RECOVERY_IP="$PROBE_RECOVERY_IP"
+  else
+    echo "   ⚠️ Recovery 页当前无响应(路由器正常运行中时本就无响应, 需进 Recovery 才起)—— 属正常, 但刷机前请确保你知道如何进 Recovery"
+  fi
+  # 把本次实测写回状态档案。
+  #   恢复页地址优先用 mtd3 实测值(T2_PRE_RECOVERY_IP, 权威), 其次用探测命中的地址,
+  #   再次是档案原值 —— 探测在路由器正常运行时必然无响应(Recovery 只有进 Recovery 才起),
+  #   所以不能拿探测结果去覆盖实测值, 否则会把档案写成空。
+  if printf '%s' "$T2_PRE_RECOVERY_IP" | grep -qE '^192\.168\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+    UBOOT_STATE_RECOVERY_IP="$T2_PRE_RECOVERY_IP"
+  elif [ "$PROBE_RECOVERY_OK" = "1" ]; then
+    UBOOT_STATE_RECOVERY_IP="$PROBE_RECOVERY_IP"
+  fi
+  UBOOT_STATE_VERSION_STR="$T2_PRE_UBOOT"
+  UBOOT_STATE_ENV_HEALTH="$T2_ENV_HEALTH"
+  UBOOT_STATE_LAST_VERIFIED="$(date '+%Y-%m-%d %H:%M:%S')"
+  [ -n "$UBOOT_STATE_TRIGGER" ] || UBOOT_STATE_TRIGGER="上电后按住 reset 键, LED 变色松手"
+  uboot_state_save
+  echo "   状态档案已更新: $UBOOT_STATE_FILE"
   if [ "$T2_PRE_OK" = "1" ]; then return 0; fi
   if [ "$DRY" = "1" ]; then echo "⚠️ [dry-run] 真实执行时本脚本会拒绝刷机"; return 0; fi
   if [ "$ALLOW_UNVERIFIED_T2" = "1" ]; then echo "⚠️ 已由 --allow-unverified-t2 显式放行(自担风险)"; return 0; fi
-  die "🛑 T2 兜底未验证, 拒绝刷机。请先确认 U-Boot env(/dev/ubi0_1|ubi0_2 与 fw_printenv), 或显式加 --allow-unverified-t2 自担风险。"
+  die "🛑 T2 兜底未验证, 拒绝刷机。请先确认 U-Boot env(/dev/ubi0_1|ubi0_2), 或显式加 --allow-unverified-t2 自担风险。"
 }
 
 # ---------- kit 有效性核验(2026-11-13 新增, 把"kit 是否重建"从人工提醒变成代码强制) ----------
@@ -428,6 +584,13 @@ config_fidelity_check(){
   local pre_dir="$tmp/etc/config"
   [ -d "$pre_dir" ] || { echo "⚠️ 升级前快照无 /etc/config, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
   echo "=== 配置保真度校验 (策略: ${CONFIG_POLICY:-full}) ==="
+  # 2026-11-16 P0 修复: post.txt(升级后 /etc/config 指纹)必须在**策略分支之前**采集。
+  #   原实现只在 full 分支末尾生成 post.txt, 而 selective 分支在分支内就去读它 ——
+  #   selective 下读到的是不存在的空文件 -> awk 无匹配 -> 所有白名单项被误报
+  #   「升级后缺失」, 且 wc -l 报错。1115 恰好走 selective, 升级报告必然失真。
+  #   现在两个策略共用同一次采集, 并对"采集为空"显式告警(不再静默误判)。
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'cd /etc/config && for f in *; do [ -f "$f" ] || continue; printf "%s %s\n" "$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)" "$f"; done' 2>/dev/null > "$tmp/post.txt" || { echo "⚠️ 无法读取升级后 /etc/config, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
+  if [ ! -s "$tmp/post.txt" ]; then echo "⚠️ 升级后 /etc/config 指纹采集为空, 跳过保真度校验(无法判定, 非配置漂移)"; rm -rf "$tmp"; return 0; fi
   # 2026-11-15: selective 策略下"逐字节一致"是错误判据 —— 新版主动改写配置, 一致反而说明
   # 旧配置被误导入。改为分层: 白名单项必须还原, 其余期望变化(只列清单, 不计漂移)。
   if [ "${CONFIG_POLICY:-full}" = "selective" ]; then
@@ -446,11 +609,13 @@ config_fidelity_check(){
     _ssid=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'uci -q get wireless.@wifi-iface[0].ssid' 2>/dev/null)
     [ -n "$_lan" ]  && echo "  ✅ LAN IP 已由补丁恢复: $_lan"  || { echo "  ⚠️ 未能读取 LAN IP"; _bad=$((_bad+1)); }
     [ -n "$_ssid" ] && echo "  ✅ SSID 已由补丁恢复: $_ssid"  || { echo "  ⚠️ 未能读取 SSID"; _bad=$((_bad+1)); }
-    echo "✅ 分层校验完成: 白名单 $_ok 项通过 / $_bad 项异常; 其余 $(wc -l < "$tmp/post.txt" | tr -d ' ') 个配置属新版生成, 不计漂移"
+    _post_total=$(wc -l < "$tmp/post.txt" | tr -d ' ')
+    _post_rest=$(( _post_total - _ok ))
+    [ "$_post_rest" -lt 0 ] && _post_rest=0
+    echo "✅ 分层校验完成: 白名单 $_ok 项通过 / $_bad 项异常; 升级后 /etc/config 共 $_post_total 个文件, 其中非白名单 $_post_rest 个属新版出厂+uci-defaults 生成, 不计漂移"
     rm -rf "$tmp"
     return 0
   fi
-  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'cd /etc/config && for f in *; do [ -f "$f" ] || continue; printf "%s %s\n" "$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)" "$f"; done' 2>/dev/null > "$tmp/post.txt" || { echo "⚠️ 无法读取升级后 /etc/config, 跳过保真度校验"; rm -rf "$tmp"; return 0; }
   local diffs=0 nf=0 bf pre_h post_h
   for pre in "$pre_dir"/*; do
     [ -f "$pre" ] || continue
@@ -509,9 +674,15 @@ post_upgrade_report(){
     OC_CFG=$(ps w | grep "[c]lash" | grep -oE "\-f [^ ]+" | awk "{print \$2}")
     [ -z "$OC_CFG" ] && OC_CFG=/etc/openclash/config.yaml
     SEC=$(grep -m1 "secret:" "$OC_CFG" 2>/dev/null | sed -E "s/.*secret:[ ]*[\"]?([A-Za-z0-9_]+)[\"]?.*/\1/")
-    REAL_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l)
+    # 2026-11-16 P0 修复: 合并 /proxies 与 /providers/proxies 两个来源取大值。
+    #   机场订阅多为 provider 模式, 节点不在 /proxies 顶层而在 /providers/proxies;
+    #   只查顶层会把"有节点"误判成 0 节点 -> DNS 由 OpenClash(7874)接管时判 FAIL
+    #   -> --auto 误触发整机回退。
+    REAL_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l | tr -d " ")
+    PROV_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/providers/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l | tr -d " ")
+    [ "${PROV_NODES:-0}" -gt "${REAL_NODES:-0}" ] 2>/dev/null && REAL_NODES="$PROV_NODES"
     ACTIVE_CONN=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/connections" 2>/dev/null | grep -oE "\"id\":\"[^\"]+\"" | wc -l)
-    echo "- 真实节点数(经控制器): $REAL_NODES 个"
+    echo "- 真实节点数(经控制器, 顶层+provider 合并): $REAL_NODES 个"
     echo "- 当前活跃外部连接: $ACTIVE_CONN 条 (证明代理正在承载上网)"
     echo ""
     echo "## 5. DHCP 静态租约数"
@@ -529,11 +700,17 @@ post_upgrade_report(){
     echo ""
     echo "## 8. U-Boot / T2 兜底 (刷前基线 vs 刷后实测)"
     echo "- 刷前: bootcmd=\`${T2_PRE_BOOTCMD:-?}\` / ${T2_PRE_UBOOT:-?} / 恢复页 ${T2_PRE_RECOVERY_IP:-?} / 核验通过=${T2_PRE_OK}"
+    echo "- 刷前 env 冗余健康度: ${T2_ENV_HEALTH:-?} (在位卷: ${T2_ENV_LIVE:-?})"
     echo "- 刷后实测:"
   } >> "$rep"
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" 'sh -s' 2>/dev/null <<'REMOTE' >> "$rep"
-echo '  - bootcmd / recovery_mtd:'
-( cat /dev/ubi0_2 2>/dev/null; cat /dev/ubi0_1 2>/dev/null; fw_printenv 2>/dev/null ) | strings 2>/dev/null | grep -E '^bootcmd=|^recovery_mtd=|^boot_ubi=' | sort -u | sed 's/^/    /'
+echo '  - bootcmd / recovery_mtd (逐卷, 不并联):'
+for v in /dev/ubi0_1 /dev/ubi0_2; do
+  echo "    [$v]"
+  cat "$v" 2>/dev/null | strings 2>/dev/null | grep -E '^bootcmd=|^recovery_mtd=|^boot_ubi=' | sort -u | sed 's/^/      /'
+done
+echo '  - fw_printenv (参考, 不作为判据):'
+fw_printenv bootcmd recovery_mtd boot_ubi 2>/dev/null | sed 's/^/      /'
 M=$(awk -F: '/"chainloader"/{gsub(/ /,"",$1);print $1}' /proc/mtd 2>/dev/null)
 [ -z "$M" ] && M=mtd3
 echo '  - U-Boot 版本串(mtd3):'
@@ -1297,6 +1474,9 @@ if [ -n "$CURRENT_COMMIT" ] && [ -n "$TARGET_COMMIT" ]; then
   fi
 fi
 
+# 载入 U-Boot 兜底状态档案(恢复页地址/触发方式/最近实测), 供重连候选与提示使用
+uboot_state_load
+
 # 11-03 卡死事件的流程化缓解: 近期异常硬复位未过 48h 观察窗时拒绝刷机
 precheck_recent_crash
 
@@ -1461,8 +1641,14 @@ for i in $(seq 1 80); do
   # 试用户配置的地址(别名或 IP), 再退到常见出厂默认 IP (首启动自举可能重置为出厂态)
   tried="$ROUTER"
   # XR1710G 出厂默认 192.168.50.1(官方 README 首次启动表); 192.168.1.1 属 XG2010G/Nokia。
-  # 192.168.0.1 同时也是 11-11 新版 chainloader 的恢复页地址, 保留作兼容候选。
-  for ip in 192.168.50.1 192.168.1.1 192.168.0.1 10.0.0.1; do tried="$tried root@$ip"; done
+  # 恢复页候选: 旧 chainloader 血脉 = 192.168.255.1, 11-11 新版 = 192.168.0.1;
+  #   2026-11-16 补 192.168.255.1 —— 原候选表漏了当前血脉的恢复页, 一旦刷完变砖
+  #   (或首启动自举失败落到 Recovery), 重连循环里根本没有当前恢复页地址, 只能干等超时。
+  #   另从状态档案读入实测的恢复页地址(刷过 U-Boot 后地址会变, 只能靠档案)。
+  _recov_cands=""
+  [ -n "$UBOOT_STATE_RECOVERY_IP" ] && _recov_cands="$UBOOT_STATE_RECOVERY_IP "
+  for ip in 192.168.50.1 192.168.1.1 192.168.255.1 192.168.0.1 10.0.0.1; do tried="$tried root@$ip"; done
+  for ip in $_recov_cands; do tried="$tried root@$ip"; done
   for target in $tried; do
     if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$target" 'true' 2>/dev/null; then
       echo "✅ 第 $i 轮经 $target 重连成功"; ROUTER="$target"; OK=1; break 2
@@ -1474,7 +1660,12 @@ if [ "$OK" != "1" ]; then
   echo "❌ 重连失败 — 可能进入 Recovery 或执行机链路仍异常"
   echo "   诊断: 执行机出口 IP=$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null || echo '?'); 路由器=$ROUTER"
   echo "   若执行机本就不经此路由上网, 请确认有线已直连路由器 LAN 口; U-Boot 兜底已就位, 可访问 HTTP Recovery 重刷"
-  echo "   HTTP Recovery 入口: 上电后按 reset、LED 变色松手; 当前 U-Boot=192.168.255.1 (刷入 11-11 chainloader 后为 192.168.0.1)"
+  uboot_state_load
+  _recov="${UBOOT_STATE_RECOVERY_IP:-192.168.255.1}"
+  echo "   HTTP Recovery 入口: ${UBOOT_STATE_TRIGGER:-上电后按住 reset 键, LED 变色松手}"
+  echo "   恢复页地址: http://$_recov/  (来源: $([ -n "$UBOOT_STATE_RECOVERY_IP" ] && echo 状态档案 || echo 推定默认))"
+  echo "   当前 U-Boot 血脉: ${UBOOT_STATE_VERSION_STR:-?}"
+  echo "   提示: 恢复页仅在路由器进入 Recovery 时才响应; 若路由器已正常启动, 请走人工排查"
   die "重连失败, 需人工介入"
 fi
 
@@ -1488,7 +1679,7 @@ echo "--- OpenClash 进程 ---"; pgrep -f clash >/dev/null && echo "clash 运行
 echo "--- OpenClash 安装日志尾部 ---"; tail -5 /tmp/zzz-postinstall.log 2>/dev/null
 echo "--- OpenClash DNS 解析 (foreign) ---"; nslookup github.com 127.0.0.1 2>/dev/null | awk "/Address: /{print \$2}" | grep -v "#53" | tail -1
 echo "--- dnsmasq 是否指向 OpenClash ---"; uci get dhcp.@dnsmasq[0].noresolv 2>/dev/null; uci get dhcp.@dnsmasq[0].server 2>/dev/null
-echo "--- U-Boot 兜底 (直接读活跃 UBI 卷 ubootenv2/ubootenv, 绕开 fw_env.config stale mtd0) ---"; ( cat /dev/ubi0_2 2>/dev/null; cat /dev/ubi0_1 2>/dev/null; fw_printenv bootcmd recovery_mtd boot_ubi 2>/dev/null ) | strings | grep -E "^bootcmd=|^recovery_mtd=|^boot_ubi=" | sort -u
+echo "--- U-Boot 兜底 (逐卷读活跃 UBI 卷 ubootenv/ubootenv2, fw_printenv 仅作参考) ---"; for v in /dev/ubi0_1 /dev/ubi0_2; do echo "  [$v]"; cat "$v" 2>/dev/null | strings | grep -E "^bootcmd=|^recovery_mtd=|^boot_ubi=" | sort -u; done; echo "  [fw_printenv 参考]"; fw_printenv bootcmd recovery_mtd boot_ubi 2>/dev/null
 echo "--- 首启动自举日志尾部 ---"; tail -5 /tmp/zzz-restore.log 2>/dev/null
 '
 echo "=== 升级流程结束 ==="
@@ -1545,7 +1736,13 @@ verify_router(){
         OC_CFG=$(ps w | grep "[c]lash" | grep -oE "\-f [^ ]+" | awk "{print \$2}")
         [ -z "$OC_CFG" ] && OC_CFG=/etc/openclash/config.yaml
         SEC=$(grep -m1 "secret:" "$OC_CFG" 2>/dev/null | sed -E "s/.*secret:[ ]*[\"]?([A-Za-z0-9_]+)[\"]?.*/\1/")
-        REAL_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l)
+        # 2026-11-16 P0 修复: 合并 /proxies 与 /providers/proxies 两个来源。
+        #   机场订阅多为 provider 模式, 节点全在 /providers/proxies; 只查顶层会误判
+        #   0 节点, 而本路由 OpenClash 正是 DNS 网关(fake-ip + 7874) -> 误判 FAIL
+        #   -> --auto 误触发整机回退(最坏情况: 好端端的路由器被回退成旧版)。
+        REAL_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l | tr -d " ")
+        PROV_NODES=$(curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/providers/proxies" 2>/dev/null | grep -oE "\"type\":\"(Vless|Vmess|Trojan|Hysteria2|Hysteria|Shadowsocks|ShadowsocksR|Tuic|WireGuard|Snell)\"" | wc -l | tr -d " ")
+        [ "${PROV_NODES:-0}" -gt "${REAL_NODES:-0}" ] 2>/dev/null && REAL_NODES="$PROV_NODES"
         [ "$REAL_NODES" -gt 0 ] && break
         sleep 5
       done
@@ -1610,18 +1807,35 @@ auto_rollback(){
     sleep 5
   done
   # DNS 兜底(P1): 回退还原旧配置可能含 7874 死端口, 若 OpenClash 未监听则回退公共DNS
+  # 2026-11-16 P0 修复(两处真 bug, 均已实机复现):
+  #   (a) 原代码 `! nc -z -w2 ...` —— BusyBox 的 nc 不支持 -z 选项(实机实测:
+  #       `nc -z -w2 127.0.0.1 22` 打印用法并返回 rc=1), 取反后条件**恒为真**,
+  #       于是每次回退都无条件把 dnsmasq 改成公共 DNS, 把 OpenClash 的网关配置破坏掉。
+  #       改为用 netstat/ss 真实判断该端口是否处于 LISTEN。
+  #   (b) 原端口提取 `grep -oE "[0-9]+" | head -1` 从 "127.0.0.1#7874" 里取到的是
+  #       "127"(IP 的第一段)而不是 7874, 即探测了一个完全无关的端口。改为按 #PORT 取。
   ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ROUTER" '
     up=$(uci get dhcp.@dnsmasq[0].server 2>/dev/null)
     if echo "$up" | grep -q "127.0.0.1"; then
-      p=$(echo "$up" | grep -oE "[0-9]+" | head -1)
-      if [ -n "$p" ] && ! nc -z -w2 127.0.0.1 "$p" 2>/dev/null; then
+      p=$(echo "$up" | grep -oE "127\.0\.0\.1#([0-9]+)" | head -1 | cut -d"#" -f2)
+      [ -z "$p" ] && p=53
+      listening=0
+      if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | grep -qE "[:.]${p}$" && listening=1
+      fi
+      if [ "$listening" = "0" ] && command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | grep -qE "[:.]${p}([[:space:]]|$)" && listening=1
+      fi
+      if [ "$listening" = "0" ]; then
         uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
         uci del dhcp.@dnsmasq[0].server 2>/dev/null
         uci add_list dhcp.@dnsmasq[0].server="223.5.5.5"
         uci add_list dhcp.@dnsmasq[0].server="8.8.8.8"
         uci commit dhcp
         /etc/init.d/dnsmasq restart
-        echo "DNS 兜底: 回退公共 DNS"
+        echo "DNS 兜底: 127.0.0.1:${p} 未监听, 已回退公共 DNS"
+      else
+        echo "DNS 兜底: 127.0.0.1:${p} 正在监听, 保留 OpenClash 网关配置(不改 DNS)"
       fi
     fi
   ' 2>/dev/null || true
