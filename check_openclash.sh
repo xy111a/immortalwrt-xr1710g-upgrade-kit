@@ -21,6 +21,8 @@
 #      硬编码 + `2>/dev/null` 会让插入静默失败, 而脚本仍打印"已豁免"并给出"真实可达/入口被封"的
 #      **假结论**(本次实战即被此坑误导)。现改为: 动态定位链 → 检查插入 rc → 回读自证规则在链里 →
 #      任一环节失败就**跳过本节并声明结果不可信**, 绝不输出可达性判定。见 oc_find_redirect_chain/oc_exempt。
+#      ⚠️ 2026-11-17 再修(P3): 第 5 节包计数 / 第 6 节规则检查原先也硬编码 `jump openclash`, 现同样复用
+#      oc_find_redirect_chain 动态取链名(OC_JUMP_NAME), 未定位到则明确跳过, 不给「未增长/未安装」假阴性。
 #   6. 2026-10-30: OpenClash 的 `openclash_custom_overwrite.sh` 里 ruby_edit 的 hash 参数必须是
 #      **合法 Ruby 源码**(用 `=>` 而非 YAML 的 `:`), 否则被 OpenClash 的 overwrite 安全检查判为
 #      "skip unsafe Overwrite command" 静默跳过; 且 mihomo 的 nameserver-policy 里 `+` 通配符
@@ -250,17 +252,28 @@ curl -s --max-time 6 -H "Authorization: Bearer $SEC" "http://127.0.0.1:9090/conn
 
 echo ""
 echo "===== 5. TCP 重定向是否在扛流量(出网探针前后计数) ====="
-B=$(nft list ruleset 2>/dev/null | grep -E "ip protocol tcp .*jump openclash" | grep -oE "packets [0-9]+" | head -1 | awk "{print \$2}")
-curl -s --max-time 6 -o /dev/null https://www.google.com 2>/dev/null
-curl -s --max-time 6 -o /dev/null https://www.youtube.com 2>/dev/null
-A=$(nft list ruleset 2>/dev/null | grep -E "ip protocol tcp .*jump openclash" | grep -oE "packets [0-9]+" | head -1 | awk "{print \$2}")
-if [ "${A:-0}" -gt "${B:-0}" ] 2>/dev/null; then TAG="增长-流量经代理✅"; else TAG="未增长"; fi
-echo "openclash TCP 重定向包计数: ${B:-?} -> ${A:-?}  [$TAG]"
+# 链名随固件/OpenClash 版本变化, 复用 oc_find_redirect_chain 动态定位 jump 目标, 绝不硬编码 "jump openclash"。
+OC_REDIR_CHAIN=$(oc_find_redirect_chain)
+OC_JUMP_NAME=$(printf '%s\n' "$OC_REDIR_CHAIN" | awk 'NF{print $3; exit}')
+if [ -n "$OC_JUMP_NAME" ]; then
+  B=$(nft list ruleset 2>/dev/null | grep -F "ip protocol tcp" | grep -F "jump $OC_JUMP_NAME" | grep -oE "packets [0-9]+" | head -1 | awk "{print \$2}")
+  curl -s --max-time 6 -o /dev/null https://www.google.com 2>/dev/null
+  curl -s --max-time 6 -o /dev/null https://www.youtube.com 2>/dev/null
+  A=$(nft list ruleset 2>/dev/null | grep -F "ip protocol tcp" | grep -F "jump $OC_JUMP_NAME" | grep -oE "packets [0-9]+" | head -1 | awk "{print \$2}")
+  if [ "${A:-0}" -gt "${B:-0}" ] 2>/dev/null; then TAG="增长-流量经代理✅"; else TAG="未增长"; fi
+  echo "openclash TCP 重定向包计数(jump $OC_JUMP_NAME): ${B:-?} -> ${A:-?}  [$TAG]"
+else
+  echo "⚠️ 未定位到承载 TCP redirect 的链(代理可能未运行/规则未安装), 跳过本节包计数"
+fi
 
 echo ""
 echo "===== 6. 工作模式 + 重定向规则 ====="
 grep -E "enhanced-mode|fake-ip-range" "$OC_CFG" 2>/dev/null | head
-nft list ruleset 2>/dev/null | grep -qE "jump openclash" && echo "nft 重定向规则: ✅ 已安装" || echo "nft 重定向规则: ❌ 未见"
+if [ -n "$OC_JUMP_NAME" ]; then
+  nft list ruleset 2>/dev/null | grep -qF "jump $OC_JUMP_NAME" && echo "nft 重定向规则: ✅ 已安装 (jump $OC_JUMP_NAME)" || echo "nft 重定向规则: ❌ 未见 jump $OC_JUMP_NAME"
+else
+  echo "nft 重定向规则: ⚠️ 未定位到 redirect 链(代理可能未运行)"
+fi
 
 echo ""
 echo "===== 6b. 当前出口节点 -> 可达性(识别能连TCP但被App封的节点) ====="
