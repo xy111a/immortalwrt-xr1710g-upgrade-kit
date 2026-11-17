@@ -65,7 +65,7 @@ agent_created: true
 - **T0 预防**：全清刷 + restore-kit 打成 `uci-defaults` 脚本随 `sysupgrade -f kit.tar.gz` 在首启动自举 → 路由自配自己，无需在刷机窗口在线值守。
 - **T1 检测**：Mac 侧轮询重连（候选含 XR1710G 出厂默认 `192.168.50.1`；`192.168.1.1` 是 XG2010G/Nokia 的，别混用）+ 终验；刷前另有 `verify_t2_fallback()` 实测核验 T2、`verify_kit()` 核验 kit 是否陈旧（2026-11-13 代码化）。
 - **T2 恢复（命门）**：U-Boot 常住兜底 `bootcmd=run boot_ubi || http_recovery` + `recovery_mtd=fit`（在 UBI 卷 ubootenv/ubootenv2，**不受 sysupgrade 影响**）。刷坏自动进 HTTP Recovery，免拆机。
-  - **⚠️ 兜底入口不是恒定的**：当前 U-Boot（`2026.07-00760-gab7fd65100f1` / `YYH2913/http-uboot` 血脉）恢复页为 **`192.168.255.1`**（mtd3 实测字符串含 `.1/.2/.255`），进入方式「上电后按 reset、LED 变色松手」（窗口宽裕，**不可按住 reset 上电**）。刷入 `2026-11-11-a9a12de55890` chainloader 后恢复页变为 **`192.168.0.1`**，DHCP 改为按 MAC 的租约表。刷 U-Boot 后旧救砖流程/脚本会失效，必须重学入口并实测一次再依赖它。
+  - **⚠️ 兜底入口不是恒定的**（**2026-11-17 已刷入官方 11-11，当前恢复页 = `192.168.0.1`**；下方是刷前历史对照）：刷前 U-Boot（`2026.07-00760-gab7fd65100f1` / `YYH2913/http-uboot` 血脉）恢复页为 `192.168.255.1`，进入方式「上电后按 reset、LED 变色松手」。官方 11-11 chainloader 恢复页 = **`192.168.0.1`**，DHCP 改为按 MAC 的租约表。若未来再换 U-Boot，必须重新确认入口再依赖它。
 - **T3 回退**：`upgrade_router.sh` 在刷前预飞阶段**自动解析当前路由器运行版本的 commit hash，并在本地 `*.itb` 中匹配同名 itb 作为回退镜像**（见 `resolve_rollback`）。即"当前版本"会被自动选为回退点——**前提是旧 itb 文件别删掉**。无匹配时回退到手动指定的 `FALLBACK_ITB`。回退操作：`sysupgrade -F <回退 itb>`。
 
 ## 执行顺序（每次升级）
@@ -383,7 +383,7 @@ bash uboot_upgrade.sh --probe-recovery
 
 **⚠️ 撤销的另一处旧判断**：「一级 bootcmd 不兼容」同样被推翻 —— `0x602100 - 0x600000 = 0x2100`，官方 SSH 文档回读偏移正是 `skip=8448`（=0x2100），YYH2913 README 明写 dual-entry 支持从 `0x600000` 无参 `bootm`。本机 uenv 实测 `bootcmd=flash read 0x600000 0x100000 $loadaddr; bootm` **与官方完全一致**。
 
-**恢复页地址会变**：当前血脉 `192.168.255.1` → 11-11 chainloader `192.168.0.1`（DHCP 改为按 MAC 的租约表）。`upgrade_router.sh` 现维护状态档案 `~/router-upgrade-logs/uboot-state.env`（恢复页 IP / 触发方式 / U-Boot 版本串 / env 健康度 / 最近实测时间），重连候选与失败提示一律读它，**不再散落硬编码**。刷完 U-Boot 请更新该文件并实测一次 Recovery 页。
+**恢复页地址随 U-Boot 变**（**2026-11-17 已刷完，当前 = `192.168.0.1`**）：刷前血脉 `192.168.255.1` → 11-11 chainloader `192.168.0.1`（DHCP 改为按 MAC 的租约表）。`upgrade_router.sh` 维护状态档案 `~/router-upgrade-logs/uboot-state.env`（恢复页 IP / 触发方式 / U-Boot 版本串 / env 健康度 / 最近实测时间），重连候选与失败提示一律读它，**不再散落硬编码**。⚠️ 状态档案仍需更新为实测后的 `192.168.0.1`（尚未实地进过恢复页）。
 
 ## 🔬 第五轮实证：mtd1(uenv) 的真相 + 官方 chainloader 的引导链（2026-11-16）
 
@@ -423,7 +423,7 @@ root=/dev/mtdblock4 ro  product_name=xPON ONU  fdt_high=0xac000000
 | fit 卷 | `ubi_read_production=ubi read ${loadaddr} fit` → 读 **UBI 卷名 `fit`** | ubi0_0 名 `fit`，46.2 MiB，内容是 FIT（magic `d00dfeed`，含 `config-1`/`kernel-1`/`rootfs-1`） | ✅ 精确匹配 |
 | bootargs | `root=/dev/fit0` | 本机 `/proc/cmdline` 含 `root=/dev/fit0` | ✅ 一致 |
 | DRAM 容量 | `ubi read ${loadaddr} fit` 要把 46 MiB 读进 RAM | MemTotal 1.86 GB，loadaddr=0x81800000 | ✅ 容量充裕 |
-| 恢复页 | `ipaddr=192.168.0.1`（`board_late_init` 硬编码） | 本机现为 192.168.255.1 | ⚠️ 刷完**会变** |
+| 恢复页 | `ipaddr=192.168.0.1`（`board_late_init` 硬编码） | 刷前 192.168.255.1，**现为 192.168.0.1**（已刷 11-11） | ✅ 已切换（见文首状态块） |
 
 **mtd4 名字问题的实质**（此前列为「待验证兼容点」，本轮已定性）：
 - 二级 chainloader 用**自己内嵌的 DTB** 解析 MTD 分区表 —— 官方 DTB 标签是 `system`（@0x700000, 0x1b700000），
@@ -596,7 +596,7 @@ recovery_size_uboot=0x100000
 ### H. 当时的未闭环项（2026-11-16 14:30 历史快照；已于 2026-11-17 全部完成或撤销，见文首「当前状态」）
 
 - ~~❌ TTL 救砖预案未落地~~ → **2026-11-17 撤销**：U-Boot 已刷成功，用户明确不需拆机。TTL 降为最后兜底，非前置条件（工具与命令单保留在 `ttl_rescue.sh`）。
-- ❌ **恢复页 IP 变更未实地演练**：刷入 11-11 后恢复页由 `192.168.255.1` → `192.168.0.1`（官方 HTTP Recovery）。刷前必须重学入口与 IP，否则"兜底在位但连不上"。
+- ❌ **恢复页 IP 变更未实地演练**（2026-11-16 历史快照；11-11 已刷入、恢复页现为 `192.168.0.1`，但**尚未实地进入过恢复页**——这是唯一残留的未验证项）：**下一步**择机上电按 reset 进一次 `http://192.168.0.1` 确认可达，否则兜底"在位但连不上"。
 - ❌ **MAC 基线比对未执行**：`mac-baseline.txt` 已抓，但刷后需逐接口（`br-lan`/`cpu`/`lan2`/`lan3`/`lan4`）核对。已知问题：现役 `br-lan/cpu/lan2/lan3/lan4` MAC **全为 `00:58:28:d7:63:60`**（重复），官方 11-11 的 `give the XR1710G CPU port its own MAC offset` 正是修这个；factory 卷 WAN=`00:58:28:d7:63:5f` / LAN=`00:58:28:d7:63:60`（与基线一致，可还原）。
 - ❌ **`--probe-recovery` 未演练**：需在真实故障态下验证脚本能扫到 `192.168.0.1`。
 
