@@ -104,7 +104,7 @@
 
 1. **T0 预防**：首启动 `uci-defaults` 自举恢复 LAN IP（**XR1710G 出厂默认 `192.168.50.1/24`**；正常路径升级前从活路由器抓取真实 LAN IP 注入，`192.168.1.1` 是 XG2010G/Nokia 的地址，别混用）+ 原 SSID，刷机窗口内 Mac 无需人工接手（WiFi 主路径，有线兜底）。
 2. **T1 检测**：脚本轮询重连（候选含出厂 `192.168.50.1`）+ 终验；刷前另有 `verify_t2_fallback()` 实测核验 U-Boot 兜底是否在位、`verify_kit()` 核验 kit 是否按当前源码/目标固件重建。
-3. **T2 恢复**：U-Boot 常住兜底 `bootcmd=run boot_ubi || http_recovery`（实测在位）——刷坏自动进 HTTP Recovery，免拆机。**恢复页地址随 U-Boot 变**：当前 chainloader 为 `192.168.255.1`（上电后按 reset、LED 变色松手）；刷入 2026-11-11 版 chainloader 后变为 `192.168.0.1`。刷 U-Boot 前必须重学入口，否则兜底会"在位但连不上"。
+3. **T2 恢复**：U-Boot 常住兜底 `bootcmd=run boot_ubi || http_recovery`（实测在位）——刷坏自动进 HTTP Recovery，免拆机。**恢复页地址随 U-Boot 变**：2026-11-17 已刷入官方 11-11 chainloader，**当前恢复页 = `192.168.0.1`**（刷前旧版为 `192.168.255.1`）。进入方式上电按 reset、LED 变色松手。⚠️ 恢复页尚未实地进入验证过。
 4. **T3 回退**：刷前自动解析"当前运行版本"对应的本地 itb 作回退镜像；强终验失败自动 `sysupgrade -F` 回退**并连带还原升级前配置快照**（`backups/`）。
 
 ---
@@ -177,7 +177,7 @@ br-lan = cpu = lan2 = lan3 = lan4 = 00:58:28:d7:63:60   ← 5 个接口同 MAC
 | U-Boot 侧 UBI attach | 全盘扫 ≈3500 PEB | 读几个 anchor PEB |
 | `CONFIG_BOOTDELAY` | 3（本机 env 实为 2） | 1 |
 | env 后端 | UBI `ubootenv`/`ubootenv2` | MTD `uenv`（共享原厂，**不可 saveenv**） |
-| 恢复页 | 192.168.255.1 | 192.168.0.1 |
+| 恢复页 | 192.168.255.1（刷前） | 192.168.0.1（**现用，已刷 11-11**） |
 
 内核侧 attach 实测耗时：`1.635s attaching → 3.348s scanning finished`（约 1.84 s）。
 
@@ -244,7 +244,7 @@ bash uboot_upgrade.sh --probe-recovery             # 救砖时探测恢复页
 - 只刷 `xr1710g-chainloader-*-slot.bin`；**绝不刷 `u-boot.bin` / 裸 `.itb`**（上游明确说裸 FIT 不能通过 HTTP Recovery 上传）。XR1710G 与 XG2010G 镜像不通用。
 - **绝不**在 chainloader 里 `saveenv` / `env default -a` —— `uenv`(mtd1) 是原厂 U-Boot 的 env 分区，chainloader 只是共用读取；saveenv 会让原厂 U-Boot 找不到启动配方（卡在 `ECNT>` 报 `Unknown command 'ubi'`）。
 - 本机**已处于「已刷 chainloader」状态**，上游 TTL+TFTP 教程针对的是原厂 U-Boot 状态 → 本机日常路径是 HTTP Recovery 的 `uboot` 目标上传；TTL 是最后的救砖手段。
-- 恢复页会变：当前 `192.168.255.1` → 11-11 chainloader `192.168.0.1`。状态档案在 `~/router-upgrade-logs/uboot-state.env`。
+- 恢复页随 U-Boot 变：刷前 `192.168.255.1` → **现用 `192.168.0.1`**（已刷 11-11）。状态档案在 `~/router-upgrade-logs/uboot-state.env`（待更新为实测值）。
 - ✅ **env 冗余对已修复**（2026-11-16）：`ubootenv`(`ubi0_1`, dynamic) 原为全 0xFF 空卷，真实 env 只在 `ubootenv2`(`ubi0_2`, **static**)，属单点保险。已用 `uboot_upgrade.sh --fix-env-redundancy --ack-env-fix` 把 ubootenv2 的 env_t 复制成 ubootenv 的有效副本（`flags` 置 `0xFF` obsolete）→ U-Boot 仍选 ubootenv2（引导行为零变化），但 ubootenv2 损坏时可回落。ubootenv2 未被触碰。
 - ⚠️ **NAND 写入必须按擦除块对齐**（2026-11-16 实机故障，两轮实证）：官方镜像长 **937538** 字节，不是 `erasesize`(131072) 的整数倍 → NAND 字符设备拒绝非整擦除块写入，内核 **EINVAL**。**症状是 `WRITE_BEGIN` 后没有 `WRITE_DONE` 且 dd 静默失败**。解法：写前把镜像用 `0xFF` pad 到 1048576 字节，优先 `mtd write` + `mtd verify`；**绝不把写命令接管道后取 `$?`**（那是 `tail` 的退出码，会伪装成功）。详见 `SKILL.md`「NAND 写入路径踩坑」。
 - 📌 **MAC 说明（2026-11-16 第五轮更正）**：`mtd1` 的 env CRC **完全有效**（此前"CRC 失效"是长度用错），只是原厂 ECNT 格式（`crc(4)+data[16380]`，无 flags），与 U-Boot `env_t` 不同。二级 U-Boot 通过 `xr1710g_sync_runtime_ethaddrs()` 从 **factory 卷**同步 MAC，不依赖 `mtd1` 的 `ethaddr`（那是原厂占位符 `00:AA:BB:01:23:40`）→ **MAC 不会因 env 回落而变**。脚本已抓 MAC 基线，刷后逐接口比对即可。
@@ -260,7 +260,7 @@ bash uboot_upgrade.sh --probe-recovery             # 救砖时探测恢复页
 - **NPU 修复溯源**：最新公开提交仍是 11-13 `9a70b257`（README），其前是 11-11 晚那批 NPU/MT7996 根因修复；release 基线逻辑上包含它们，但镜像内嵌 commit `5e152df9` 在公开 master **查不到**，作者从未明确声明「修了 #82」。`#82` 报告者 11-15 回复「升级以后需要双清，就好了」—— 用户经验，与「配置不兼容」呼应，非作者确认。
 - issue 动态：`#95`（1112 AP 模式 Qualcomm 重试风暴）作者 11-15 回复「刷入最新版测试」+ 复测方法，**未确认**已修；`#96`（XG2010G NPU 数据通路卡死）作者求补全日志；其余 open：`#94`（5G/6G VIF flowtable）、`#92`（B17 PCIe）、`#62`（PON 校准）。1029 的 `#81` bridger 断流仍靠停服务规避。
 - **72h 沉淀闸**：到 **11-18 14:51（北京）** 才过。叠加 48h 异常复位观察窗、镜像 commit 不可溯源、配置不兼容，**当前不刷机**。
-- **U-Boot**：当前 `2026.07-00760-gab7fd65100f1`（恢复页 `192.168.255.1`）；11-11 的 `a9a12de55890` 同源 chainloader、同 mtd3/0x600000/1MiB 槽位。**`ubi` vs `system` 的兼容疑点已于 2026-11-16 彻底闭环**（第六轮实证：官方 1112 固件内核 DTB 的 partition label 也是 `ubi`，与 1115/1016 逐属性一致；label=`system` 的那份是 chainloader 内嵌控制 DTB，非固件 DTB）。**成功率（第六轮上修）：只刷 U-Boot 88% / 只刷固件 70% / 两者都刷 72%**，推荐顺序：**先刷官方 11-11 chainloader**（fastmap 硬约束：固件内核写 fastmap，旧 chainloader 无 `ubi_attach_fastmap` 符号）→ 立即验证版本串/MAC/恢复页 IP `192.168.0.1` → 需要 NPU 改进再单独刷 1115 固件。刷前必备：mtd3 + mtd1/uenv 备份（已双份异地）+ MAC 基线。~~TTL 串口~~ 已撤销（2026-11-17 刷成功，不拆机）。
+- **U-Boot**：2026-11-17 已刷入官方 11-11 `ga9a12de55890`（版本串 `U-Boot XR1710G-2026-11-11-ga9a12de55890`，恢复页 `192.168.0.1`）；刷前为 `2026.07-00760-gab7fd65100f1`（恢复页 `192.168.255.1`），同 mtd3/0x600000/1MiB 槽位。**`ubi` vs `system` 的兼容疑点已于 2026-11-16 彻底闭环**（第六轮实证：官方 1112 固件内核 DTB 的 partition label 也是 `ubi`，与 1115/1016 逐属性一致；label=`system` 的那份是 chainloader 内嵌控制 DTB，非固件 DTB）。**成功率（第六轮上修）：只刷 U-Boot 88% / 只刷固件 70% / 两者都刷 72%**，推荐顺序：**先刷官方 11-11 chainloader**（fastmap 硬约束：固件内核写 fastmap，旧 chainloader 无 `ubi_attach_fastmap` 符号）→ 立即验证版本串/MAC/恢复页 IP `192.168.0.1` → 需要 NPU 改进再单独刷 1115 固件。刷前必备：mtd3 + mtd1/uenv 备份（已双份异地）+ MAC 基线。~~TTL 串口~~ 已撤销（2026-11-17 刷成功，不拆机）。
 - **固件建议（触发条件）**：过 72h → 复核新 issue 与作者是否确认 #82 → **先按新固件重建 kit（`--config-policy selective`）** → 人工核对 `config-restore-todo-*.md` 重配清单 → `upgrade_router.sh --ack-config-reset` 全清刷（**不走 LuCI OTA**）。旧的「全量配置保真」路径对 1115 已不适用，详见下方「wipe-config 版本适配」。
 
 ### ⚠️ 真刷前必须先重建 kit（2026-11-13 实测）
@@ -437,7 +437,7 @@ router_watch.sh --now --force --ack-config-reset --ack-manual-reboot   # 立即�
 | fit 卷 | ubi0_0 名 `fit`，46.2 MiB，FIT magic `d00dfeed`，含 `config-1`/`kernel-1`/`rootfs-1` | `ubi read ${loadaddr} fit` ✅ 精确匹配 |
 | bootargs | `root=/dev/fit0` | 一致 ✅ |
 | DRAM | 1.86 GB | 读 46 MiB 到 0x81800000 容量充裕 ✅ |
-| 恢复页 | 现在 `192.168.255.1` | 刷完变 **`192.168.0.1`** ⚠️ |
+| 恢复页 | 刷前 `192.168.255.1` | **现用 `192.168.0.1`**（已刷 11-11）✅ |
 
 > ✅ **撤销旧结论**：「mtd1 uenv CRC 失效 → 二级回落官方默认 env → ethaddr/MAC 可能变」——**不成立**。
 > 此前是 CRC 长度用错（用了 16384，实际 16380）。本机 MAC 不受 env 影响。
