@@ -869,7 +869,7 @@ router_watch.sh --now --force --ack-config-reset --ack-manual-reboot   # 立即�
 
 **剩余已知缺口**：1115 完整 rootfs 3,101 节点中 10 个第三方包关键词 0 命中，出厂确不含；kit 已离线注入 `openclash`/`dawn`/`pushbot`/`tailscale`/`wifihistory` 程序本体，但 `glass`/`usteer`/`socat`/`udpxy`/`msd_lite`/`rtp2httpd` 仍是「配置已保真、程序未装回」的悬空配置（无害但不生效），需刷后按需装回。
 
-## 🔧 2026-11-17 实战后修复（6 项，全部活体/单元实证）
+## 🔧 2026-11-17 实战后修复（7 项，全部活体/单元实证）
 
 本轮修复全部来自 11-16 真实升级过程中踩到的坑，**不是理论推断**。改前副本留档于 `~/router-upgrade-logs/skill-prefix-20261117-071126/`（该目录非 git 仓库，故先存副本再改）。
 
@@ -930,6 +930,14 @@ env 布局代码块里 `data = "key=value<NUL>"` 混进了**真实 NUL 字节**�
 | 随机路径 + `?token=abc` / 根路径 + `?token=abc` | 404 / 200（**`token=` 不是触发点**） |
 
 定性：**路径级拒绝，且拒绝发生在校验 token 之前**（真/假 token 响应完全相同）。根路径 200 证明**家宽 IP 未被封**；随机路径 404 证明**路由存在、URL 没写错**。故**不能断言订阅过期/失效**——用户「订阅应该还是有效的」的判断与证据一致。这不是本地 OpenClash 配置能修的。处置指向机场侧：面板**重新生成/复制订阅链接**（旧路径可能已作废）→ 找**备用/海外订阅域名** → **手机关 WiFi 用蜂窝**做跨网对照 → 仍 403 则联系机场（响应头有 `cf-ray: …-HKG`，疑似边缘 WAF 规则或订阅下发被关闭）。
+
+**⑦ P3：`check_openclash.sh` 第 5/6 节 `jump openclash` 链名硬编码（本轮 GitHub review 发现）**
+
+① 只修了 8d/2d 豁免链的硬编码；第 5 节「TCP 重定向包计数」与第 6 节「重定向规则是否存在」仍写死 `grep -E "ip protocol tcp .*jump openclash"` / `grep -qE "jump openclash"`。旧写法靠前缀碰巧也能匹配 `jump openclash`，但**链名一变（如 `openclash_output` 或自定义名）就静默给「未增长 / 未安装」的假阴性**，把正在扛流量的代理误判成没工作。
+
+修法：第 5 节开头复用 `oc_find_redirect_chain` 拿真实链，取第 3 段作 jump 目标存入 `OC_JUMP_NAME`；第 5/6 节一律用 `grep -F "jump $OC_JUMP_NAME"` 匹配（固定串，不受正则元字符影响）；未定位到链则明确打印「跳过本节包计数 / 未定位到 redirect 链」，不再硬给结论。文件头第 5 条注释同步补充。
+
+实证：从文件原样抽出 `oc_find_redirect_chain`，用模拟 ruleset（同时含 `openclash` 与 `openclash_output` 两条链）跑闭环 → 动态定位返回 `inet fw4 openclash`、提取目标 `openclash`（**不是旧硬编码的 `openclash_output`**）、计数匹配 packets=42；`bash -n` 通过；生效代码中 `jump openclash` 字面量仅剩一行说明注释。
 
 **验证汇总**：`bash -n` 三脚本全通过；`check_openclash.sh` 完整活体跑通（2d/8d 均正确豁免、判定、清理，nft 残留 0）；预检与下载/校验函数均做**假值对照**单元验证；`uboot_upgrade.sh --flash --dry-run` 确认 ack 闸仍在最前（未带 `--ack-uboot-flash` 时 rc=1 拒刷）。**本轮未刷机、未写 bootloader、未改路由器任何配置**（nft 豁免为临时插入且已自证清零）。
 
