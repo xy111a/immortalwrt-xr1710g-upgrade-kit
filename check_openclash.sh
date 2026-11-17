@@ -100,8 +100,12 @@ oc_exempt(){
   fi
   OC_EXEMPT_HANDLE=$(nft -a list chain $chain 2>/dev/null | grep -F "ip daddr $ip return" | grep -oE "handle [0-9]+" | awk '{print $2}' | head -1)
   if [ -z "$OC_EXEMPT_HANDLE" ]; then
-    echo "    ⚠️ 插入命令返回成功但回读未在链中找到该规则 -> 视为未生效"
-    OC_EXEMPT_CHAIN=""; return 1
+    # 2026-11-17 审计修复: 插入已成功但回读未命中 handle 时, 必须按规则内容兜底删除,
+    # 否则规则残留在 nft 里, 导致该 IP 永久绕过代理直连(污染被诊断系统)。
+    # 原实现直接清空 OC_EXEMPT_CHAIN 返回 1 -> 调用方走 else 不调 oc_unexempt -> 泄漏。
+    echo "    ⚠️ 插入成功但回读未命中 handle -> 按内容回滚刚插入的规则"
+    nft delete rule $chain ip daddr "$ip" return 2>/dev/null || true
+    OC_EXEMPT_CHAIN=""; OC_EXEMPT_HANDLE=""; return 1
   fi
   return 0
 }
